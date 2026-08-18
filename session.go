@@ -24,10 +24,12 @@ type Session struct {
 	Activity time.Time
 	// Attached is the number of clients attached to the session.
 	Attached int
-	// Width and Height are the dimensions of the session's smallest client,
-	// or the session's own size when detached.
-	Width, Height int
 }
+
+// A session has no size field here on purpose. tmux's session_width and
+// session_height formats are deprecated and expand to nothing from tmux 3.1
+// onwards — verified empty on 3.2a — so a Session.Width would be zero on
+// every supported version. Window carries the real dimensions.
 
 // IsAttached reports whether any client is attached to the session.
 func (s Session) IsAttached() bool { return s.Attached > 0 }
@@ -40,8 +42,6 @@ var sessionSpec = FormatSpec{
 	"session_created",
 	"session_activity",
 	"session_attached",
-	"session_width",
-	"session_height",
 }
 
 func sessionFromRow(r Row) (Session, error) {
@@ -61,12 +61,6 @@ func sessionFromRow(r Row) (Session, error) {
 		return Session{}, err
 	}
 	if s.Attached, err = r.Int("session_attached"); err != nil {
-		return Session{}, err
-	}
-	if s.Width, err = r.Int("session_width"); err != nil {
-		return Session{}, err
-	}
-	if s.Height, err = r.Int("session_height"); err != nil {
 		return Session{}, err
 	}
 	return s, nil
@@ -96,10 +90,15 @@ type NewSessionOptions struct {
 	// arrive as separate arguments.
 	//
 	// A vector of two or more elements is executed directly, so shell
-	// metacharacters in it are inert. A single element is handled by tmux
-	// itself and, per tmux's documented behaviour, is run through the shell —
-	// pass {"sh", "-c", script} if you want that explicitly, or add a second
-	// element if you do not.
+	// metacharacters anywhere in it are inert. A vector of exactly one
+	// element is not: tmux hands a lone argument to the shell, so
+	// {"rm -rf /tmp/x; reboot"} would run both commands.
+	//
+	// Rather than let that promise quietly fail, a single-element vector is
+	// required to be a bare command word — no whitespace and no shell
+	// metacharacters. To run a shell fragment, say so:
+	//
+	//	Command: []string{"sh", "-c", "make && ./run"}
 	Command []string
 
 	// WindowName names the session's first window.
@@ -162,6 +161,9 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 	if err := validateEnv(opts.Env); err != nil {
 		return nil, err
 	}
+	if err := validateCommand(opts.Command); err != nil {
+		return nil, err
+	}
 
 	out, _, err := c.run(ctx, opts.args()...)
 	if err != nil {
@@ -199,6 +201,44 @@ func validateEnv(env map[string]string) error {
 	}
 	return nil
 }
+
+// validateCommand enforces the one case where tmux will not keep this
+// package's promise that a command vector is executed directly.
+//
+// tmux passes two or more arguments to execvp, but hands a lone argument to
+// the shell. Verified against tmux 3.2a: a session started with the single
+// argument "touch x; touch y" runs both commands. Since callers are told that
+// metacharacters are inert, a single element that could be interpreted is
+// refused rather than silently interpreted.
+func validateCommand(cmd []string) error {
+	if len(cmd) == 0 {
+		return nil
+	}
+	for i, arg := range cmd {
+		if arg == "" {
+			return fmt.Errorf("gotmucks: command element %d is empty", i)
+		}
+		if strings.ContainsAny(arg, "\x00\n\r") {
+			return fmt.Errorf("gotmucks: command element %d contains a newline or NUL", i)
+		}
+	}
+	if len(cmd) > 1 {
+		return nil
+	}
+
+	if i := strings.IndexAny(cmd[0], shellMetacharacters); i >= 0 {
+		return fmt.Errorf(
+			"gotmucks: a one-element Command is run by the shell, and %q contains %q; "+
+				"pass []string{\"sh\", \"-c\", %q} to mean that, or split it into separate arguments",
+			cmd[0], cmd[0][i:i+1], cmd[0])
+	}
+	return nil
+}
+
+// shellMetacharacters is every byte that could make a lone command argument
+// mean more than one thing to a shell. Whitespace is included: a command with
+// an argument in it is already two things.
+const shellMetacharacters = " \t;&|<>()$`\"'\\*?[]{}~#!\n\r"
 
 // ListSessions returns every session on the server, ordered by identifier.
 //

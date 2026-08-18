@@ -47,7 +47,7 @@ func (c *Client) SocketArgs() []string { return c.cfg.globalArgs() }
 // missing server wraps [ErrNoServer], and an unresolvable target wraps
 // [ErrNoSession].
 func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte, err error) {
-	full := append(c.cfg.globalArgs(), args...)
+	full, tmuxArgs := c.cfg.argv(args)
 
 	cmd := exec.CommandContext(ctx, c.cfg.binary, full...)
 	cmd.Env = c.cfg.environ()
@@ -66,7 +66,7 @@ func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte
 	// such rather than as a tmux failure.
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return stdout, stderr, &ExitError{
-			Args:   full,
+			Args:   tmuxArgs,
 			Code:   exitCode(runErr),
 			Stderr: strings.TrimSpace(string(stderr)),
 			Err:    ctxErr,
@@ -74,7 +74,7 @@ func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte
 	}
 
 	xerr := &ExitError{
-		Args:   full,
+		Args:   tmuxArgs,
 		Code:   exitCode(runErr),
 		Stderr: strings.TrimSpace(string(stderr)),
 	}

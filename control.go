@@ -15,10 +15,15 @@ import (
 
 // ControlClient is a persistent connection to a tmux server in control mode.
 //
-// tmux -CC is a two-way protocol on one pair of pipes: commands go down, and
-// command replies, live pane output and asynchronous notifications come back
-// interleaved. A single goroutine owns the read side and dispatches by line
-// prefix; nothing else touches the pipe.
+// Control mode is a two-way protocol on one pair of pipes: commands go down,
+// and command replies, live pane output and asynchronous notifications come
+// back interleaved. A single goroutine owns the read side and dispatches by
+// line prefix; nothing else touches the pipe.
+//
+// The connection uses tmux's -C. The -CC form documented for applications
+// additionally puts the terminal out of canonical mode, which makes tmux call
+// tcgetattr on its standard input; against a pipe that fails and tmux exits at
+// once. See [WithDoubleControlMode].
 //
 // A ControlClient is safe for concurrent use. [ControlClient.Do] may be
 // called from many goroutines at once: commands are correlated with their
@@ -119,14 +124,7 @@ func (r Reply) Rows(spec FormatSpec) ([]Row, error) { return ParseRows(spec, r.O
 // to an existing one, or [WithControlArgs] for anything else.
 func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 	cfg := newConfig(opts)
-
-	cc := &ControlClient{
-		cfg:    cfg,
-		taps:   make(map[PaneID]*tap),
-		events: make(chan Event, cfg.eventBuffer),
-		done:   make(chan struct{}),
-		stderr: &syncBuffer{},
-	}
+	cc := newControlClient(cfg)
 
 	if !cfg.skipVersionCk {
 		v, err := New(opts...).Version(ctx)
@@ -140,8 +138,8 @@ func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 		cc.version = v
 	}
 
-	args := append(cfg.globalArgs(), "-CC")
-	args = append(args, controlCommand(cfg)...)
+	tmuxArgs := append([]string{cfg.controlFlag()}, controlCommand(cfg)...)
+	args, _ := cfg.argv(tmuxArgs)
 
 	// Deliberately exec.Command and not exec.CommandContext: ctx bounds
 	// setup, not the connection's life.
@@ -161,8 +159,8 @@ func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 		return nil, fmt.Errorf("gotmucks: starting %s %s: %w", cfg.binary, strings.Join(args, " "), err)
 	}
 
-	cc.cmd, cc.stdin, cc.stdout = cmd, stdin, stdout
-	go cc.readLoop()
+	cc.cmd = cmd
+	cc.start(stdin, stdout)
 
 	// Prove the connection works before handing it back. If tmux could not
 	// start or the requested session does not exist, it exits immediately and
@@ -175,6 +173,28 @@ func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 		return nil, fmt.Errorf("gotmucks: control connection failed: %w", err)
 	}
 	return cc, nil
+}
+
+// newControlClient builds an unstarted client. [Connect] then attaches it to
+// a tmux process; the tests attach it to in-memory pipes, which is how the
+// reader and its dispatch are covered without a subprocess.
+func newControlClient(cfg config) *ControlClient {
+	return &ControlClient{
+		cfg:  cfg,
+		taps: make(map[PaneID]*tap),
+		// One slot beyond the caller's buffer is reserved for loss reports
+		// and the terminal event, so that a burst which fills the channel can
+		// still say that it did. See emit.
+		events: make(chan Event, cfg.eventBuffer+1),
+		done:   make(chan struct{}),
+		stderr: &syncBuffer{},
+	}
+}
+
+// start attaches the client to a pair of pipes and launches the reader.
+func (cc *ControlClient) start(stdin io.WriteCloser, stdout io.ReadCloser) {
+	cc.stdin, cc.stdout = stdin, stdout
+	go cc.readLoop()
 }
 
 // controlCommand is the tmux command a control connection issues on startup.
@@ -411,10 +431,13 @@ func (cc *ControlClient) Close() error {
 		select {
 		case <-cc.done:
 		case <-time.After(cc.cfg.closeTimeout):
-			if cc.cmd.Process != nil {
+			if cc.cmd != nil && cc.cmd.Process != nil {
 				_ = cc.cmd.Process.Kill()
 			}
 			<-cc.done
+		}
+		if cc.cmd == nil {
+			return // in-memory connection; there is no process to reap
 		}
 		err = cc.cmd.Wait()
 		if err != nil && cc.isCleanExit(err) {

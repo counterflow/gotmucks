@@ -163,6 +163,14 @@ func needsQuoting(s string) bool {
 // safeByte reports whether a byte can appear unquoted in a tmux command line.
 // The set is deliberately small: everything outside it is quoted, and quoting
 // something that did not need it is harmless.
+//
+// Note what is absent. '#' introduces a format, and '$' a variable, so an
+// unquoted format string loses its argument entirely. '%' is worse: tmux's
+// parser reads a token beginning with '%' as one of its %if/%endif
+// preprocessor directives, so "refresh-client -A %0:continue" is a syntax
+// error rather than a command — which is exactly the pane identifiers this
+// package deals in. '@' is excluded for the same family of reasons even
+// though it currently parses, since window identifiers are just as common.
 func safeByte(c byte) bool {
 	switch {
 	case c >= 'a' && c <= 'z',
@@ -171,7 +179,7 @@ func safeByte(c byte) bool {
 		return true
 	}
 	switch c {
-	case '_', '-', '.', '/', ':', '=', ',', '@', '+', '%':
+	case '_', '-', '.', '/', ':', '=', ',', '+':
 		return true
 	}
 	return false

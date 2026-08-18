@@ -349,22 +349,53 @@ func (cc *ControlClient) deliverOutput(pane PaneID, data []byte, extended bool, 
 // emit publishes an event without ever blocking the reader.
 //
 // A reader that blocked on a slow consumer would stall command replies and
-// every other pane's output as well, so a full channel drops the event and
-// the loss is reported through [EventsDropped] as soon as there is room to
-// say so.
+// every other pane's output as well, so a full channel drops the event
+// instead. The loss is then reported as an [EventsDropped] event.
+//
+// The channel is allocated one slot larger than the buffer the caller asked
+// for, and ordinary events are only allowed to fill it to that requested
+// size. The spare slot is reserved for loss reports and for the terminal
+// event. Without the reservation, a burst that filled the channel could only
+// report itself once some later event happened to be emitted — so a caller
+// that fell behind and then went quiet would never be told, which is the one
+// case where being told matters most.
 func (cc *ControlClient) emit(ev Event) {
-	if n := cc.pendingDrops.Swap(0); n > 0 {
+	cc.flushDrops()
+
+	if len(cc.events) < cc.cfg.eventBuffer {
 		select {
-		case cc.events <- EventsDropped{Count: n}:
+		case cc.events <- ev:
+			return
 		default:
-			cc.pendingDrops.Add(n)
 		}
 	}
+
+	cc.totalDrops.Add(1)
+	cc.pendingDrops.Add(1)
+	cc.flushDrops()
+}
+
+// emitReserved publishes an event that may use the reserved slot. It is for
+// the terminal event, which is worth more than one more notification.
+func (cc *ControlClient) emitReserved(ev Event) {
 	select {
 	case cc.events <- ev:
 	default:
-		cc.pendingDrops.Add(1)
 		cc.totalDrops.Add(1)
+	}
+}
+
+// flushDrops reports accumulated losses if there is room, and puts the count
+// back if there is not.
+func (cc *ControlClient) flushDrops() {
+	n := cc.pendingDrops.Swap(0)
+	if n == 0 {
+		return
+	}
+	select {
+	case cc.events <- EventsDropped{Count: n}:
+	default:
+		cc.pendingDrops.Add(n)
 	}
 }
 
@@ -413,7 +444,7 @@ func (cc *ControlClient) finishReader(readErr error) {
 		}
 	}
 
-	cc.emit(Exited{Reason: exitMsg, Err: exitErr})
+	cc.emitReserved(Exited{Reason: exitMsg, Err: exitErr})
 
 	for _, t := range taps {
 		close(t.ch)

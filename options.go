@@ -27,6 +27,29 @@ type config struct {
 	outputBuffer  int
 	closeTimeout  time.Duration
 	skipVersionCk bool
+	doubleControl bool
+
+	// execPrefix is inserted before tmux's own arguments. It exists so the
+	// test suite can re-execute the test binary as a stand-in for tmux, which
+	// is how the command layer is tested without a tmux installation.
+	execPrefix []string
+}
+
+// withExecPrefix inserts args between the binary and tmux's own arguments.
+// Unexported: this is a testing seam, not part of the API.
+func withExecPrefix(args ...string) Option {
+	return func(c *config) { c.execPrefix = append([]string(nil), args...) }
+}
+
+// argv assembles the full argument vector for a tmux invocation, and returns
+// alongside it the tmux-visible portion for use in error messages.
+func (c config) argv(args []string) (full, tmuxArgs []string) {
+	tmuxArgs = append(c.globalArgs(), args...)
+	if len(c.execPrefix) == 0 {
+		return tmuxArgs, tmuxArgs
+	}
+	full = append(append([]string(nil), c.execPrefix...), tmuxArgs...)
+	return full, tmuxArgs
 }
 
 // Defaults chosen to be unsurprising rather than clever.
@@ -177,4 +200,31 @@ func WithCloseTimeout(d time.Duration) Option {
 // connection is opened. Intended for tests against stand-in binaries.
 func WithoutVersionCheck() Option {
 	return func(c *config) { c.skipVersionCk = true }
+}
+
+// WithDoubleControlMode starts the control connection with tmux's -CC rather
+// than -C.
+//
+// -CC additionally turns off canonical mode on the terminal, which means tmux
+// calls tcgetattr on its standard input. With a pipe there — which is how a
+// library drives tmux — that call fails and tmux exits immediately:
+//
+//	tcgetattr failed: Inappropriate ioctl for device
+//
+// So -C is the default here, despite -CC being the flag documented for
+// applications: -CC is for an application that has given tmux a terminal, such
+// as a terminal emulator embedding a tmux session. Pass this option only if
+// you have arranged a pty for tmux's standard input yourself.
+//
+// Control-mode only.
+func WithDoubleControlMode() Option {
+	return func(c *config) { c.doubleControl = true }
+}
+
+// controlFlag is the flag that puts tmux into control mode.
+func (c config) controlFlag() string {
+	if c.doubleControl {
+		return "-CC"
+	}
+	return "-C"
 }
