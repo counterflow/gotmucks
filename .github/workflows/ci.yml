@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that needs no tmux: build, vet, and the hermetic test suite.
+  # Runs on the oldest supported Go so that a newer-than-1.22 construct
+  # slipping in is caught here rather than by a user.
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.22', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Build with cgo disabled
+        env:
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Confirm there are no non-stdlib dependencies
+        run: |
+          if [ -s go.sum ]; then
+            echo "go.sum is not empty; this library takes no external dependencies"
+            cat go.sum
+            exit 1
+          fi
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  # Integration tests against real tmux. 3.2 is the floor, for new-session -e.
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tmux: ['3.2a', '3.4', '3.5a']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libevent-dev libncurses-dev bison pkg-config
+
+      - name: Cache the tmux build
+        id: tmux-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tmux-install
+          key: tmux-${{ matrix.tmux }}-${{ runner.os }}
+
+      - name: Build tmux ${{ matrix.tmux }}
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          version='${{ matrix.tmux }}'
+          curl -fsSL -o tmux.tar.gz \
+            "https://github.com/tmux/tmux/releases/download/${version}/tmux-${version}.tar.gz"
+          tar xzf tmux.tar.gz
+          cd "tmux-${version}"
+          ./configure --prefix="$HOME/tmux-install"
+          make -j"$(nproc)"
+          make install
+
+      - name: Report the tmux under test
+        run: |
+          echo "$HOME/tmux-install/bin" >> "$GITHUB_PATH"
+          "$HOME/tmux-install/bin/tmux" -V
+
+      - name: Probe tmux behaviour
+        # Not an assertion: this prints how this release actually behaves, so
+        # that a matrix failure comes with the evidence next to it.
+        run: |
+          bash ./scripts/probe-tmux.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-control.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-argv.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-formats.sh "$HOME/tmux-install/bin/tmux" || true
+
+      - name: Integration tests
+        run: |
+          GOTMUCKS_TMUX="$HOME/tmux-install/bin/tmux" \
+            go test -tags integration -race -count=1 -timeout 15m ./...
+
+  # The escaping of pane output is the single most test-worthy piece of
+  # parsing here, so it gets a fuzzing pass of its own on every run.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Fuzz the output escaping round trip
+        run: |
+          go test ./internal/escape/ -run xxx -fuzz FuzzRoundTrip -fuzztime 60s
+          go test ./internal/escape/ -run xxx -fuzz FuzzUnescapeArbitrary -fuzztime 60s

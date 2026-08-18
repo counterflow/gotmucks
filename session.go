@@ -177,9 +177,12 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 
 	s, err := c.Session(ctx, id)
 	if err != nil {
-		// The session exists — we have its id — but reading it back failed.
-		// Return what is known rather than nothing.
-		if errors.Is(err, ErrNoSession) {
+		// The session was created — we have its id — but reading it back
+		// failed. A short-lived Command is the usual reason: it can exit, end
+		// the session, and take the server with it (a server with no sessions
+		// exits at once) before this second call lands. Report what is known
+		// rather than an error for a session that really was created.
+		if errors.Is(err, ErrNoSession) || errors.Is(err, ErrNoServer) {
 			return &Session{ID: id, Name: opts.Name}, nil
 		}
 		return nil, err

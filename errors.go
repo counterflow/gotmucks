@@ -101,6 +101,12 @@ var noServerPatterns = []string{
 	"no such file or directory",
 	"connect failed: no such file or directory",
 	"server not found",
+	// Emitted when the server goes away while a command is in flight. A
+	// server with no sessions exits at once (tmux's exit-empty defaults to
+	// on), so a session whose command finishes quickly can take the whole
+	// server with it between one call and the next.
+	"server exited unexpectedly",
+	"lost server",
 }
 
 // isNoServerStderr reports whether stderr is tmux's way of saying the socket
