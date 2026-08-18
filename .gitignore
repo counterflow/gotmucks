@@ -1,0 +1,15 @@
+# Build and test output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp

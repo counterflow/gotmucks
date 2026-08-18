@@ -1,0 +1,167 @@
+package gotmucks
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// MinimumVersion is the oldest tmux this package supports.
+//
+// The floor is set by "new-session -e", which arrived in tmux 3.2. Everything
+// else used here is older, so 3.2 is the single constraint.
+var MinimumVersion = Version{Major: 3, Minor: 2}
+
+// Version is a tmux version.
+//
+// tmux versions are a major and minor number with an optional letter suffix
+// ("3.2a"), and development builds carry a "next-" prefix ("next-3.4").
+// Unnumbered builds ("master") parse as [Version.Unknown].
+type Version struct {
+	// Major and Minor are the numeric components.
+	Major, Minor int
+	// Suffix is the trailing letter revision, "a" in "3.2a". Empty if absent.
+	Suffix string
+	// Next reports a development build, the "next-" prefix in "next-3.4".
+	Next bool
+	// Raw is the string this was parsed from.
+	Raw string
+	// Unknown reports that no version number could be found, as for builds
+	// that report "master".
+	Unknown bool
+}
+
+// String renders the version the way tmux writes it.
+func (v Version) String() string {
+	if v.Unknown {
+		if v.Raw != "" {
+			return v.Raw
+		}
+		return "unknown"
+	}
+	var b strings.Builder
+	if v.Next {
+		b.WriteString("next-")
+	}
+	fmt.Fprintf(&b, "%d.%d%s", v.Major, v.Minor, v.Suffix)
+	return b.String()
+}
+
+// Compare orders two versions: -1 if v is older than w, 0 if equal, +1 if
+// newer. The letter suffix is compared lexically, so 3.2 < 3.2a < 3.2b.
+//
+// An unknown version is treated as newer than any known one: builds that do
+// not report a number are development builds of the tip, and refusing to run
+// against them would be the wrong default.
+func (v Version) Compare(w Version) int {
+	switch {
+	case v.Unknown && w.Unknown:
+		return 0
+	case v.Unknown:
+		return 1
+	case w.Unknown:
+		return -1
+	}
+	if v.Major != w.Major {
+		return sign(v.Major - w.Major)
+	}
+	if v.Minor != w.Minor {
+		return sign(v.Minor - w.Minor)
+	}
+	return strings.Compare(v.Suffix, w.Suffix)
+}
+
+// AtLeast reports whether v is w or newer.
+func (v Version) AtLeast(w Version) bool { return v.Compare(w) >= 0 }
+
+func sign(n int) int {
+	switch {
+	case n < 0:
+		return -1
+	case n > 0:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ParseVersion reads the output of "tmux -V", with or without the leading
+// "tmux " word.
+func ParseVersion(s string) (Version, error) {
+	raw := strings.TrimSpace(s)
+	v := Version{Raw: raw}
+	if raw == "" {
+		return v, fmt.Errorf("gotmucks: empty tmux version string")
+	}
+
+	field := raw
+	// "tmux 3.2a" — take the last whitespace-separated field.
+	if fields := strings.Fields(raw); len(fields) > 1 {
+		field = fields[len(fields)-1]
+	}
+
+	if rest, ok := strings.CutPrefix(field, "next-"); ok {
+		v.Next = true
+		field = rest
+	}
+	// Some distributions prefix an OS name, e.g. "openbsd-7.4".
+	if i := strings.LastIndexByte(field, '-'); i >= 0 {
+		field = field[i+1:]
+	}
+
+	major, rest, ok := strings.Cut(field, ".")
+	if !ok {
+		v.Unknown = true
+		return v, nil
+	}
+	maj, err := strconv.Atoi(major)
+	if err != nil {
+		v.Unknown = true
+		return v, nil
+	}
+
+	// The minor component runs until the first non-digit; anything after it
+	// is the letter suffix.
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		v.Unknown = true
+		return v, nil
+	}
+	min, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		v.Unknown = true
+		return v, nil
+	}
+
+	v.Major, v.Minor, v.Suffix = maj, min, rest[end:]
+	return v, nil
+}
+
+// Version reports the version of the tmux binary this client runs.
+//
+// It does not need a running server: "tmux -V" answers from the binary alone.
+func (c *Client) Version(ctx context.Context) (Version, error) {
+	out, _, err := c.run(ctx, "-V")
+	if err != nil {
+		return Version{}, err
+	}
+	return ParseVersion(string(out))
+}
+
+// CheckVersion reports an error wrapping [ErrUnsupportedVersion] if the tmux
+// binary is older than [MinimumVersion].
+func (c *Client) CheckVersion(ctx context.Context) error {
+	v, err := c.Version(ctx)
+	if err != nil {
+		return err
+	}
+	if !v.AtLeast(MinimumVersion) {
+		return fmt.Errorf("gotmucks: tmux %s is older than the required %s: %w",
+			v, MinimumVersion, ErrUnsupportedVersion)
+	}
+	return nil
+}
