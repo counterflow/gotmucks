@@ -87,6 +87,9 @@ func (c *Client) ListWindows(ctx context.Context) ([]Window, error) {
 // A session that does not exist yields an empty slice rather than an error,
 // matching the other list calls.
 func (c *Client) ListSessionWindows(ctx context.Context, id SessionID) ([]Window, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	return c.windows(ctx, "list-windows", "-t", string(id))
 }
 
@@ -108,6 +111,9 @@ func (c *Client) windows(ctx context.Context, args ...string) ([]Window, error) 
 
 // Window returns one window by identifier.
 func (c *Client) Window(ctx context.Context, id WindowID) (*Window, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	windows, err := c.ListWindows(ctx)
 	if err != nil {
 		return nil, err
@@ -123,5 +129,8 @@ func (c *Client) Window(ctx context.Context, id WindowID) (*Window, error) {
 
 // RenameWindow gives a window a new name.
 func (c *Client) RenameWindow(ctx context.Context, id WindowID, name string) error {
+	if err := id.check(); err != nil {
+		return err
+	}
 	return c.runOK(ctx, "rename-window", "-t", string(id), name)
 }

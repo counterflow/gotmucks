@@ -273,6 +273,9 @@ func (c *Client) ListSessions(ctx context.Context) ([]Session, error) {
 // supported version range. Session counts are small enough that filtering in
 // process costs nothing.
 func (c *Client) Session(ctx context.Context, id SessionID) (*Session, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	sessions, err := c.ListSessions(ctx)
 	if err != nil {
 		return nil, err
@@ -289,7 +292,12 @@ func (c *Client) Session(ctx context.Context, id SessionID) (*Session, error) {
 // HasSession reports whether a session exists.
 //
 // Neither a missing session nor a missing server is an error; both are false.
+// An id that is not an identifier is: an absence is an answer, whereas asking
+// the wrong question is a caller mistake. See [ErrInvalidID].
 func (c *Client) HasSession(ctx context.Context, id SessionID) (bool, error) {
+	if err := id.check(); err != nil {
+		return false, err
+	}
 	_, _, err := c.run(ctx, "has-session", "-t", string(id))
 	switch {
 	case err == nil:
@@ -304,8 +312,13 @@ func (c *Client) HasSession(ctx context.Context, id SessionID) (bool, error) {
 // KillSession destroys a session.
 //
 // It is idempotent: a session that is already gone, or a server that is not
-// running, is success.
+// running, is success. An id that is not an identifier is an error, because
+// tmux would otherwise read it as a name and kill whichever session answers to
+// it. See [ErrInvalidID].
 func (c *Client) KillSession(ctx context.Context, id SessionID) error {
+	if err := id.check(); err != nil {
+		return err
+	}
 	err := c.runOK(ctx, "kill-session", "-t", string(id))
 	if err != nil && (errors.Is(err, ErrNoServer) || isMissingTarget(err)) {
 		return nil
@@ -317,5 +330,8 @@ func (c *Client) KillSession(ctx context.Context, id SessionID) error {
 // unchanged, which is why identifiers rather than names are the addressing
 // scheme here.
 func (c *Client) RenameSession(ctx context.Context, id SessionID, name string) error {
+	if err := id.check(); err != nil {
+		return err
+	}
 	return c.runOK(ctx, "rename-session", "-t", string(id), name)
 }

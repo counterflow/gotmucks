@@ -11,6 +11,15 @@ import (
 // and indexes are neither stable nor unique, so this package addresses objects
 // by ID everywhere and exposes the three kinds as distinct types — a PaneID
 // will not compile where a WindowID is wanted.
+//
+// The types are defined over string, so the compiler keeps the three apart but
+// cannot stop SessionID("work") being written. tmux would resolve that as a
+// name, which is the whole failure this scheme exists to prevent, so the shape
+// is checked as well: every exported call that puts an identifier in a -t
+// argument runs check first and fails with [ErrInvalidID] rather than acting
+// on whatever the name reached. [ControlClient.Do] and [Client.QueryArgs] are
+// the deliberate exceptions: a command line assembled by the caller is the
+// caller's own.
 
 // SessionID is a tmux session identifier, of the form "$0".
 type SessionID string
@@ -32,11 +41,14 @@ const (
 // types implement it, as does [GlobalTarget] for server- and global-scoped
 // commands.
 //
-// The interface is closed: it has an unexported method so that only this
-// package can add targets, which keeps -t construction total.
+// The interface is closed: it has unexported methods so that only this package
+// can add targets, which keeps -t construction total.
 type Target interface {
 	// TargetArg is the literal value passed to tmux's -t flag.
 	TargetArg() string
+	// check reports an error if this target cannot be addressed, which for an
+	// identifier means it is not one. See [ErrInvalidID].
+	check() error
 	isTarget()
 }
 
@@ -76,6 +88,29 @@ func (id WindowID) String() string { return string(id) }
 // String returns the identifier as tmux writes it.
 func (id PaneID) String() string { return string(id) }
 
+// check implements [Target]. Every exported call that addresses a session runs
+// it before the identifier reaches tmux.
+func (id SessionID) check() error { return checkID(string(id), sessionSigil, "session") }
+
+// check implements [Target].
+func (id WindowID) check() error { return checkID(string(id), windowSigil, "window") }
+
+// check implements [Target].
+func (id PaneID) check() error { return checkID(string(id), paneSigil, "pane") }
+
+// check implements [Target]. The global target addresses no object, so there
+// is nothing to get wrong.
+func (GlobalTarget) check() error { return nil }
+
+// checkTarget is [Target.check] for a target that may be nil, which
+// targetArgs reads as [Global].
+func checkTarget(t Target) error {
+	if t == nil {
+		return nil
+	}
+	return t.check()
+}
+
 // Valid reports whether the identifier is well formed: a '$' followed by at
 // least one decimal digit.
 func (id SessionID) Valid() bool { return validID(string(id), sessionSigil) }
@@ -100,24 +135,24 @@ func (id PaneID) Ordinal() (int, error) { return idOrdinal(string(id), paneSigil
 
 // ParseSessionID validates s and returns it as a [SessionID].
 func ParseSessionID(s string) (SessionID, error) {
-	if !validID(s, sessionSigil) {
-		return "", badID(s, sessionSigil, "session")
+	if err := checkID(s, sessionSigil, "session"); err != nil {
+		return "", err
 	}
 	return SessionID(s), nil
 }
 
 // ParseWindowID validates s and returns it as a [WindowID].
 func ParseWindowID(s string) (WindowID, error) {
-	if !validID(s, windowSigil) {
-		return "", badID(s, windowSigil, "window")
+	if err := checkID(s, windowSigil, "window"); err != nil {
+		return "", err
 	}
 	return WindowID(s), nil
 }
 
 // ParsePaneID validates s and returns it as a [PaneID].
 func ParsePaneID(s string) (PaneID, error) {
-	if !validID(s, paneSigil) {
-		return "", badID(s, paneSigil, "pane")
+	if err := checkID(s, paneSigil, "pane"); err != nil {
+		return "", err
 	}
 	return PaneID(s), nil
 }
@@ -147,8 +182,16 @@ func idOrdinal(s string, sigil byte, kind string) (int, error) {
 	return n, nil
 }
 
+func checkID(s string, sigil byte, kind string) error {
+	if !validID(s, sigil) {
+		return badID(s, sigil, kind)
+	}
+	return nil
+}
+
 func badID(s string, sigil byte, kind string) error {
-	return fmt.Errorf("gotmucks: %q is not a %s id (want %c followed by digits)", s, kind, sigil)
+	return fmt.Errorf("gotmucks: %q is not a %s id (want %c followed by digits): %w",
+		s, kind, sigil, ErrInvalidID)
 }
 
 // trimID strips a trailing newline and surrounding space from raw tmux output

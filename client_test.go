@@ -547,7 +547,7 @@ func TestSendKeysBatching(t *testing.T) {
 	}{
 		{
 			name: "named only",
-			keys: []Key{Named("C-c"), Enter},
+			keys: []Key{Named("C-c"), Enter()},
 			want: [][]string{{"send-keys", "-t", "%0", "--", "C-c", "Enter"}},
 		},
 		{
@@ -564,7 +564,7 @@ func TestSendKeysBatching(t *testing.T) {
 			// -l and -H are flags on the invocation, not properties of a key,
 			// so a mixed sequence has to be split into runs.
 			name: "mixed splits into runs",
-			keys: []Key{Literal("echo hi"), Enter, Hex(0x03)},
+			keys: []Key{Literal("echo hi"), Enter(), Hex(0x03)},
 			want: [][]string{
 				{"send-keys", "-l", "-t", "%0", "--", "echo hi"},
 				{"send-keys", "-t", "%0", "--", "Enter"},
@@ -865,4 +865,88 @@ func TestMissingBinary(t *testing.T) {
 	if errors.Is(err, ErrNoServer) {
 		t.Error("a missing binary was misreported as a missing server")
 	}
+}
+
+// TestIdentifiersMustBeIdentifiers is this package's central claim, and the one
+// the types alone cannot keep. SessionID, WindowID and PaneID are string types,
+// so SessionID("work") compiles; tmux then resolves "work" as a name and acts
+// on whichever session answers to it, which is exactly the failure addressing
+// by identifier exists to prevent.
+//
+// So every call that puts one in a -t argument refuses a name, and refuses it
+// before tmux is started: a command that ran cannot be taken back.
+func TestIdentifiersMustBeIdentifiers(t *testing.T) {
+	ctx := context.Background()
+
+	calls := []struct {
+		name string
+		run  func(*Client) error
+	}{
+		{"Session", func(c *Client) error { _, err := c.Session(ctx, "work"); return err }},
+		{"HasSession", func(c *Client) error { _, err := c.HasSession(ctx, "work"); return err }},
+		{"KillSession", func(c *Client) error { return c.KillSession(ctx, "work") }},
+		{"RenameSession", func(c *Client) error { return c.RenameSession(ctx, "work", "x") }},
+		{"ListSessionWindows", func(c *Client) error { _, err := c.ListSessionWindows(ctx, "work"); return err }},
+		{"ListSessionPanes", func(c *Client) error { _, err := c.ListSessionPanes(ctx, "work"); return err }},
+		{"Window", func(c *Client) error { _, err := c.Window(ctx, "editor"); return err }},
+		{"RenameWindow", func(c *Client) error { return c.RenameWindow(ctx, "editor", "x") }},
+		{"ListWindowPanes", func(c *Client) error { _, err := c.ListWindowPanes(ctx, "editor"); return err }},
+		{"Pane", func(c *Client) error { _, err := c.Pane(ctx, "bash"); return err }},
+		{"CapturePane", func(c *Client) error {
+			_, err := c.CapturePane(ctx, "bash", CaptureOptions{})
+			return err
+		}},
+		{"SendKeys", func(c *Client) error { return c.SendKeys(ctx, "bash", Literal("hi")) }},
+		{"SendText", func(c *Client) error { return c.SendText(ctx, "bash", "hi") }},
+		// The empty string sends nothing, but it must not be the one way in.
+		{"SendText empty", func(c *Client) error { return c.SendText(ctx, "bash", "") }},
+		{"SendLine", func(c *Client) error { return c.SendLine(ctx, "bash", "hi") }},
+		{"SetOption", func(c *Client) error {
+			return c.SetOption(ctx, SessionID("work"), "status", "off")
+		}},
+		{"SetOptionScoped", func(c *Client) error {
+			return c.SetOptionScoped(ctx, WindowID("editor"), ScopeWindow, "automatic-rename", "off")
+		}},
+		{"UnsetOption", func(c *Client) error {
+			return c.UnsetOption(ctx, SessionID("work"), ScopeSession, "status")
+		}},
+		{"ShowOption", func(c *Client) error {
+			_, _, err := c.ShowOption(ctx, SessionID("work"), ScopeSession, "status")
+			return err
+		}},
+		{"ShowOptions", func(c *Client) error {
+			_, err := c.ShowOptions(ctx, SessionID("work"), ScopeSession)
+			return err
+		}},
+		{"SetRemainOnExit", func(c *Client) error { return c.SetRemainOnExit(ctx, PaneID("bash"), true) }},
+		{"SetHook", func(c *Client) error {
+			return c.SetHook(ctx, SessionID("work"), "pane-exited", "display-message gone")
+		}},
+		{"UnsetHook", func(c *Client) error { return c.UnsetHook(ctx, SessionID("work"), "pane-exited") }},
+		{"ShowHooks", func(c *Client) error { _, err := c.ShowHooks(ctx, SessionID("work")); return err }},
+	}
+
+	for _, call := range calls {
+		t.Run(call.name, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{})
+
+			err := call.run(f.client())
+			if !errors.Is(err, ErrInvalidID) {
+				t.Fatalf("got %v, want an error wrapping ErrInvalidID", err)
+			}
+			if argv := f.argv(); len(argv) != 0 {
+				t.Errorf("tmux ran anyway: %v", argv)
+			}
+		})
+	}
+}
+
+// The global target addresses no object, so it is the one Target with nothing
+// to check. It must keep working.
+func TestGlobalTargetIsAlwaysAddressable(t *testing.T) {
+	f := newFake(t, faketmux.Script{})
+	if err := f.client().SetOptionScoped(context.Background(), Global, ScopeGlobal, "status", "off"); err != nil {
+		t.Fatalf("SetOptionScoped on Global: %v", err)
+	}
+	f.wantArgv(0, "set-option", "-g", "--", "status", "off")
 }

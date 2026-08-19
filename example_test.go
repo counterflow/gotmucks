@@ -67,7 +67,7 @@ func ExampleClient_SendKeys() {
 	// library issues one per run. The caller does not have to care.
 	err := c.SendKeys(ctx, pane,
 		gotmucks.Literal("go test ./..."),
-		gotmucks.Enter,
+		gotmucks.Enter(),
 	)
 	if err != nil {
 		log.Fatal(err)

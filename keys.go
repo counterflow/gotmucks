@@ -49,7 +49,10 @@ func Hex(b ...byte) Key { return Key{kind: keyHex, hex: append([]byte(nil), b...
 func Bytes(b []byte) Key { return Hex(b...) }
 
 // Enter is the return key, the most common thing to send after text.
-var Enter = Named("Enter")
+//
+// It is a function rather than a variable so that nothing else in the process
+// can redefine what this package's callers mean by Enter.
+func Enter() Key { return Named("Enter") }
 
 // String renders the key for diagnostics.
 func (k Key) String() string {
@@ -105,8 +108,11 @@ func (k keyKind) flag() (string, bool) {
 // same-kind keys. The runs are sent in order and a failure part-way through
 // leaves the earlier runs delivered — tmux has no transaction for this.
 //
-//	c.SendKeys(ctx, pane, gotmucks.Literal("echo hi"), gotmucks.Enter)
+//	c.SendKeys(ctx, pane, gotmucks.Literal("echo hi"), gotmucks.Enter())
 func (c *Client) SendKeys(ctx context.Context, id PaneID, keys ...Key) error {
+	if err := id.check(); err != nil {
+		return err
+	}
 	if len(keys) == 0 {
 		return nil
 	}
@@ -138,7 +144,10 @@ func (c *Client) SendKeys(ctx context.Context, id PaneID, keys ...Key) error {
 // SendText sends a string to a pane literally, without a trailing newline.
 func (c *Client) SendText(ctx context.Context, id PaneID, s string) error {
 	if s == "" {
-		return nil
+		// Nothing to send, but the pane is still checked: a call that is a
+		// no-op for the empty string should not also be the one call that lets
+		// a bad identifier through unremarked.
+		return c.SendKeys(ctx, id)
 	}
 	return c.SendKeys(ctx, id, Literal(s))
 }
@@ -151,9 +160,9 @@ func (c *Client) SendText(ctx context.Context, id PaneID, s string) error {
 // to manage.
 func (c *Client) SendLine(ctx context.Context, id PaneID, s string) error {
 	if s == "" {
-		return c.SendKeys(ctx, id, Enter)
+		return c.SendKeys(ctx, id, Enter())
 	}
-	return c.SendKeys(ctx, id, Literal(s), Enter)
+	return c.SendKeys(ctx, id, Literal(s), Enter())
 }
 
 // keyRun is a maximal run of consecutive keys of one kind.

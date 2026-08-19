@@ -88,10 +88,10 @@ func TestVersionCompare(t *testing.T) {
 		t.Errorf("3.2a.Compare(3.2a) = %d, want 0", got)
 	}
 	// An unnumbered build is the tip, so it must not be refused as too old.
-	if !v("master").AtLeast(MinimumVersion) {
+	if !v("master").AtLeast(MinimumVersion()) {
 		t.Error("an unknown version should sort newest")
 	}
-	if !v("3.4-rc1").AtLeast(MinimumVersion) {
+	if !v("3.4-rc1").AtLeast(MinimumVersion()) {
 		t.Error("3.4-rc1 is newer than the minimum")
 	}
 }

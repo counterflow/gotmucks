@@ -28,6 +28,17 @@ var ErrNoPane = errors.New("gotmucks: pane not found")
 // ErrClosed reports use of a [ControlClient] after [ControlClient.Close].
 var ErrClosed = errors.New("gotmucks: control client closed")
 
+// ErrInvalidID reports a [SessionID], [WindowID] or [PaneID] that is not an
+// identifier: a name, an index, or anything else that is not the object's
+// sigil followed by digits.
+//
+// The three are Go string types, so nothing stops a caller building one out of
+// a session name — and tmux would then resolve it as a name, which is the
+// failure addressing by identifier exists to prevent. Every exported call that
+// puts one in a -t argument checks it first and reports this rather than
+// acting on whichever object the name happened to reach.
+var ErrInvalidID = errors.New("gotmucks: not a tmux identifier")
+
 // ErrServerExited reports that the control-mode connection ended, either
 // because tmux sent %exit or because the process died. It is terminal: the
 // caller reconnects if it wants to, because only the caller knows whether

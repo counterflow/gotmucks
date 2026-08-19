@@ -11,7 +11,12 @@ import (
 //
 // The floor is set by "new-session -e", which arrived in tmux 3.2. Everything
 // else used here is older, so 3.2 is the single constraint.
-var MinimumVersion = Version{Major: 3, Minor: 2}
+//
+// It is a function rather than a variable because it is what [Connect] and
+// [Client.CheckVersion] gate on, and a variable could be moved by anything
+// else in the process — including a dependency — with the version check then
+// quietly passing something it was written to refuse.
+func MinimumVersion() Version { return Version{Major: 3, Minor: 2} }
 
 // Version is a tmux version.
 //
@@ -174,9 +179,9 @@ func (c *Client) CheckVersion(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !v.AtLeast(MinimumVersion) {
+	if floor := MinimumVersion(); !v.AtLeast(floor) {
 		return fmt.Errorf("gotmucks: tmux %s is older than the required %s: %w",
-			v, MinimumVersion, ErrUnsupportedVersion)
+			v, floor, ErrUnsupportedVersion)
 	}
 	return nil
 }

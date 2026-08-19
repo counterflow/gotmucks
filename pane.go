@@ -100,11 +100,17 @@ func (c *Client) ListPanes(ctx context.Context) ([]Pane, error) {
 
 // ListSessionPanes returns every pane in one session, across all its windows.
 func (c *Client) ListSessionPanes(ctx context.Context, id SessionID) ([]Pane, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	return c.panes(ctx, "list-panes", "-s", "-t", string(id))
 }
 
 // ListWindowPanes returns the panes of one window.
 func (c *Client) ListWindowPanes(ctx context.Context, id WindowID) ([]Pane, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	return c.panes(ctx, "list-panes", "-t", string(id))
 }
 
@@ -126,6 +132,9 @@ func (c *Client) panes(ctx context.Context, args ...string) ([]Pane, error) {
 
 // Pane returns one pane by identifier.
 func (c *Client) Pane(ctx context.Context, id PaneID) (*Pane, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	panes, err := c.ListPanes(ctx)
 	if err != nil {
 		return nil, err
@@ -201,6 +210,9 @@ func (o CaptureOptions) args() []string {
 // [CaptureOptions.Escapes] set it contains terminal escape sequences, and
 // because pane contents are not guaranteed to be valid UTF-8.
 func (c *Client) CapturePane(ctx context.Context, id PaneID, opts CaptureOptions) ([]byte, error) {
+	if err := id.check(); err != nil {
+		return nil, err
+	}
 	args := append([]string{"capture-pane"}, opts.args()...)
 	args = append(args, "-t", string(id))
 

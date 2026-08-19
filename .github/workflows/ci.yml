@@ -107,6 +107,7 @@ jobs:
           bash ./scripts/probe-startup.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-argv.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-formats.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-blocks.sh "$HOME/tmux-install/bin/tmux" || true
 
       - name: Integration tests
         run: |

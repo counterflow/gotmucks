@@ -32,7 +32,9 @@ func SubscribeWindow(id WindowID) string { return string(id) }
 // target selects what the format is expanded for: [SubscribeSession],
 // [SubscribeAllPanes], [SubscribeAllWindows], or a single object via
 // [SubscribePane] or [SubscribeWindow]. tmux expands the format once per
-// matching object and reports a change at most once a second.
+// matching object and reports a change at most once a second. Anything else is
+// refused with [ErrInvalidID]: a name here would subscribe to whichever object
+// tmux resolved it to.
 //
 // Subscriptions are how a caller tracks tmux state without polling
 // list-sessions. Re-subscribing under an existing name replaces it; use
@@ -44,8 +46,29 @@ func (cc *ControlClient) Subscribe(ctx context.Context, name, target, format str
 	if strings.ContainsAny(name, ": \t") {
 		return fmt.Errorf("gotmucks: subscription name %q may not contain a colon or whitespace", name)
 	}
+	if err := checkSubscribeTarget(target); err != nil {
+		return err
+	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-B", name+":"+target+":"+format)
 	return err
+}
+
+// checkSubscribeTarget accepts the three wildcards tmux defines for the middle
+// field of a -B argument and otherwise insists on an identifier, since a name
+// here would quietly subscribe to whichever object tmux resolved it to.
+func checkSubscribeTarget(target string) error {
+	switch target {
+	case SubscribeSession, SubscribeAllPanes, SubscribeAllWindows:
+		return nil
+	}
+	switch target[0] {
+	case paneSigil:
+		return PaneID(target).check()
+	case windowSigil:
+		return WindowID(target).check()
+	}
+	return fmt.Errorf("gotmucks: subscription target %q is not a pane or window id: %w",
+		target, ErrInvalidID)
 }
 
 // Unsubscribe removes a subscription. tmux reads a -B argument with no colons
@@ -114,8 +137,8 @@ func (cc *ControlClient) PauseAfter(ctx context.Context, d time.Duration) error 
 
 // Resume restarts output for a pane that flow control paused.
 func (cc *ControlClient) Resume(ctx context.Context, pane PaneID) error {
-	if !pane.Valid() {
-		return fmt.Errorf("gotmucks: %q is not a pane id", string(pane))
+	if err := pane.check(); err != nil {
+		return err
 	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-A", string(pane)+":continue")
 	return err
@@ -123,8 +146,8 @@ func (cc *ControlClient) Resume(ctx context.Context, pane PaneID) error {
 
 // Pause stops output for a pane without waiting for it to fall behind.
 func (cc *ControlClient) Pause(ctx context.Context, pane PaneID) error {
-	if !pane.Valid() {
-		return fmt.Errorf("gotmucks: %q is not a pane id", string(pane))
+	if err := pane.check(); err != nil {
+		return err
 	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-A", string(pane)+":pause")
 	return err

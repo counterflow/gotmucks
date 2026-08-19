@@ -91,6 +91,9 @@ func (c *Client) SetOptionScoped(ctx context.Context, t Target, scope OptionScop
 	if name == "" {
 		return errors.New("gotmucks: empty option name")
 	}
+	if err := checkTarget(t); err != nil {
+		return err
+	}
 	args := []string{"set-option"}
 	args = append(args, scope.flags()...)
 	args = append(args, targetArgs(t)...)
@@ -103,6 +106,9 @@ func (c *Client) SetOptionScoped(ctx context.Context, t Target, scope OptionScop
 func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, name string) error {
 	if name == "" {
 		return errors.New("gotmucks: empty option name")
+	}
+	if err := checkTarget(t); err != nil {
+		return err
 	}
 	args := []string{"set-option", "-u"}
 	args = append(args, scope.flags()...)
@@ -128,6 +134,9 @@ func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, n
 func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, name string) (string, bool, error) {
 	if name == "" {
 		return "", false, errors.New("gotmucks: empty option name")
+	}
+	if err := checkTarget(t); err != nil {
+		return "", false, err
 	}
 	args := []string{"show-options"}
 	args = append(args, scope.flags()...)
@@ -177,6 +186,9 @@ func isUnknownOptionStderr(stderr string) bool {
 // escaping the characters that would otherwise break the line; both are undone
 // here, so a value containing a tab or a newline comes back intact.
 func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (map[string]string, error) {
+	if err := checkTarget(t); err != nil {
+		return nil, err
+	}
 	args := []string{"show-options"}
 	args = append(args, scope.flags()...)
 	args = append(args, targetArgs(t)...)

@@ -21,6 +21,9 @@ func (c *Client) SetHook(ctx context.Context, t Target, name, command string) er
 	if name == "" {
 		return errors.New("gotmucks: empty hook name")
 	}
+	if err := checkTarget(t); err != nil {
+		return err
+	}
 	args := []string{"set-hook"}
 	args = append(args, targetArgs(t)...)
 	args = append(args, "--", name, command)
@@ -40,6 +43,9 @@ func (c *Client) SetGlobalHook(ctx context.Context, name, command string) error 
 func (c *Client) UnsetHook(ctx context.Context, t Target, name string) error {
 	if name == "" {
 		return errors.New("gotmucks: empty hook name")
+	}
+	if err := checkTarget(t); err != nil {
+		return err
 	}
 	args := []string{"set-hook", "-u"}
 	args = append(args, targetArgs(t)...)
@@ -66,6 +72,9 @@ func (c *Client) UnsetGlobalHook(ctx context.Context, name string) error {
 // "set-hook -t $0" is reported for that session's windows and panes too.
 // Global hooks are not included; [Client.ShowGlobalHooks] reports those.
 func (c *Client) ShowHooks(ctx context.Context, t Target) (map[string]string, error) {
+	if err := checkTarget(t); err != nil {
+		return nil, err
+	}
 	args := []string{"show-hooks"}
 	args = append(args, targetArgs(t)...)
 	return c.hooks(ctx, args)

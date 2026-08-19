@@ -827,37 +827,80 @@ func TestDoRejectsUnsendableCommands(t *testing.T) {
 	// "rename-session -t $0 'a\x00b'" renamed the session to "a" and reported
 	// success. An unquoted ';' is subtler still: tmux runs both commands and
 	// answers each with its own block, so the second reply lands on whichever
-	// command comes next.
-	for _, cmd := range []string{"", "   ", "a\nb", "a\rb", "a\x00b", "list-sessions ; list-sessions"} {
+	// command comes next. A brace block is that same defect in tmux's other
+	// quoting form — see scripts/probe-blocks.sh.
+	cmds := []string{
+		"", "   ", "a\nb", "a\rb", "a\x00b",
+		"list-sessions ; list-sessions",
+		`if-shell "true" { list-sessions }`,
+		`if-shell "true" {list-sessions}`,
+	}
+	for _, cmd := range cmds {
 		if _, err := c.cc.Do(context.Background(), cmd); err == nil {
 			t.Errorf("Do(%q) was accepted", cmd)
 		}
 	}
+
+	// None of them reached tmux. That is the point of refusing them: a line
+	// that was written could not be unsent, and the queue would already be one
+	// reply out of step.
+	select {
+	case line := <-c.sent.lines:
+		t.Errorf("a rejected command was written anyway: %q", line)
+	default:
+	}
 }
 
-func TestCommandSeparator(t *testing.T) {
+func TestCommandBreak(t *testing.T) {
 	tests := []struct {
 		cmd  string
-		want bool // does tmux see a second command here?
+		want byte // 0 if this is one command
 	}{
-		{`list-sessions`, false},
-		{`list-sessions ; list-sessions`, true},
-		{`kill-session;`, true},
-		// Quoting is what tmux goes by, and quoteArg quotes a ';' because it
-		// is not in the safe set, so DoArgs can never trip this.
-		{`list-sessions -F 'A;B'`, false},
-		{`list-sessions -F "A;B"`, false},
-		{`send-keys a\;b`, false},
+		{`list-sessions`, 0},
+		{`list-sessions ; list-sessions`, ';'},
+		{`kill-session;`, ';'},
+		// Quoting is what tmux goes by, and quoteArg quotes both ';' and '{'
+		// because neither is in the safe set, so DoArgs can never trip this.
+		{`list-sessions -F 'A;B'`, 0},
+		{`list-sessions -F "A;B"`, 0},
+		{`send-keys a\;b`, 0},
 		// A backslash inside single quotes is literal, so it does not shield
 		// the quote that follows it.
-		{`display-message -p 'a' ; kill-server`, true},
-		{`display-message -p "it's here"`, false},
+		{`display-message -p 'a' ; kill-server`, ';'},
+		{`display-message -p "it's here"`, 0},
+
+		// A '{' opens a token, and tmux reads that token as a command list
+		// wherever the command takes one. Both readings produce the same line,
+		// so both are refused.
+		{`if-shell "true" { list-sessions }`, '{'},
+		{`if-shell "true" {list-sessions}`, '{'},
+		{`display-message -p {a}`, '{'},
+		{`{list-sessions}`, '{'},
+		// A brace anywhere but the start of a token is data, and the common
+		// case — a format — is quoted anyway.
+		{`display-message -p a{b`, 0},
+		{`list-sessions -F '#{session_id}'`, 0},
+		{`display-message -p "{a}"`, 0},
+		{`display-message -p \{a}`, 0},
+		// The ';' is found first, which is the more useful thing to say.
+		{`if-shell "true" ; { list-sessions }`, ';'},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.cmd, func(t *testing.T) {
-			if got := commandSeparator(tt.cmd) >= 0; got != tt.want {
-				t.Errorf("commandSeparator(%q) found a separator = %v, want %v", tt.cmd, got, tt.want)
+			b, i := commandBreak(tt.cmd)
+			if tt.want == 0 {
+				if i >= 0 {
+					t.Errorf("commandBreak(%q) = (%q, %d), want no break", tt.cmd, string(b), i)
+				}
+				return
+			}
+			if b != tt.want || i < 0 {
+				t.Errorf("commandBreak(%q) = (%q, %d), want %q", tt.cmd, string(b), i, string(tt.want))
+			}
+			if i >= 0 && tt.cmd[i] != tt.want {
+				t.Errorf("commandBreak(%q) pointed at %q, not the %q it reported",
+					tt.cmd, string(tt.cmd[i]), string(tt.want))
 			}
 		})
 	}
@@ -1370,6 +1413,89 @@ func TestSubscribeRejectsBadNames(t *testing.T) {
 		if err := c.cc.Subscribe(context.Background(), name, SubscribeSession, "#{x}"); err == nil {
 			t.Errorf("Subscribe accepted the name %q", name)
 		}
+	}
+}
+
+// TestSubscribeRejectsBadTargets: the middle field of a -B argument is one of
+// tmux's three wildcards or an identifier. A name there subscribes to whatever
+// tmux resolved it to, which is the failure addressing by id exists to remove.
+func TestSubscribeRejectsBadTargets(t *testing.T) {
+	c := newCtl(t)
+	for _, target := range []string{"bash", "editor", "%", "@", "%x", "@one", "$0"} {
+		err := c.cc.Subscribe(context.Background(), "s", target, "#{pane_title}")
+		if !errors.Is(err, ErrInvalidID) {
+			t.Errorf("Subscribe(target=%q) = %v, want an error wrapping ErrInvalidID", target, err)
+		}
+	}
+}
+
+// TestZeroControlClientIsAnEndedConnection pins what a ControlClient nobody
+// opened does. It is not a usable connection — only Connect makes one — but
+// reaching a method through it used to panic in three places, and one of those
+// panics was raised on a goroutine this package started, where no recover the
+// caller writes can reach it: it ended the process rather than the call.
+//
+// So the zero value answers as a connection that has already ended, which is
+// the one reading of it that is true.
+func TestZeroControlClientIsAnEndedConnection(t *testing.T) {
+	var cc ControlClient
+
+	if got := cc.Stderr(); got != "" {
+		t.Errorf("Stderr = %q, want empty", got)
+	}
+	if err := cc.Err(); !errors.Is(err, ErrServerExited) {
+		t.Errorf("Err = %v, want an error wrapping ErrServerExited", err)
+	}
+	if id := cc.AttachedSession(); id != "" {
+		t.Errorf("AttachedSession = %q, want empty", id)
+	}
+	if v := cc.Version(); !v.Unknown && v != (Version{}) {
+		t.Errorf("Version = %v, want the zero version", v)
+	}
+	if n := cc.Dropped(); n != 0 {
+		t.Errorf("Dropped = %d, want 0", n)
+	}
+
+	// Every channel is closed, so a caller ranging over one finishes instead
+	// of waiting on a connection that will never say anything.
+	select {
+	case _, ok := <-cc.Output("%0"):
+		if ok {
+			t.Error("the output tap delivered data")
+		}
+	default:
+		t.Error("Output left its channel open")
+	}
+	select {
+	case _, ok := <-cc.Events():
+		if ok {
+			t.Error("the event stream delivered an event")
+		}
+	default:
+		t.Error("Events left its channel open")
+	}
+	select {
+	case <-cc.Done():
+	default:
+		t.Error("Done is not closed")
+	}
+
+	cc.Untap("%0")
+
+	if _, err := cc.Do(context.Background(), "list-sessions"); !errors.Is(err, ErrServerExited) {
+		t.Errorf("Do = %v, want an error wrapping ErrServerExited", err)
+	}
+	if err := cc.Wait(context.Background()); !errors.Is(err, ErrServerExited) {
+		t.Errorf("Wait = %v, want an error wrapping ErrServerExited", err)
+	}
+	// Nothing was started, so there is nothing to report on and nothing to
+	// wait for. Close must say so rather than blocking on a channel no reader
+	// will ever close.
+	if err := cc.Close(); err != nil {
+		t.Errorf("Close = %v, want nil", err)
+	}
+	if err := cc.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil", err)
 	}
 }
 

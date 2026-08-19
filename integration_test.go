@@ -106,8 +106,8 @@ func TestIntegrationVersionMeetsMinimum(t *testing.T) {
 	}
 	t.Logf("tmux version: %s", v)
 
-	if !v.AtLeast(MinimumVersion) {
-		t.Fatalf("tmux %s is below the supported minimum %s", v, MinimumVersion)
+	if !v.AtLeast(MinimumVersion()) {
+		t.Fatalf("tmux %s is below the supported minimum %s", v, MinimumVersion())
 	}
 	if err := c.CheckVersion(ctx); err != nil {
 		t.Errorf("CheckVersion: %v", err)
@@ -978,7 +978,7 @@ func TestIntegrationControlConnect(t *testing.T) {
 	cc, _ := testControl(t)
 	ctx := testCtx(t)
 
-	if v := cc.Version(); !v.AtLeast(MinimumVersion) {
+	if v := cc.Version(); !v.AtLeast(MinimumVersion()) {
 		t.Errorf("control client version = %s", v)
 	}
 
@@ -1276,4 +1276,77 @@ func TestIntegrationControlAttachMissingSessionFails(t *testing.T) {
 		t.Fatal("Connect succeeded against a session that does not exist")
 	}
 	t.Logf("Connect failed as expected: %v", err)
+}
+
+// TestIntegrationNameIsNotAnAddress is the identifier rule against a tmux that
+// really would honour a name. The session is named so that tmux could resolve
+// it, and the package must still refuse to ask.
+func TestIntegrationNameIsNotAnAddress(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "work", Command: []string{"sleep", "600"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// tmux itself resolves the name; that is what makes the refusal necessary
+	// rather than pedantic.
+	if _, _, err := c.run(ctx, "has-session", "-t", "work"); err != nil {
+		t.Fatalf("tmux did not resolve the session name, so this test proves nothing: %v", err)
+	}
+
+	if err := c.KillSession(ctx, SessionID("work")); !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("KillSession by name = %v, want an error wrapping ErrInvalidID", err)
+	}
+	has, err := c.HasSession(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("HasSession: %v", err)
+	}
+	if !has {
+		t.Fatal("the session was killed by name")
+	}
+
+	// WithAttach cannot report anything itself, so Connect checks it.
+	cc, err := Connect(ctx, append(opts, WithAttach("work"))...)
+	if err == nil {
+		cc.Close()
+		t.Fatal("Connect attached to a session by name")
+	}
+	if !errors.Is(err, ErrInvalidID) {
+		t.Errorf("Connect(WithAttach(\"work\")) = %v, want an error wrapping ErrInvalidID", err)
+	}
+
+	// The identifier still works, which is the other half of the claim.
+	if err := c.KillSession(ctx, s.ID); err != nil {
+		t.Errorf("KillSession by id: %v", err)
+	}
+}
+
+// TestIntegrationControlRefusesCommandBlocks is G6 against real tmux: a brace
+// block earns a second reply block, so the connection would be one reply out
+// of step from then on. The command must be refused, and the connection must
+// still be in step afterwards.
+func TestIntegrationControlRefusesCommandBlocks(t *testing.T) {
+	cc, _ := testControl(t)
+	ctx := testCtx(t)
+
+	for _, cmd := range []string{
+		`if-shell "true" { list-sessions }`,
+		`if-shell "true" {list-sessions}`,
+		`list-sessions ; list-windows`,
+	} {
+		if _, err := cc.Do(ctx, cmd); err == nil {
+			t.Errorf("Do(%q) was accepted", cmd)
+		}
+	}
+
+	// Still in step: this reply is this command's, not a leftover.
+	reply, err := cc.Do(ctx, "display-message -p in-step")
+	if err != nil {
+		t.Fatalf("Do after the refusals: %v (stderr: %s)", err, cc.Stderr())
+	}
+	if reply.String() != "in-step" {
+		t.Errorf("reply = %q, want %q", reply.String(), "in-step")
+	}
 }

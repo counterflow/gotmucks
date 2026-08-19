@@ -17,10 +17,12 @@
 //
 // # Control mode
 //
-// [ControlClient] holds a persistent "tmux -CC" connection: commands go down
+// [ControlClient] holds a persistent "tmux -C" connection: commands go down
 // one pipe, and replies, live pane output and asynchronous notifications come
 // back up another, interleaved. This is the half no other Go package covers
-// and the reason this one exists.
+// and the reason this one exists. (The -CC form documented for applications
+// wants a terminal on standard input and exits at once against a pipe; see
+// [WithDoubleControlMode].)
 //
 //	cc, err := gotmucks.Connect(ctx, gotmucks.WithSocketName("myapp"))
 //	defer cc.Close()
@@ -40,6 +42,13 @@
 // "@1", [PaneID] "%2" — and never by name or index. Names change and indexes
 // renumber; identifiers do not. The three are distinct Go types so that a
 // pane cannot be passed where a window is wanted.
+//
+// They are string types, so the compiler cannot also stop SessionID("work")
+// being written, and tmux would resolve that as a name. Every call that puts
+// an identifier in a -t argument therefore checks its shape first and reports
+// [ErrInvalidID] rather than acting on whichever object the name reached.
+// Identifiers come back from tmux — [Session.ID], [Row.PaneID] — or from
+// [ParseSessionID] and its siblings; a name is not an address.
 //
 // # No server running
 //
