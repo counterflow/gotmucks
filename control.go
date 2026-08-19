@@ -201,8 +201,19 @@ func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		// os/exec closes the pipes it made from Start, and Start is not reached
+		// on this path, so the pair StdinPipe created has to be closed here:
+		// the write end it returned, and the read end it left in cmd.Stdin for
+		// the child. The only way StdoutPipe fails is os.Pipe failing, which
+		// means descriptors are already exhausted — the one moment at which
+		// leaking two more matters.
+		_ = stdin.Close()
+		if childEnd, ok := cmd.Stdin.(io.Closer); ok {
+			_ = childEnd.Close()
+		}
 		return nil, fmt.Errorf("gotmucks: control stdout: %w", err)
 	}
+	// Start closes both pairs itself if it fails, so nothing to undo here.
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("gotmucks: starting %s %s: %w", cfg.binary, strings.Join(args, " "), err)
 	}
@@ -406,13 +417,27 @@ func (cc *ControlClient) Dropped() uint64 { return cc.totalDrops.Load() }
 // receive is one %output notification, not one line.
 //
 // A tap lasts until [ControlClient.Untap] removes it or the connection ends.
-func (cc *ControlClient) Output(pane PaneID) <-chan []byte {
+//
+// An identifier that is not one is refused with [ErrInvalidID]. This call
+// builds no -t, so nothing would reach tmux, but a tap registered under a name
+// matches no %output notification and is silent for the life of the
+// connection — which is the failure addressing by identifier exists to remove.
+// It returns an error rather than a closed channel so that the mistake is
+// distinguishable from a connection that has ended.
+//
+// Note what the check does not buy. A well-formed identifier for a pane that
+// does not exist is accepted and is equally silent, deliberately: a tap may be
+// registered before the pane it names is created.
+func (cc *ControlClient) Output(pane PaneID) (<-chan []byte, error) {
+	if err := pane.check(); err != nil {
+		return nil, err
+	}
 	cc.ensure()
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
 	if t, ok := cc.taps[pane]; ok {
-		return t.ch
+		return t.ch, nil
 	}
 	t := &tap{ch: make(chan []byte, cc.cfg.outputBuffer)}
 	if cc.closed {
@@ -422,7 +447,7 @@ func (cc *ControlClient) Output(pane PaneID) <-chan []byte {
 		t.closed = true
 	}
 	cc.taps[pane] = t
-	return t.ch
+	return t.ch, nil
 }
 
 // Untap removes the tap [ControlClient.Output] registered for a pane and
@@ -430,8 +455,14 @@ func (cc *ControlClient) Output(pane PaneID) <-chan []byte {
 //
 // Taps are otherwise permanent, so a long-lived connection to a session that
 // churns through panes would accumulate a channel and a buffer for every pane
-// it ever saw. Untapping a pane that has none does nothing.
+// it ever saw. Untapping a pane that has none does nothing, and so does
+// untapping an identifier that is not one — [ControlClient.Output] refuses to
+// register a tap under one, so there can be nothing there to remove. Untap
+// says so itself rather than leaving it to be inferred from Output.
 func (cc *ControlClient) Untap(pane PaneID) {
+	if !pane.Valid() {
+		return
+	}
 	cc.ensure()
 	cc.mu.Lock()
 	defer cc.mu.Unlock()

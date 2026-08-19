@@ -94,7 +94,11 @@ func ExampleControlClient_Output() {
 
 	// The channel carries unescaped bytes as tmux framed them, which is not
 	// line-oriented: one receive is one notification, not one line.
-	for chunk := range cc.Output("%0") {
+	pane, err := cc.Output("%0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for chunk := range pane {
 		os.Stdout.Write(chunk)
 	}
 }

@@ -44,9 +44,10 @@
 // pane cannot be passed where a window is wanted.
 //
 // They are string types, so the compiler cannot also stop SessionID("work")
-// being written, and tmux would resolve that as a name. Every call that puts
-// an identifier in a -t argument therefore checks its shape first and reports
-// [ErrInvalidID] rather than acting on whichever object the name reached.
+// being written, and tmux would resolve that as a name. Every call that acts
+// on an identifier therefore checks its shape first and reports [ErrInvalidID]
+// rather than proceeding: the ones that build a -t, and [ControlClient.Output],
+// which builds none but would otherwise register a tap that matches nothing.
 // Identifiers come back from tmux — [Session.ID], [Row.PaneID] — or from
 // [ParseSessionID] and its siblings; a name is not an address.
 //

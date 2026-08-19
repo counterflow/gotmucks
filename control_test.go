@@ -90,6 +90,16 @@ func (c *ctl) send(lines ...string) {
 	}
 }
 
+// tap registers an output tap for a pane the test knows is well formed.
+func (c *ctl) tap(pane PaneID) <-chan []byte {
+	c.t.Helper()
+	ch, err := c.cc.Output(pane)
+	if err != nil {
+		c.t.Fatalf("Output(%s): %v", pane, err)
+	}
+	return ch
+}
+
 // sendRaw writes bytes with no newline handling, for prelude and terminator
 // tests.
 func (c *ctl) sendRaw(s string) {
@@ -447,7 +457,7 @@ func TestOutputEscapingIsUndone(t *testing.T) {
 func TestOutputTapAndFirehose(t *testing.T) {
 	c := newCtl(t)
 
-	tap := c.cc.Output("%1")
+	tap := c.tap("%1")
 
 	c.send(`%output %1 hello`)
 	c.send(`%output %2 other`)
@@ -477,14 +487,14 @@ func TestOutputTapAndFirehose(t *testing.T) {
 	}
 
 	// Repeat calls return the same channel rather than registering a second.
-	if again := c.cc.Output("%1"); again != tap {
+	if again := c.tap("%1"); again != tap {
 		t.Error("Output returned a different channel for the same pane")
 	}
 }
 
 func TestTapDoesNotAliasFirehoseBuffer(t *testing.T) {
 	c := newCtl(t)
-	tap := c.cc.Output("%0")
+	tap := c.tap("%0")
 
 	c.send(`%output %0 abc`)
 
@@ -699,7 +709,7 @@ func TestExitIsTerminal(t *testing.T) {
 
 func TestExitClosesPaneTaps(t *testing.T) {
 	c := newCtl(t)
-	tap := c.cc.Output("%0")
+	tap := c.tap("%0")
 
 	c.send("%exit")
 
@@ -1237,7 +1247,7 @@ func TestExitedSurvivesAFloodedChannel(t *testing.T) {
 func TestUntapClosesTheChannel(t *testing.T) {
 	c := newCtl(t)
 
-	tap := c.cc.Output("%0")
+	tap := c.tap("%0")
 	c.cc.Untap("%0")
 
 	select {
@@ -1251,7 +1261,7 @@ func TestUntapClosesTheChannel(t *testing.T) {
 
 	// Output after Untap registers a fresh tap rather than handing back the
 	// closed one.
-	again := c.cc.Output("%0")
+	again := c.tap("%0")
 	c.send(`%output %0 world`)
 
 	select {
@@ -1266,8 +1276,11 @@ func TestUntapClosesTheChannel(t *testing.T) {
 		t.Fatal("the replacement tap delivered nothing")
 	}
 
-	// Untapping a pane that has no tap is not an error.
+	// Untapping a pane that has no tap is not an error, and neither is
+	// untapping something that is not a pane id: Output would not have
+	// registered one under it.
 	c.cc.Untap("%9")
+	c.cc.Untap("bash")
 }
 
 // TestFailedWriteLeavesNoPendingCommand: a command whose write failed was
@@ -1416,6 +1429,45 @@ func TestSubscribeRejectsBadNames(t *testing.T) {
 	}
 }
 
+// TestOutputRejectsANameForAPane: Output builds no -t, so a name here reaches
+// no tmux — it registers a tap that matches no %output notification and is
+// silent for the life of the connection. That is the failure shape the
+// identifier rule exists to remove, so it is refused rather than registered.
+func TestOutputRejectsANameForAPane(t *testing.T) {
+	c := newCtl(t)
+
+	for _, pane := range []PaneID{"bash", "", "%", "0", "@1", "%1x"} {
+		ch, err := c.cc.Output(pane)
+		if !errors.Is(err, ErrInvalidID) {
+			t.Errorf("Output(%q) = (%v, %v), want an error wrapping ErrInvalidID", string(pane), ch, err)
+		}
+		if ch != nil {
+			t.Errorf("Output(%q) handed back a channel anyway", string(pane))
+		}
+	}
+
+	// Nothing was registered, so real output still reaches the firehose and a
+	// later well-formed tap.
+	tap := c.tap("%0")
+	c.send(`%output %0 hello`)
+
+	select {
+	case b := <-tap:
+		if string(b) != "hello" {
+			t.Errorf("tap got %q, want hello", b)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the tap delivered nothing")
+	}
+
+	c.cc.mu.Lock()
+	taps := len(c.cc.taps)
+	c.cc.mu.Unlock()
+	if taps != 1 {
+		t.Errorf("%d taps registered, want 1", taps)
+	}
+}
+
 // TestSubscribeRejectsBadTargets: the middle field of a -B argument is one of
 // tmux's three wildcards or an identifier. A name there subscribes to whatever
 // tmux resolved it to, which is the failure addressing by id exists to remove.
@@ -1458,8 +1510,12 @@ func TestZeroControlClientIsAnEndedConnection(t *testing.T) {
 
 	// Every channel is closed, so a caller ranging over one finishes instead
 	// of waiting on a connection that will never say anything.
+	tap, err := cc.Output("%0")
+	if err != nil {
+		t.Fatalf("Output: %v", err)
+	}
 	select {
-	case _, ok := <-cc.Output("%0"):
+	case _, ok := <-tap:
 		if ok {
 			t.Error("the output tap delivered data")
 		}
@@ -1545,7 +1601,7 @@ func TestOutputAfterCloseIsAClosedChannel(t *testing.T) {
 	nextEventOfType[Exited](c)
 
 	// Registering a tap on a dead connection must not hang the caller.
-	tap := c.cc.Output("%5")
+	tap := c.tap("%5")
 	select {
 	case _, ok := <-tap:
 		if ok {

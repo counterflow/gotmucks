@@ -1086,7 +1086,10 @@ func TestIntegrationControlPaneOutput(t *testing.T) {
 		t.Fatal("no panes")
 	}
 	pane := PaneID(reply.Output[0])
-	tap := cc.Output(pane)
+	tap, err := cc.Output(pane)
+	if err != nil {
+		t.Fatalf("Output(%s): %v", pane, err)
+	}
 
 	const marker = "gotmucks-live-output"
 	if _, err := cc.DoArgs(ctx, "send-keys", "-t", string(pane), "-l", marker); err != nil {

@@ -69,8 +69,9 @@ that no command asked for.
 `@1`, panes `%2`. Names change and indexes renumber. `SessionID`, `WindowID`
 and `PaneID` are distinct types, so a pane cannot be passed where a window is
 wanted — and since they are string types the compiler cannot stop
-`SessionID("work")` on its own, every call that builds a `-t` checks the shape
-too and fails with `ErrInvalidID` rather than letting tmux resolve a name.
+`SessionID("work")` on its own, every call that acts on an identifier checks
+the shape too and fails with `ErrInvalidID` rather than letting tmux resolve a
+name.
 
 **`context.Context` on everything.** These are subprocess calls and they can
 hang.

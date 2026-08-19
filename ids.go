@@ -15,10 +15,12 @@ import (
 // The types are defined over string, so the compiler keeps the three apart but
 // cannot stop SessionID("work") being written. tmux would resolve that as a
 // name, which is the whole failure this scheme exists to prevent, so the shape
-// is checked as well: every exported call that puts an identifier in a -t
-// argument runs check first and fails with [ErrInvalidID] rather than acting
-// on whatever the name reached. [ControlClient.Do] and [Client.QueryArgs] are
-// the deliberate exceptions: a command line assembled by the caller is the
+// is checked as well: every exported call that acts on an identifier runs
+// check first and fails with [ErrInvalidID] rather than acting on whatever the
+// name reached. That is every call that builds a -t, and
+// [ControlClient.Output], which builds none but would otherwise register a tap
+// that matches nothing. [ControlClient.Do] and [Client.QueryArgs] are the
+// deliberate exceptions: a command line assembled by the caller is the
 // caller's own.
 
 // SessionID is a tmux session identifier, of the form "$0".
