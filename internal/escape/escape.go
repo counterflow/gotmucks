@@ -20,7 +20,20 @@ package escape
 // and the data is more useful than the objection.
 //
 // The result is a fresh slice; src is not modified.
-func Unescape(src []byte) []byte {
+func Unescape(src []byte) []byte { return unescape(src) }
+
+// UnescapeString is [Unescape] for a string.
+//
+// It decodes the string in place of converting it first. That conversion is
+// the whole reason this is not simply Unescape([]byte(s)): %output arrives as
+// a string on the reader's hot path, and copying every line to a byte slice
+// just to allocate the destination beside it doubles the work per
+// notification for nothing.
+func UnescapeString(s string) []byte { return unescape(s) }
+
+// unescape is written once over both input types so the two entry points
+// cannot drift apart.
+func unescape[S ~string | ~[]byte](src S) []byte {
 	// Escaped output is never shorter than its decoding, so one allocation of
 	// len(src) is always enough.
 	dst := make([]byte, 0, len(src))
@@ -43,12 +56,9 @@ func Unescape(src []byte) []byte {
 	return dst
 }
 
-// UnescapeString is [Unescape] for a string.
-func UnescapeString(s string) []byte { return Unescape([]byte(s)) }
-
 // octalTriple decodes exactly three octal digits starting at i, reporting
 // whether they were there and fit in a byte.
-func octalTriple(src []byte, i int) (byte, bool) {
+func octalTriple[S ~string | ~[]byte](src S, i int) (byte, bool) {
 	if i+3 > len(src) {
 		return 0, false
 	}

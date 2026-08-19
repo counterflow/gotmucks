@@ -33,6 +33,22 @@ type ctl struct {
 func newCtl(t *testing.T, opts ...Option) *ctl {
 	t.Helper()
 
+	c := newBareCtl(t, opts...)
+
+	// Real tmux opens a block for the command that started the connection
+	// before it reads anything the client sends, and the client holds its
+	// first write until that block has been absorbed. A harness that skipped
+	// it would be testing an opening no tmux produces. Flags 0 is what 3.2a
+	// writes on that block; every reply carries 1.
+	c.startup(100)
+	return c
+}
+
+// newBareCtl is [newCtl] without tmux's opening block, for the few tests that
+// care about the very first bytes on the connection.
+func newBareCtl(t *testing.T, opts ...Option) *ctl {
+	t.Helper()
+
 	cfg := newConfig(append([]Option{WithCloseTimeout(2 * time.Second)}, opts...))
 	cc := newControlClient(cfg)
 
@@ -44,6 +60,15 @@ func newCtl(t *testing.T, opts ...Option) *ctl {
 
 	t.Cleanup(c.stop)
 	return c
+}
+
+// startup writes the unsolicited block tmux opens for its own start command.
+func (c *ctl) startup(number int) {
+	c.t.Helper()
+	c.send(
+		fmt.Sprintf("%%begin 1700000000 %d 0", number),
+		fmt.Sprintf("%%end 1700000000 %d 0", number),
+	)
 }
 
 // stop tears the connection down the way a real server would: the client's
@@ -140,16 +165,31 @@ func nextEventOfType[T Event](c *ctl) T {
 
 // cmdSink stands in for tmux's stdin, recording whole lines.
 type cmdSink struct {
-	mu     sync.Mutex
-	buf    bytes.Buffer
-	closed bool
-	lines  chan string
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	closed  bool
+	blocked chan struct{}
+	lines   chan string
 }
 
 func newCmdSink() *cmdSink { return &cmdSink{lines: make(chan string, 64)} }
 
+// block makes every later write hang, which is what a tmux that has stopped
+// draining its input does to the writer.
+func (s *cmdSink) block() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocked = make(chan struct{})
+}
+
 func (s *cmdSink) Write(p []byte) (int, error) {
 	s.mu.Lock()
+	if s.blocked != nil {
+		wedged := s.blocked
+		s.mu.Unlock()
+		<-wedged
+		return 0, io.ErrClosedPipe
+	}
 	if s.closed {
 		s.mu.Unlock()
 		return 0, io.ErrClosedPipe
@@ -181,6 +221,10 @@ func (s *cmdSink) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	if s.blocked != nil {
+		close(s.blocked)
+		s.blocked = nil
+	}
 	return nil
 }
 
@@ -611,7 +655,7 @@ func TestSessionChangedRecordsAttachedSession(t *testing.T) {
 }
 
 func TestDCSPreludeIsStripped(t *testing.T) {
-	c := newCtl(t)
+	c := newBareCtl(t)
 
 	// tmux -CC announces itself with a DCS sequence before anything else.
 	c.sendRaw(dcsEnter)
@@ -778,10 +822,44 @@ func TestAbandonedCommandKeepsCorrelation(t *testing.T) {
 func TestDoRejectsUnsendableCommands(t *testing.T) {
 	c := newCtl(t)
 
-	for _, cmd := range []string{"", "   ", "a\nb", "a\rb"} {
+	// A NUL is the subtle one: tmux reads the command line as a C string, so
+	// it does not fail, it truncates — verified against 3.2a, where
+	// "rename-session -t $0 'a\x00b'" renamed the session to "a" and reported
+	// success. An unquoted ';' is subtler still: tmux runs both commands and
+	// answers each with its own block, so the second reply lands on whichever
+	// command comes next.
+	for _, cmd := range []string{"", "   ", "a\nb", "a\rb", "a\x00b", "list-sessions ; list-sessions"} {
 		if _, err := c.cc.Do(context.Background(), cmd); err == nil {
-			t.Errorf("Do(%q) was accepted; an empty line detaches and a newline is a second command", cmd)
+			t.Errorf("Do(%q) was accepted", cmd)
 		}
+	}
+}
+
+func TestCommandSeparator(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		want bool // does tmux see a second command here?
+	}{
+		{`list-sessions`, false},
+		{`list-sessions ; list-sessions`, true},
+		{`kill-session;`, true},
+		// Quoting is what tmux goes by, and quoteArg quotes a ';' because it
+		// is not in the safe set, so DoArgs can never trip this.
+		{`list-sessions -F 'A;B'`, false},
+		{`list-sessions -F "A;B"`, false},
+		{`send-keys a\;b`, false},
+		// A backslash inside single quotes is literal, so it does not shield
+		// the quote that follows it.
+		{`display-message -p 'a' ; kill-server`, true},
+		{`display-message -p "it's here"`, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cmd, func(t *testing.T) {
+			if got := commandSeparator(tt.cmd) >= 0; got != tt.want {
+				t.Errorf("commandSeparator(%q) found a separator = %v, want %v", tt.cmd, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -881,6 +959,320 @@ func TestUnsolicitedBlockIsAbsorbed(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("an unsolicited block broke correlation")
+	}
+}
+
+// TestStartupBlockIsNotBoundToTheFirstCommand is the regression test for the
+// failure this whole barrier exists to prevent. tmux opens a block for its own
+// start command before it reads any of ours; a client that wrote first and
+// bound by queue order alone would hand that block's body to its first command
+// and shift every reply afterwards by one.
+func TestStartupBlockIsNotBoundToTheFirstCommand(t *testing.T) {
+	c := newBareCtl(t)
+
+	// The command is issued before tmux has said anything at all, which is
+	// the race: the queue is not empty by the time the opening block arrives.
+	done := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(context.Background(), "list-sessions")
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		done <- r
+	}()
+
+	// Nothing may be written until the opening block has been absorbed.
+	select {
+	case line := <-c.sent.lines:
+		t.Fatalf("wrote %q before tmux opened its first block", line)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	c.send("%begin 1700000000 261 0", "startup output", "%end 1700000000 261 0")
+
+	if cmd := c.nextCommand(); cmd != "list-sessions" {
+		t.Fatalf("command was %q", cmd)
+	}
+	c.reply(265, "$0")
+
+	select {
+	case r := <-done:
+		if len(r.Output) != 1 || r.Output[0] != "$0" {
+			t.Errorf("reply = %q, want the command's own output", r.Output)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the command never completed")
+	}
+}
+
+// TestBlockWithZeroFlagsIsUnsolicited covers the blocks the barrier cannot:
+// tmux runs commands on a client's behalf at any time — from a hook, say —
+// and guards those too. The flags word is how they are told apart, and it is
+// not a guess: tmux sets it from CMDQ_STATE_CONTROL, which only a command line
+// read from this client's input carries.
+func TestBlockWithZeroFlagsIsUnsolicited(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(context.Background(), "list-sessions")
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		done <- r
+	}()
+	c.nextCommand()
+
+	// A block tmux opened for itself, arriving while our command is in flight.
+	c.send("%begin 1700000000 300 0", "not ours", "%end 1700000000 300 0")
+	c.reply(301, "$0")
+
+	select {
+	case r := <-done:
+		if len(r.Output) != 1 || r.Output[0] != "$0" {
+			t.Errorf("reply = %q, want the command's own output", r.Output)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("an unsolicited block stole the command's reply")
+	}
+}
+
+// TestBlockWithNoFlagsFieldStillBinds keeps the flags rule from turning into a
+// hang against a tmux that stops writing the field: an absent flags word is
+// not the same statement as a zero one.
+func TestBlockWithNoFlagsFieldStillBinds(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(context.Background(), "list-sessions")
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		done <- r
+	}()
+	c.nextCommand()
+
+	c.send("%begin 1700000000 7", "$0", "%end 1700000000 7")
+
+	select {
+	case r := <-done:
+		if len(r.Output) != 1 || r.Output[0] != "$0" {
+			t.Errorf("reply = %q", r.Output)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("a block with no flags field was treated as unsolicited")
+	}
+}
+
+// TestAbandonedBlockFailsItsCommand: a second %begin while a block is open
+// leaves the pending in neither the queue nor cc.current, so nothing else can
+// ever wake it. It has to be failed here or the caller waits for ever.
+func TestAbandonedBlockFailsItsCommand(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "first")
+		done <- err
+	}()
+	c.nextCommand()
+
+	c.send("%begin 1700000000 1 1", "partial")
+	c.send("%begin 1700000000 2 1") // the first block never closed
+
+	select {
+	case err := <-done:
+		var pe *ProtocolError
+		if !errors.As(err, &pe) {
+			t.Fatalf("got %v (%T), want a *ProtocolError", err, err)
+		}
+		if !strings.Contains(pe.Reason, "still open") {
+			t.Errorf("Reason = %q", pe.Reason)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the abandoned command was stranded")
+	}
+}
+
+// TestMismatchedTerminatorFailsItsCommand: the body under a terminator for
+// some other block cannot be said to be this command's, and reporting it as a
+// successful reply would hand the caller another command's output.
+func TestMismatchedTerminatorFailsItsCommand(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "list-sessions")
+		done <- err
+	}()
+	c.nextCommand()
+
+	c.send("%begin 1700000000 5 1", "body", "%end 1700000000 9 1")
+
+	select {
+	case err := <-done:
+		var pe *ProtocolError
+		if !errors.As(err, &pe) {
+			t.Fatalf("got %v (%T), want a *ProtocolError", err, err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Do never returned")
+	}
+}
+
+// TestMalformedBlockHeaderIsNotABlock: a header whose arguments do not parse
+// has no command number, so binding on it would attach a command to a body
+// that may not be its own. It used to consume a queued command and deliver
+// the body as a successful reply.
+func TestMalformedBlockHeaderIsNotABlock(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "list-sessions")
+		done <- err
+	}()
+	c.nextCommand()
+
+	c.send("%begin garbage", "payload", "%end garbage")
+
+	ev := nextEventOfType[*ProtocolError](c)
+	if !strings.Contains(ev.Reason, "do not parse") {
+		t.Errorf("Reason = %q", ev.Reason)
+	}
+
+	// The command is still outstanding: nothing bound to it, so a real reply
+	// still can.
+	select {
+	case err := <-done:
+		t.Fatalf("Do returned %v; the malformed block should not have answered it", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	c.reply(0, "$0")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the real reply never arrived")
+	}
+}
+
+// TestExitedSurvivesAFloodedChannel: the terminal event has a slot of its own,
+// because a consumer ranging over the channel and waiting for Exited would
+// otherwise just see the channel close.
+func TestExitedSurvivesAFloodedChannel(t *testing.T) {
+	c := newCtl(t, WithEventBuffer(2))
+
+	for i := 0; i < 50; i++ {
+		c.send("%sessions-changed")
+	}
+	c.send("%exit flooded")
+
+	deadline := time.After(testTimeout)
+	for {
+		select {
+		case ev, ok := <-c.cc.Events():
+			if !ok {
+				t.Fatal("the channel closed without ever delivering Exited")
+			}
+			if ex, isExit := ev.(Exited); isExit {
+				if ex.Reason != "flooded" {
+					t.Errorf("Reason = %q", ex.Reason)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for Exited")
+		}
+	}
+}
+
+func TestUntapClosesTheChannel(t *testing.T) {
+	c := newCtl(t)
+
+	tap := c.cc.Output("%0")
+	c.cc.Untap("%0")
+
+	select {
+	case _, ok := <-tap:
+		if ok {
+			t.Error("an untapped channel delivered data")
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Untap did not close the channel")
+	}
+
+	// Output after Untap registers a fresh tap rather than handing back the
+	// closed one.
+	again := c.cc.Output("%0")
+	c.send(`%output %0 world`)
+
+	select {
+	case data, ok := <-again:
+		if !ok {
+			t.Fatal("the replacement tap was closed")
+		}
+		if string(data) != "world" {
+			t.Errorf("got %q, want world", data)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the replacement tap delivered nothing")
+	}
+
+	// Untapping a pane that has no tap is not an error.
+	c.cc.Untap("%9")
+}
+
+// TestFailedWriteLeavesNoPendingCommand: a command whose write failed was
+// never sent, so tmux will never open a block for it. Leaving it queued would
+// bind the next reply that does arrive to a command nobody is waiting on, and
+// every reply after that to the wrong one.
+func TestFailedWriteLeavesNoPendingCommand(t *testing.T) {
+	c := newCtl(t)
+
+	_ = c.sent.Close() // the pipe to tmux breaks
+
+	if _, err := c.cc.Do(context.Background(), "list-sessions"); err == nil {
+		t.Fatal("Do reported success although the command was never written")
+	}
+
+	c.cc.mu.Lock()
+	queued := len(c.cc.queue)
+	c.cc.mu.Unlock()
+	if queued != 0 {
+		t.Errorf("%d commands still queued after a failed write", queued)
+	}
+}
+
+// TestCloseIsBoundedByItsTimeout: the detach write is unbounded, so a tmux
+// that has stopped reading its input used to hold Close open indefinitely and
+// WithCloseTimeout never got a chance to apply.
+func TestCloseIsBoundedByItsTimeout(t *testing.T) {
+	c := newBareCtl(t, WithCloseTimeout(200*time.Millisecond))
+	c.sent.block()
+
+	// There is no process to kill here, so the reader has to be the thing
+	// that ends: closing the server side is what a killed tmux would look
+	// like. Close must not still be inside its write when that happens.
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		_ = c.out.Close()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.cc.Close()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Close blocked on a write that tmux was not reading")
 	}
 }
 

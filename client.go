@@ -45,7 +45,8 @@ func (c *Client) SocketArgs() []string { return c.cfg.globalArgs() }
 // A non-zero exit yields an [*ExitError]. Two exit conditions are classified
 // further and wrap a sentinel so callers can test them with errors.Is: a
 // missing server wraps [ErrNoServer], and an unresolvable target wraps
-// [ErrNoSession].
+// [ErrNoSession], [ErrNoWindow] or [ErrNoPane] according to what tmux said it
+// could not find.
 func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte, err error) {
 	full, tmuxArgs := c.cfg.argv(args)
 
@@ -85,11 +86,10 @@ func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte
 		return stdout, stderr, xerr
 	}
 
-	switch {
-	case isNoServerStderr(xerr.Stderr):
+	if isNoServerStderr(xerr.Stderr) {
 		xerr.Err = ErrNoServer
-	case isNoSessionStderr(xerr.Stderr):
-		xerr.Err = ErrNoSession
+	} else if target := missingTargetErr(xerr.Stderr); target != nil {
+		xerr.Err = target
 	}
 	return stdout, stderr, xerr
 }

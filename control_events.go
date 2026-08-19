@@ -146,8 +146,13 @@ type PasteBufferDeleted struct{ Buffer string }
 
 // Exited reports that the control connection has ended.
 //
-// It is terminal and is the last event on the channel before it closes. This
-// library does not reconnect on its own: only the caller knows whether a
+// It is terminal and is the last event on the channel before it closes. A slot
+// in the channel is held back for it alone, so a consumer that ranges over
+// [ControlClient.Events] and waits for this receives it even if it fell far
+// enough behind to lose ordinary events; [ControlClient.Wait] reports the same
+// thing for a caller that is not reading the stream.
+//
+// This library does not reconnect on its own: only the caller knows whether a
 // reconnect is wanted, and re-establishing state after one is the caller's
 // business.
 type Exited struct {

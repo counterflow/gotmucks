@@ -26,8 +26,10 @@ import (
 // once. See [WithDoubleControlMode].
 //
 // A ControlClient is safe for concurrent use. [ControlClient.Do] may be
-// called from many goroutines at once: commands are correlated with their
-// replies by tmux's command number, so more than one may be outstanding.
+// called from many goroutines at once: more than one command may be
+// outstanding, and each reply is bound to the command that earned it by queue
+// order rather than by tmux's command number, which cannot be predicted. See
+// beginBlock.
 type ControlClient struct {
 	cfg     config
 	version Version
@@ -59,9 +61,34 @@ type ControlClient struct {
 	pendingDrops atomic.Uint64
 	totalDrops   atomic.Uint64
 
+	// startup is closed once commands may be written. tmux opens a block for
+	// the command that started the connection before it reads any of ours,
+	// and a command written before the reader has absorbed that block would
+	// be bound to it. See awaitStartup.
+	startup     chan struct{}
+	startupOnce sync.Once
+
+	// sawFirstLine is owned by the reader goroutine and needs no lock. It
+	// distinguishes the block tmux opens for itself, which arrives first,
+	// from every later one.
+	sawFirstLine bool
+
+	// killed records that Close ran out of patience and killed tmux, so that
+	// the resulting signalled exit is not mistaken for a crash.
+	killed atomic.Bool
+
 	done      chan struct{}
 	closeOnce sync.Once
 	doneOnce  sync.Once
+	stdinOnce sync.Once
+
+	// reaped is closed once the tmux process has been waited for. It is what
+	// makes the last step of the teardown observable, since the reader does
+	// it after closing done so that nothing waiting on the connection's end
+	// is held up by a process that is slow to die.
+	reaped   chan struct{}
+	waitOnce sync.Once
+	waitErr  error
 }
 
 // pending is a command written to tmux and awaiting its reply block.
@@ -79,6 +106,11 @@ type pending struct {
 	// orphan marks a block tmux opened for a command this client did not
 	// send. Its body is absorbed and nobody is waiting on it.
 	orphan bool
+	// err is set when the reader could not deliver a trustworthy reply: the
+	// block was abandoned, or closed by a terminator belonging to another
+	// one. The command fails with it rather than being handed a body that may
+	// not be its own.
+	err error
 
 	done chan struct{}
 	once sync.Once
@@ -96,7 +128,9 @@ type tap struct {
 
 // Reply is the result of a control-mode command.
 type Reply struct {
-	// Number is the tmux command number the reply was correlated by.
+	// Number is the command number tmux assigned. It identifies the block on
+	// the wire; it is not what the reply was matched by, since the numbers
+	// are neither predictable nor contiguous.
 	Number int
 	// Time is the timestamp tmux reported on the closing %end or %error.
 	Time time.Time
@@ -182,12 +216,15 @@ func newControlClient(cfg config) *ControlClient {
 	return &ControlClient{
 		cfg:  cfg,
 		taps: make(map[PaneID]*tap),
-		// One slot beyond the caller's buffer is reserved for loss reports
-		// and the terminal event, so that a burst which fills the channel can
-		// still say that it did. See emit.
-		events: make(chan Event, cfg.eventBuffer+1),
-		done:   make(chan struct{}),
-		stderr: &syncBuffer{},
+		// Two slots beyond the caller's buffer are reserved: one for a loss
+		// report, so that a burst which fills the channel can still say that
+		// it did, and one for the terminal event, so that a loss report
+		// cannot take the slot the terminal event needs. See emit.
+		events:  make(chan Event, cfg.eventBuffer+2),
+		done:    make(chan struct{}),
+		startup: make(chan struct{}),
+		reaped:  make(chan struct{}),
+		stderr:  &syncBuffer{},
 	}
 }
 
@@ -195,6 +232,64 @@ func newControlClient(cfg config) *ControlClient {
 func (cc *ControlClient) start(stdin io.WriteCloser, stdout io.ReadCloser) {
 	cc.stdin, cc.stdout = stdin, stdout
 	go cc.readLoop()
+
+	// The reader lifts the startup barrier as soon as it knows whether tmux
+	// opened a block of its own. This is the backstop for one that says
+	// nothing at all until it is given a command: without it such a tmux
+	// would never be sent one, which is a worse failure than the race the
+	// barrier exists to remove.
+	time.AfterFunc(startupGrace, cc.releaseStartup)
+}
+
+// startupGrace bounds the wait for tmux's own opening block. Every release in
+// the support matrix emits it within milliseconds of starting — verified for
+// attach-session and new-session on 3.2a, including when the first command
+// was already sitting in the pipe — so this expires only against a tmux that
+// behaves differently from any known one.
+const startupGrace = 2 * time.Second
+
+// awaitStartup blocks until it is safe to write a command.
+//
+// tmux opens a block for the command that started the connection, and does so
+// before it reads anything from standard input. A command written before the
+// reader has absorbed that block would be bound to it by the queue-order
+// rule, and the caller would be handed the start command's output as its own
+// with no error, every later reply then shifted by one. Holding the first
+// write until the block has been seen removes the race rather than trying to
+// detect it afterwards.
+func (cc *ControlClient) awaitStartup(ctx context.Context) error {
+	select {
+	case <-cc.startup:
+		return nil
+	default:
+	}
+	select {
+	case <-cc.startup:
+		return nil
+	case <-cc.done:
+		return cc.terminalErr()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseStartup lifts the barrier. It is idempotent: the reader calls it on
+// the first line that rules a startup block out, on every block terminator,
+// and on teardown.
+func (cc *ControlClient) releaseStartup() {
+	cc.startupOnce.Do(func() { close(cc.startup) })
+}
+
+// started reports whether a command may already have been written. While it
+// is false the queue is certainly empty, so any block that opens is certainly
+// not a reply to one of ours.
+func (cc *ControlClient) started() bool {
+	select {
+	case <-cc.startup:
+		return true
+	default:
+		return false
+	}
 }
 
 // controlCommand is the tmux command a control connection issues on startup.
@@ -248,6 +343,8 @@ func (cc *ControlClient) Dropped() uint64 { return cc.totalDrops.Load() }
 //
 // Bytes are delivered as tmux framed them, which is not line-oriented: one
 // receive is one %output notification, not one line.
+//
+// A tap lasts until [ControlClient.Untap] removes it or the connection ends.
 func (cc *ControlClient) Output(pane PaneID) <-chan []byte {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -266,23 +363,77 @@ func (cc *ControlClient) Output(pane PaneID) <-chan []byte {
 	return t.ch
 }
 
+// Untap removes the tap [ControlClient.Output] registered for a pane and
+// closes its channel. A later Output for the same pane registers a fresh one.
+//
+// Taps are otherwise permanent, so a long-lived connection to a session that
+// churns through panes would accumulate a channel and a buffer for every pane
+// it ever saw. Untapping a pane that has none does nothing.
+func (cc *ControlClient) Untap(pane PaneID) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	t, ok := cc.taps[pane]
+	if !ok {
+		return
+	}
+	delete(cc.taps, pane)
+	if !t.closed {
+		t.closed = true
+		close(t.ch)
+	}
+}
+
 // Do sends a command and waits for its reply.
 //
-// cmd is a tmux command line, parsed by tmux itself; use [ControlClient.DoArgs]
-// to have arguments quoted for you. It must be a single line: a newline would
-// be a second command, and an empty line detaches the control client.
+// cmd is one tmux command line, parsed by tmux itself; use
+// [ControlClient.DoArgs] to have arguments quoted for you. It must be a single
+// line: a newline would be a second command, and an empty line detaches the
+// control client. It must also be a single command: tmux answers each command
+// of a ";"-separated list with a block of its own, so a list would leave
+// blocks over for the commands after it, and an unquoted ";" is rejected for
+// that reason. Send the commands one at a time instead — Do may be called
+// concurrently.
 //
-// It is safe to call Do concurrently. Replies are matched to commands by
-// tmux's command number, so several may be outstanding at once.
+// The same caveat applies, undetectably, to a command that makes tmux queue
+// further commands on this client. Verified on 3.2a:
+// "if-shell 'true' { list-sessions ; list-sessions }" produces three blocks,
+// one for the if-shell and one for each command in the braces, and all three
+// are marked as this client's. Nothing distinguishes the extra ones from
+// replies, so do not send a command block through a connection that other
+// goroutines are using.
+//
+// It is safe to call Do concurrently: several commands may be outstanding at
+// once, and each reply is bound to the command that earned it by the order the
+// commands were written in.
 //
 // A command tmux answers with %error yields a [*ControlError]; the reply is
-// still returned with the error body in its output.
+// still returned with the error body in its output. A [*ProtocolError] means
+// tmux said something about this command that could not be made sense of, and
+// the reply must not be trusted.
 func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	if strings.TrimSpace(cmd) == "" {
 		return Reply{}, errors.New("gotmucks: empty control command (an empty line detaches the client)")
 	}
-	if strings.ContainsAny(cmd, "\n\r") {
-		return Reply{}, errors.New("gotmucks: control command contains a newline")
+	// A newline would be a second command, and an empty line detaches the
+	// client. A NUL is worse than either: tmux reads the command line as a C
+	// string, so the command runs truncated at the NUL and reports success —
+	// verified on 3.2a, where rename-session with a NUL in the new name
+	// renamed the session to the part before it.
+	if i := strings.IndexAny(cmd, "\n\r\x00"); i >= 0 {
+		return Reply{}, fmt.Errorf(
+			"gotmucks: control command contains %q at byte %d and cannot be sent as written",
+			cmd[i:i+1], i)
+	}
+	if i := commandSeparator(cmd); i >= 0 {
+		return Reply{}, fmt.Errorf(
+			"gotmucks: control command has an unquoted %q at byte %d, which tmux reads as the "+
+				"start of a second command; each command is answered with its own reply block, so "+
+				"the extra one would be delivered to whichever command follows. Send them separately",
+			";", i)
+	}
+	if err := cc.awaitStartup(ctx); err != nil {
+		return Reply{}, err
 	}
 
 	p := &pending{cmd: cmd, done: make(chan struct{})}
@@ -319,6 +470,9 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	}
 
 	reply := Reply{Number: p.number, Output: p.lines, Flags: p.flags, Time: p.replyTime}
+	if p.err != nil {
+		return reply, p.err
+	}
 	if !p.answered {
 		return reply, cc.terminalErr()
 	}
@@ -330,6 +484,33 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 		}
 	}
 	return reply, nil
+}
+
+// commandSeparator reports the offset of a ';' tmux would read as ending one
+// command and starting another, or -1 if there is none.
+//
+// Quoting is what makes the difference, and tmux's rules for it are the ones
+// applied here: single quotes take everything literally, which is why
+// quoteArg prefers them, while a backslash escapes the next byte anywhere
+// else. Verified on 3.2a, where "list-sessions -F 'A;B'" is one command
+// producing one block.
+func commandSeparator(cmd string) int {
+	var quote byte
+	for i := 0; i < len(cmd); i++ {
+		switch c := cmd[i]; {
+		case c == '\\' && quote != '\'':
+			i++ // an escaped byte is data, ";" included
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == ';':
+			return i
+		}
+	}
+	return -1
 }
 
 // DoArgs sends a command built from separate arguments, each quoted for
@@ -377,9 +558,9 @@ func (cc *ControlClient) unqueue(p *pending) {
 // Wait blocks until the connection ends and reports why.
 //
 // It returns nil for a clean exit — tmux sent %exit, or [ControlClient.Close]
-// was called — and an error wrapping [ErrServerExited] otherwise. Unlike the
-// [Exited] event, which is dropped if the event channel is full, this is
-// always available.
+// was called — and an error wrapping [ErrServerExited] otherwise. It reports
+// the same thing as the [Exited] event, for a caller that is not reading the
+// event stream.
 func (cc *ControlClient) Wait(ctx context.Context) error {
 	select {
 	case <-cc.done:
@@ -409,8 +590,17 @@ func (cc *ControlClient) Stderr() string { return cc.stderr.String() }
 // Close ends the connection.
 //
 // It writes the empty line that detaches a control client, then waits for
-// tmux to exit, killing it if it outstays [WithCloseTimeout]. Close is
-// idempotent and safe to call concurrently with anything else.
+// tmux to exit, killing it if it outstays [WithCloseTimeout]. That timeout
+// bounds the whole of Close, the detach write included. Close is idempotent
+// and safe to call concurrently with anything else.
+//
+// It returns an error if tmux did not end the way it was asked to — an exit
+// status of its own, or a signal this package did not send.
+//
+// Calling it is good manners rather than a requirement for tidiness: the
+// reader reaps the process whenever the connection ends, so a caller that
+// watches [ControlClient.Done] instead leaks nothing. What Close adds is the
+// clean detach and the report of how tmux went.
 //
 // Closing detaches the control client; it does not kill the session or the
 // server. Use [Client.KillSession] for that.
@@ -422,29 +612,65 @@ func (cc *ControlClient) Close() error {
 		cc.userClose = true
 		cc.mu.Unlock()
 
-		// An empty line is how a control client detaches.
-		cc.writeMu.Lock()
-		_, _ = io.WriteString(cc.stdin, "\n")
-		cc.writeMu.Unlock()
-		_ = cc.stdin.Close()
+		// The detach write is unbounded: a tmux that has stopped draining its
+		// input blocks it for as long as it likes, and it would then consume
+		// the close timeout rather than being covered by it. Running it on its
+		// own goroutine is what makes WithCloseTimeout bound the whole of
+		// Close rather than only the part after the write returned.
+		go cc.detach()
 
 		select {
 		case <-cc.done:
 		case <-time.After(cc.cfg.closeTimeout):
+			// Closing the pipe releases a detach write that is still stuck.
+			cc.closeStdin()
+			cc.killed.Store(true)
 			if cc.cmd != nil && cc.cmd.Process != nil {
 				_ = cc.cmd.Process.Kill()
 			}
 			<-cc.done
 		}
-		if cc.cmd == nil {
-			return // in-memory connection; there is no process to reap
-		}
-		err = cc.cmd.Wait()
-		if err != nil && cc.isCleanExit(err) {
-			err = nil
-		}
+		err = cc.reap()
 	})
 	return err
+}
+
+// detach writes the empty line that ends a control client's connection, then
+// closes the pipe so that tmux sees end of file either way.
+func (cc *ControlClient) detach() {
+	cc.writeMu.Lock()
+	_, _ = io.WriteString(cc.stdin, "\n")
+	cc.writeMu.Unlock()
+	cc.closeStdin()
+}
+
+// closeStdin closes the command pipe once, whoever gets there first.
+func (cc *ControlClient) closeStdin() {
+	cc.stdinOnce.Do(func() {
+		if cc.stdin != nil {
+			_ = cc.stdin.Close()
+		}
+	})
+}
+
+// reap waits for the tmux process and reports whether it ended cleanly.
+//
+// It is idempotent, and both the reader and Close call it: the reader so that
+// a caller who watches [ControlClient.Done] and never calls Close still does
+// not leak a zombie and the pipes that came with it, and Close because it is
+// the one that reports the result.
+func (cc *ControlClient) reap() error {
+	cc.waitOnce.Do(func() {
+		if cc.cmd != nil { // an in-memory connection has no process
+			err := cc.cmd.Wait()
+			if err != nil && cc.isCleanExit(err) {
+				err = nil
+			}
+			cc.waitErr = err
+		}
+		close(cc.reaped)
+	})
+	return cc.waitErr
 }
 
 // isCleanExit reports whether a process error is the expected consequence of
@@ -454,25 +680,64 @@ func (cc *ControlClient) isCleanExit(err error) bool {
 	if !errors.As(err, &exitErr) {
 		return false
 	}
-	// tmux exits 0 on a clean detach. A signalled exit is our own Kill.
-	return exitErr.ExitCode() <= 0
+	return cleanExitCode(exitErr.ExitCode(), cc.killed.Load())
 }
 
-// syncBuffer is a bytes.Buffer safe for the concurrent writes os/exec makes
+// cleanExitCode decides whether an exit status is one this package caused.
+//
+// tmux exits 0 on a clean detach. ExitCode reports -1 for an exit by any
+// signal, which covers this package's own Kill and equally a tmux that died on
+// SIGSEGV, so only the former is forgiven: a server that crashed without the
+// caller being told is exactly what Close's error is for.
+func cleanExitCode(code int, killed bool) bool {
+	if code < 0 {
+		return killed
+	}
+	return code == 0
+}
+
+// maxStderr caps how much of tmux's standard error is kept.
+//
+// A control connection lives as long as the caller wants it to, and a tmux
+// writing a warning a minute would otherwise grow this without bound. The
+// earliest bytes are the ones worth keeping: what appears here is
+// configuration errors and startup complaints, and a later flood is far more
+// likely to be repetition than news.
+const maxStderr = 64 << 10
+
+// syncBuffer is a capped buffer safe for the concurrent writes os/exec makes
 // from its own goroutine while the owner reads.
 type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	dropped int
 }
 
 func (b *syncBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(p)
+
+	room := maxStderr - b.buf.Len()
+	switch {
+	case room <= 0:
+		b.dropped += len(p)
+	case len(p) > room:
+		b.buf.Write(p[:room])
+		b.dropped += len(p) - room
+	default:
+		return b.buf.Write(p)
+	}
+	// The whole write is reported as accepted: os/exec's copier abandons the
+	// stream on a short write, and there is nothing to be gained by telling
+	// it that a diagnostic buffer is full.
+	return len(p), nil
 }
 
 func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.String()
+	if b.dropped == 0 {
+		return b.buf.String()
+	}
+	return fmt.Sprintf("%s\n[%d further bytes of tmux stderr discarded]", b.buf.String(), b.dropped)
 }

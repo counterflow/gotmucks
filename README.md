@@ -55,8 +55,11 @@ for ev := range cc.Events() {
 }
 ```
 
-`Do` is safe to call from many goroutines: replies are correlated with their
-commands by tmux's command number, so more than one may be outstanding.
+`Do` is safe to call from many goroutines: more than one command may be
+outstanding, and each reply is bound to the command that earned it by the
+order the commands were written in. Not by tmux's command number — those
+neither start at zero nor run contiguously, and tmux opens blocks of its own
+that no command asked for.
 
 ---
 

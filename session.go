@@ -182,7 +182,7 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 		// the session, and take the server with it (a server with no sessions
 		// exits at once) before this second call lands. Report what is known
 		// rather than an error for a session that really was created.
-		if errors.Is(err, ErrNoSession) || errors.Is(err, ErrNoServer) {
+		if isMissingTarget(err) || errors.Is(err, ErrNoServer) {
 			return &Session{ID: id, Name: opts.Name}, nil
 		}
 		return nil, err
@@ -294,7 +294,7 @@ func (c *Client) HasSession(ctx context.Context, id SessionID) (bool, error) {
 	switch {
 	case err == nil:
 		return true, nil
-	case errors.Is(err, ErrNoServer), errors.Is(err, ErrNoSession):
+	case errors.Is(err, ErrNoServer), isMissingTarget(err):
 		return false, nil
 	default:
 		return false, err
@@ -307,7 +307,7 @@ func (c *Client) HasSession(ctx context.Context, id SessionID) (bool, error) {
 // running, is success.
 func (c *Client) KillSession(ctx context.Context, id SessionID) error {
 	err := c.runOK(ctx, "kill-session", "-t", string(id))
-	if err != nil && (errors.Is(err, ErrNoServer) || errors.Is(err, ErrNoSession)) {
+	if err != nil && (errors.Is(err, ErrNoServer) || isMissingTarget(err)) {
 		return nil
 	}
 	return err

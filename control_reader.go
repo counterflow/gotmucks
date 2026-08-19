@@ -62,6 +62,29 @@ func (cc *ControlClient) readLoop() {
 func (cc *ControlClient) handleLine(line string) bool {
 	cl := ctlparse.Classify(line)
 
+	// The first line settles whether there is a startup block to absorb: tmux
+	// opens one for the command that started the connection, before it reads
+	// anything from standard input. If the connection opens with anything
+	// else, there is none, and commands may be written at once.
+	if !cc.sawFirstLine {
+		cc.sawFirstLine = true
+		if cl.Kind != ctlparse.KindBegin || cl.Malformed {
+			cc.releaseStartup()
+		}
+	}
+
+	// Malformed is only ever set for a block header, and a header whose
+	// arguments did not parse has no command number to bind by. Opening or
+	// closing a block on a guessed number would attach a command to a body
+	// that is not its own, so the line is reported and otherwise ignored.
+	if cl.Malformed {
+		cc.emit(&ProtocolError{
+			Line:   cl.Raw,
+			Reason: "block " + cl.Kind.String() + " with arguments that do not parse",
+		})
+		return true
+	}
+
 	switch cl.Kind {
 	case ctlparse.KindBegin:
 		cc.beginBlock(cl)
@@ -82,21 +105,44 @@ func (cc *ControlClient) handleLine(line string) bool {
 //
 // Binding is by queue order rather than by predicting the number: tmux
 // processes a connection's commands in the order it receives them, and writes
-// are serialised, so the front of the queue is always the command this block
-// belongs to. That holds whatever base tmux numbers from.
+// are serialised, so the front of the queue is the command this block belongs
+// to. That holds whatever base tmux numbers from.
+//
+// The rule needs a companion for blocks that did not come from the queue at
+// all, since tmux opens one for the command that started the connection and
+// for anything else it runs on this client's behalf. Two things identify
+// those, and both are needed:
+//
+//   - Nothing has been written yet. Commands are held until the reader has
+//     absorbed tmux's opening block (see awaitStartup), so while the barrier
+//     stands the queue is empty by construction rather than by luck.
+//   - The flags word is zero. tmux sets it from CMDQ_STATE_CONTROL, which is
+//     set only for a command line read from the control client's own input,
+//     so zero means the block answers something this client did not send.
+//     Verified on 3.2a: the opening block carries 0 and every reply carries 1.
+//     A tmux that stopped writing the field at all is not second-guessed.
 func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
-	var stray Event
+	var (
+		stray     Event
+		abandoned *pending
+	)
 
 	cc.mu.Lock()
 	if cc.current != nil {
-		stray = &ProtocolError{Line: cl.Raw, Reason: "%begin while a block was still open"}
+		// The open block never got its terminator. Whoever is waiting on it
+		// must be told now: once it is neither in the queue nor in cc.current,
+		// even the teardown cannot find it, and Do would wait for ever.
+		pe := &ProtocolError{Line: cl.Raw, Reason: "%begin while a block was still open"}
+		abandoned, stray = cc.current, pe
+		abandoned.err = pe
 		cc.current = nil
 	}
-	if len(cc.queue) == 0 {
+	switch {
+	case !cc.started(), unsolicitedBlock(cl), len(cc.queue) == 0:
 		// A block for a command this client did not send. Absorb its body so
 		// the lines are not reported as stray output.
 		cc.current = &pending{number: cl.Number, orphan: true, done: make(chan struct{})}
-	} else {
+	default:
 		p := cc.queue[0]
 		cc.queue = cc.queue[1:]
 		p.number = cl.Number
@@ -104,10 +150,17 @@ func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
 	}
 	cc.mu.Unlock()
 
+	if abandoned != nil && !abandoned.orphan {
+		abandoned.finish()
+	}
 	if stray != nil {
 		cc.emit(stray)
 	}
 }
+
+// unsolicitedBlock reports a block tmux opened for a command this client did
+// not send, by the flags word of its header. See beginBlock.
+func unsolicitedBlock(cl ctlparse.Line) bool { return cl.HasFlags && cl.Flags == 0 }
 
 // endBlock closes the open block and wakes the command waiting on it.
 func (cc *ControlClient) endBlock(cl ctlparse.Line, failed bool) {
@@ -122,18 +175,31 @@ func (cc *ControlClient) endBlock(cl ctlparse.Line, failed bool) {
 	case p == nil:
 		stray = &ProtocolError{Line: cl.Raw, Reason: "block terminator with no open block"}
 	case p.number != cl.Number:
-		stray = &ProtocolError{
+		// The terminator belongs to some other block, so the body collected
+		// under it cannot be said to be this command's. Completing the command
+		// would hand the caller someone else's output with a nil error, and a
+		// %error would be reported as success; the only honest answer is to
+		// fail it. The event says the same thing to a consumer watching the
+		// stream, but that channel is lossy, so the error goes to the caller
+		// directly as well.
+		pe := &ProtocolError{
 			Line:   cl.Raw,
 			Reason: fmt.Sprintf("terminator for command %d closed block %d", cl.Number, p.number),
 		}
-	}
-	if p != nil {
+		p.err, stray = pe, pe
+	default:
 		p.failed = failed
 		p.answered = true
+	}
+	if p != nil {
 		p.flags = cl.Flags
 		p.replyTime = time.Unix(cl.Time, 0)
 	}
 	cc.mu.Unlock()
+
+	// A block has closed, so whatever tmux was going to say for itself has
+	// been said and commands may be written.
+	cc.releaseStartup()
 
 	if stray != nil {
 		cc.emit(stray)
@@ -322,27 +388,37 @@ func (cc *ControlClient) malformed(cl ctlparse.Line) {
 // Each destination gets its own copy. Sharing one slice between the firehose
 // and a tap would hand two consumers the same mutable buffer, which is a
 // worse trade than an allocation.
+//
+// The send to the tap happens under the lock. It cannot block — the send is
+// non-blocking and the reader never waits on a consumer — and holding the
+// lock across the lookup and the send is what makes [ControlClient.Untap]
+// safe, since a tap closed between the two would otherwise be sent on after
+// it was closed.
 func (cc *ControlClient) deliverOutput(pane PaneID, data []byte, extended bool, age time.Duration) {
 	cc.emit(PaneOutput{Pane: pane, Data: data, Extended: extended, Age: age})
 
 	cc.mu.Lock()
 	t := cc.taps[pane]
-	cc.mu.Unlock()
-	if t == nil {
+	if t == nil || t.closed {
+		cc.mu.Unlock()
 		return
 	}
 
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
+	var recovered uint64
 	select {
 	case t.ch <- cp:
-		if n := t.drops.Swap(0); n > 0 {
-			cc.emit(OutputDropped{Pane: pane, Count: n})
-		}
+		recovered = t.drops.Swap(0)
 	default:
 		t.drops.Add(1)
 		t.total.Add(1)
+	}
+	cc.mu.Unlock()
+
+	if recovered > 0 {
+		cc.emit(OutputDropped{Pane: pane, Count: recovered})
 	}
 }
 
@@ -352,13 +428,15 @@ func (cc *ControlClient) deliverOutput(pane PaneID, data []byte, extended bool, 
 // every other pane's output as well, so a full channel drops the event
 // instead. The loss is then reported as an [EventsDropped] event.
 //
-// The channel is allocated one slot larger than the buffer the caller asked
+// The channel is allocated two slots larger than the buffer the caller asked
 // for, and ordinary events are only allowed to fill it to that requested
-// size. The spare slot is reserved for loss reports and for the terminal
-// event. Without the reservation, a burst that filled the channel could only
-// report itself once some later event happened to be emitted — so a caller
-// that fell behind and then went quiet would never be told, which is the one
-// case where being told matters most.
+// size. The first spare slot is for loss reports: without it, a burst that
+// filled the channel could only report itself once some later event happened
+// to be emitted, so a caller that fell behind and then went quiet would never
+// be told, which is the one case where being told matters most. The second is
+// for the terminal event alone, so that a loss report cannot take the slot
+// [Exited] needs — a consumer ranging over the channel and waiting for it
+// would otherwise just see the channel close.
 func (cc *ControlClient) emit(ev Event) {
 	cc.flushDrops()
 
@@ -375,8 +453,10 @@ func (cc *ControlClient) emit(ev Event) {
 	cc.flushDrops()
 }
 
-// emitReserved publishes an event that may use the reserved slot. It is for
-// the terminal event, which is worth more than one more notification.
+// emitReserved publishes an event into the slot kept for the terminal event.
+// Nothing else may use that slot, so this never drops in practice; the
+// default arm is there because a send on a full channel would otherwise block
+// the teardown.
 func (cc *ControlClient) emitReserved(ev Event) {
 	select {
 	case cc.events <- ev:
@@ -386,17 +466,21 @@ func (cc *ControlClient) emitReserved(ev Event) {
 }
 
 // flushDrops reports accumulated losses if there is room, and puts the count
-// back if there is not.
+// back if there is not. It may use the first reserved slot but not the second,
+// which belongs to the terminal event.
 func (cc *ControlClient) flushDrops() {
 	n := cc.pendingDrops.Swap(0)
 	if n == 0 {
 		return
 	}
-	select {
-	case cc.events <- EventsDropped{Count: n}:
-	default:
-		cc.pendingDrops.Add(n)
+	if len(cc.events) <= cc.cfg.eventBuffer {
+		select {
+		case cc.events <- EventsDropped{Count: n}:
+			return
+		default:
+		}
 	}
+	cc.pendingDrops.Add(n)
 }
 
 // finishReader tears the connection down once the read side has ended. It is
@@ -450,5 +534,15 @@ func (cc *ControlClient) finishReader(readErr error) {
 		close(t.ch)
 	}
 	close(cc.events)
+
+	// A command written now would never be answered, so nothing should be
+	// waiting on the barrier for the two seconds the backstop would take.
+	cc.releaseStartup()
+	cc.closeStdin()
 	cc.doneOnce.Do(func() { close(cc.done) })
+
+	// Reap last. Close waits on done and then reaps itself, so a caller that
+	// never calls Close still does not leave a zombie and its pipes behind,
+	// and one that does is not made to wait for the process here.
+	_ = cc.reap()
 }

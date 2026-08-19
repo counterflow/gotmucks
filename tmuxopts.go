@@ -111,42 +111,71 @@ func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, n
 	return c.runOK(ctx, args...)
 }
 
-// ShowOption returns the value of a single option and whether it was set.
+// ShowOption returns the value of a single option and whether it is set in
+// the requested table.
 //
-// It uses show-options -v, which prints the bare value, so the result needs
-// no unquoting.
+// A name tmux does not know, a server that is not running and a target that
+// does not exist are all absences rather than failures: the value is empty,
+// the bool is false, and the error is nil.
+//
+// It asks show-options for one name rather than using show-options -v, even
+// though -v would print the value with no quoting to undo. -v cannot answer
+// the question this function exists to answer: an option that is not set in
+// the table produces exit 0 and an empty line, exactly like one that is set
+// to the empty string — verified on 3.2a. The named form prints nothing at
+// all when the option is not set there, which is the distinction the bool
+// reports.
 func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, name string) (string, bool, error) {
 	if name == "" {
 		return "", false, errors.New("gotmucks: empty option name")
 	}
-	args := []string{"show-options", "-v"}
+	args := []string{"show-options"}
 	args = append(args, scope.flags()...)
 	args = append(args, targetArgs(t)...)
 	args = append(args, "--", name)
 
-	out, _, err := c.run(ctx, args...)
+	lines, err := c.runLines(ctx, args...)
 	if err != nil {
-		// tmux exits non-zero for an option that is not set in the requested
-		// table, which is an absence rather than a failure.
-		if errors.Is(err, ErrNoServer) || errors.Is(err, ErrNoSession) {
+		if errors.Is(err, ErrNoServer) || isMissingTarget(err) {
 			return "", false, nil
 		}
 		var xerr *ExitError
-		if errors.As(err, &xerr) && strings.Contains(strings.ToLower(xerr.Stderr), "unknown option") {
+		if errors.As(err, &xerr) && isUnknownOptionStderr(xerr.Stderr) {
 			return "", false, nil
 		}
 		return "", false, err
 	}
-	return strings.TrimSuffix(string(out), "\n"), true, nil
+	if len(lines) == 0 || lines[0] == "" {
+		return "", false, nil
+	}
+	// "name value", or the name alone for a flag option set with no value.
+	_, value, ok := strings.Cut(lines[0], " ")
+	if !ok {
+		return "", true, nil
+	}
+	return unquoteOptionValue(value), true, nil
+}
+
+// unknownOptionPatterns are how tmux says it has never heard of an option
+// name. 3.2a says "invalid option: <name>"; the other spelling is kept
+// because the wording has moved before and matching both costs nothing.
+var unknownOptionPatterns = []string{"invalid option", "unknown option"}
+
+func isUnknownOptionStderr(stderr string) bool {
+	s := strings.ToLower(stderr)
+	for _, p := range unknownOptionPatterns {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // ShowOptions returns every option in a scope.
 //
-// tmux prints one "name value" pair per line and quotes values that need it;
-// quoted values are unquoted here. Values containing newlines cannot be
-// represented in this output and are returned truncated at the newline, which
-// is a limitation of show-options rather than of this package — use
-// [Client.ShowOption] for those.
+// tmux prints one "name value" pair per line, quoting values that need it and
+// escaping the characters that would otherwise break the line; both are undone
+// here, so a value containing a tab or a newline comes back intact.
 func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (map[string]string, error) {
 	args := []string{"show-options"}
 	args = append(args, scope.flags()...)
@@ -154,7 +183,7 @@ func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (
 
 	lines, err := c.runLines(ctx, args...)
 	if err != nil {
-		if errors.Is(err, ErrNoServer) || errors.Is(err, ErrNoSession) {
+		if errors.Is(err, ErrNoServer) || isMissingTarget(err) {
 			return map[string]string{}, nil
 		}
 		return nil, err
@@ -176,20 +205,87 @@ func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (
 	return opts, nil
 }
 
-// unquoteOptionValue strips the quoting show-options applies to values that
-// contain spaces or metacharacters.
+// unquoteOptionValue undoes what tmux does to an option value on its way out
+// of show-options.
+//
+// tmux quotes a value that contains a space or a metacharacter, and escapes
+// the rest with vis(3) in its C style: a backslash becomes "\\", a tab "\t", a
+// newline "\n", and anything else unprintable three octal digits. The
+// escaping is applied whether or not the value ends up quoted, so unquoting
+// alone is not enough — verified on 3.2a, where a value containing a tab is
+// printed unquoted as "has\ttab".
+//
+// This is one left-to-right pass rather than a sequence of replacements. Two
+// passes over the whole string — undoing "\\" and then "\t" or the other way
+// round — is the shape that turns a literal backslash followed by a t into a
+// tab, and it happens to be safe here only because of the order the escapes
+// are written in.
 func unquoteOptionValue(v string) string {
-	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		inner := v[1 : len(v)-1]
-		// show-options escapes embedded quotes and backslashes.
-		inner = strings.ReplaceAll(inner, `\"`, `"`)
-		inner = strings.ReplaceAll(inner, `\\`, `\`)
-		return inner
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
 	}
-	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
-		return v[1 : len(v)-1]
+	if !strings.Contains(v, `\`) {
+		return v
 	}
-	return v
+
+	var b strings.Builder
+	b.Grow(len(v))
+	for i := 0; i < len(v); i++ {
+		if v[i] != '\\' || i+1 >= len(v) {
+			b.WriteByte(v[i])
+			continue
+		}
+		i++
+		switch c := v[i]; c {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'v':
+			b.WriteByte('\v')
+		case 's':
+			b.WriteByte(' ')
+		case '\\', '"', '\'':
+			b.WriteByte(c)
+		default:
+			if o, ok := octalByte(v, i); ok {
+				b.WriteByte(o)
+				i += 2
+				continue
+			}
+			// Not an escape this package knows. Keep both bytes: the value is
+			// worth more than the objection.
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// octalByte decodes exactly three octal digits starting at i.
+func octalByte(s string, i int) (byte, bool) {
+	if i+3 > len(s) {
+		return 0, false
+	}
+	n := 0
+	for j := i; j < i+3; j++ {
+		if s[j] < '0' || s[j] > '7' {
+			return 0, false
+		}
+		n = n*8 + int(s[j]-'0')
+	}
+	if n > 0xFF {
+		return 0, false
+	}
+	return byte(n), true
 }
 
 // SetRemainOnExit controls whether a pane stays after its process exits.

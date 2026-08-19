@@ -104,6 +104,7 @@ jobs:
         run: |
           bash ./scripts/probe-tmux.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-control.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-startup.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-argv.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-formats.sh "$HOME/tmux-install/bin/tmux" || true
 

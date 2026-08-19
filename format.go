@@ -21,12 +21,18 @@ const fieldSep = "\t"
 // FormatSpec is an ordered list of tmux format variables to request.
 //
 // Entries are normally bare variable names ("session_id", "pane_active").
-// An entry that already contains "#{" is used verbatim, which allows
-// conditionals and modifiers:
+// An entry containing a '#' is already a format expression and is used
+// verbatim, which allows conditionals, modifiers and the single-character
+// forms:
 //
-//	FormatSpec{"pane_id", "#{?pane_dead,dead,live}"}
+//	FormatSpec{"pane_id", "#{?pane_dead,dead,live}", "#H"}
 //
 // The name a value is looked up by in a [Row] is the entry as written.
+//
+// Order matters for more than presentation. tmux escapes a tab in most fields
+// but passes some through raw, and a raw tab is an extra field as far as
+// [ParseRows] is concerned; put any field that can contain one last, where the
+// overflow belongs to it rather than shifting every column after it.
 type FormatSpec []string
 
 // Arg renders the spec as the value of tmux's -F flag.
@@ -40,8 +46,13 @@ func (s FormatSpec) Arg() string {
 
 // formatVar wraps a bare variable name in #{...}, leaving anything that
 // already looks like a format expression alone.
+//
+// The test is a bare '#' rather than "#{" or "#(": tmux also has
+// single-character forms such as #H and #S, and wrapping one of those would
+// produce "#{#H}", which expands to nothing useful. No tmux variable name
+// contains a '#', so nothing that needs wrapping is missed.
 func formatVar(f string) string {
-	if strings.Contains(f, "#{") || strings.Contains(f, "#(") {
+	if strings.Contains(f, "#") {
 		return f
 	}
 	return "#{" + f + "}"
@@ -166,6 +177,16 @@ func (r Row) PaneID(name string) (PaneID, error) {
 //
 // It is exported so that output captured elsewhere — a control-mode reply,
 // for instance — can be parsed with the same rules as a one-shot command.
+//
+// Too few fields is an error: the row cannot be aligned with the spec at all,
+// and guessing which column is missing would be worse than saying so. Too
+// many are folded into the last field, because tmux does not escape the tab
+// in every value it expands — verified on 3.2a, where a pane whose working
+// directory contains one puts a raw tab in pane_current_path while escaping
+// it in session_name and window_name and refusing it outright in pane_title.
+// A spec that keeps such a field last therefore reads back the value intact;
+// one that does not silently mixes two columns, which is why [FormatSpec]
+// says to put it last.
 func ParseRows(spec FormatSpec, lines []string) ([]Row, error) {
 	if len(lines) == 0 {
 		return nil, nil
@@ -176,10 +197,14 @@ func ParseRows(spec FormatSpec, lines []string) ([]Row, error) {
 			continue
 		}
 		vals := strings.Split(line, fieldSep)
-		if len(vals) != len(spec) {
+		if len(vals) < len(spec) {
 			return nil, fmt.Errorf(
 				"gotmucks: format line %d has %d fields, want %d (spec %v, line %q)",
 				i+1, len(vals), len(spec), []string(spec), line)
+		}
+		if len(vals) > len(spec) {
+			last := len(spec) - 1
+			vals = append(vals[:last], strings.Join(vals[last:], fieldSep))
 		}
 		rows = append(rows, Row{spec: spec, vals: vals})
 	}
@@ -210,7 +235,7 @@ func (c *Client) QueryArgs(ctx context.Context, spec FormatSpec, args ...string)
 	if err != nil {
 		// Both "no server" and "no such target" mean the answer is "nothing",
 		// which for a listing is an empty result rather than a failure.
-		if errors.Is(err, ErrNoServer) || errors.Is(err, ErrNoSession) {
+		if errors.Is(err, ErrNoServer) || isMissingTarget(err) {
 			return nil, nil
 		}
 		return nil, err

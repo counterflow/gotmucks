@@ -49,7 +49,9 @@ func (v Version) String() string {
 }
 
 // Compare orders two versions: -1 if v is older than w, 0 if equal, +1 if
-// newer. The letter suffix is compared lexically, so 3.2 < 3.2a < 3.2b.
+// newer. The letter suffix is compared lexically, so 3.2 < 3.2a < 3.2b, and a
+// hyphenated suffix is a pre-release of the version it hangs off rather than a
+// revision of it, so 3.4-rc1 < 3.4 < 3.4a.
 //
 // An unknown version is treated as newer than any known one: builds that do
 // not report a number are development builds of the tip, and refusing to run
@@ -69,8 +71,18 @@ func (v Version) Compare(w Version) int {
 	if v.Minor != w.Minor {
 		return sign(v.Minor - w.Minor)
 	}
+	if pv, pw := isPreRelease(v.Suffix), isPreRelease(w.Suffix); pv != pw {
+		if pv {
+			return -1
+		}
+		return 1
+	}
 	return strings.Compare(v.Suffix, w.Suffix)
 }
+
+// isPreRelease reports a suffix that hangs off the version rather than
+// revising it, which tmux writes with a hyphen: "3.4-rc1" precedes "3.4".
+func isPreRelease(suffix string) bool { return strings.HasPrefix(suffix, "-") }
 
 // AtLeast reports whether v is w or newer.
 func (v Version) AtLeast(w Version) bool { return v.Compare(w) >= 0 }
@@ -105,18 +117,21 @@ func ParseVersion(s string) (Version, error) {
 		v.Next = true
 		field = rest
 	}
-	// Some distributions prefix an OS name, e.g. "openbsd-7.4".
-	if i := strings.LastIndexByte(field, '-'); i >= 0 {
-		field = field[i+1:]
-	}
 
 	major, rest, ok := strings.Cut(field, ".")
-	if !ok {
-		v.Unknown = true
-		return v, nil
-	}
 	maj, err := strconv.Atoi(major)
-	if err != nil {
+	if !ok || err != nil {
+		// Some distributions prefix an OS name, e.g. "openbsd-7.4". Stripping
+		// that is a fallback rather than the first move: doing it first also
+		// eats the tail of a release candidate, and "3.4-rc1" would parse as
+		// "rc1" and be discarded as unknown.
+		if i := strings.LastIndexByte(field, '-'); i >= 0 {
+			field = field[i+1:]
+			major, rest, ok = strings.Cut(field, ".")
+			maj, err = strconv.Atoi(major)
+		}
+	}
+	if !ok || err != nil {
 		v.Unknown = true
 		return v, nil
 	}

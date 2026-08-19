@@ -12,12 +12,15 @@
 package gotmucks
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -611,6 +614,364 @@ func testControl(t *testing.T, extra ...Option) (*ControlClient, *Client) {
 		}
 	})
 	return cc, c
+}
+
+// TestIntegrationControlBlockFlagsMarkOurCommands pins the assumption the
+// reader's second orphan rule rests on, against whichever tmux is under test.
+//
+// tmux computes a block's flags word from CMDQ_STATE_CONTROL, which it sets
+// only for a command line read from the control client's own input, so a block
+// it opened for itself carries 0 and a reply to us carries 1. If a release
+// ever stops doing that, the reader would start binding unsolicited blocks to
+// commands again — silently — so this is checked rather than assumed. It talks
+// to tmux directly instead of through [Connect], because the client absorbs
+// the opening block and the point here is to look at it.
+// TestIntegrationPaneWithTabInItsPath is H1 against real tmux: tmux escapes a
+// tab in a session or window name but hands pane_current_path back with the
+// tab in it, and a single such pane used to make every pane listing on the
+// whole server fail.
+func TestIntegrationPaneWithTabInItsPath(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	dir := filepath.Join(t.TempDir(), "a\tb")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Skipf("this filesystem will not hold a directory with a tab in its name: %v", err)
+	}
+
+	if _, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "tabbed", Width: 80, Height: 24, StartDir: dir, Command: []string{"cat"},
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	panes, err := c.ListPanes(ctx)
+	if err != nil {
+		t.Fatalf("ListPanes: %v", err)
+	}
+	if len(panes) == 0 {
+		t.Fatal("no panes")
+	}
+
+	var found bool
+	for _, p := range panes {
+		if strings.Contains(p.CurrentPath, "\t") {
+			found = true
+		}
+	}
+	if !found {
+		// Worth saying which it was: the alternative to a raw tab is that
+		// this tmux escapes the field, which would be a change worth knowing.
+		t.Errorf("no pane reported a path containing a tab; paths were %v", pathsOf(panes))
+	}
+}
+
+func pathsOf(panes []Pane) []string {
+	out := make([]string, len(panes))
+	for i, p := range panes {
+		out[i] = p.CurrentPath
+	}
+	return out
+}
+
+// TestIntegrationShowOption is H2 against real tmux. The unit test for this
+// scripted a stderr string ("unknown option") that no tmux emits, so the
+// branch it covered could never fire; 3.2a says "invalid option". The other
+// half is that an option which is simply not set in the table exits 0 with no
+// output, which is what makes the bool meaningful.
+func TestIntegrationShowOption(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "opts", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if err := c.SetOption(ctx, s.ID, "status-left", "[#S] "); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	v, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "status-left")
+	if err != nil {
+		t.Fatalf("ShowOption: %v", err)
+	}
+	if !ok || v != "[#S] " {
+		t.Errorf("got (%q, %v), want (%q, true)", v, ok, "[#S] ")
+	}
+
+	// A value tmux has to escape on the way out must come back intact.
+	if err := c.SetOption(ctx, s.ID, "status-right", "a\tb\\c"); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	if v, ok, err = c.ShowOption(ctx, s.ID, ScopeSession, "status-right"); err != nil {
+		t.Fatalf("ShowOption: %v", err)
+	} else if !ok || v != "a\tb\\c" {
+		t.Errorf("got (%q, %v), want (%q, true)", v, ok, "a\tb\\c")
+	}
+
+	if err := c.UnsetOption(ctx, s.ID, ScopeSession, "status-left"); err != nil {
+		t.Fatalf("UnsetOption: %v", err)
+	}
+	if v, ok, err = c.ShowOption(ctx, s.ID, ScopeSession, "status-left"); err != nil {
+		t.Fatalf("ShowOption after unset: %v", err)
+	} else if ok || v != "" {
+		t.Errorf("got (%q, %v) for an option that is not set, want (\"\", false)", v, ok)
+	}
+
+	if v, ok, err = c.ShowOption(ctx, s.ID, ScopeSession, "no-such-option-at-all"); err != nil {
+		t.Fatalf("an unknown option name is an absence, not a failure: %v", err)
+	} else if ok || v != "" {
+		t.Errorf("got (%q, %v) for an unknown option name, want (\"\", false)", v, ok)
+	}
+}
+
+// TestIntegrationShowHooksReportsPerTargetHooks is M4: the comment on
+// ShowHooks used to warn that "show-hooks -t" reports nothing on 3.2a even for
+// a hook that was set successfully. It does report it.
+func TestIntegrationShowHooksReportsPerTargetHooks(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "hooks", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := c.SetHook(ctx, s.ID, "alert-bell", "display-message hooked"); err != nil {
+		t.Fatalf("SetHook: %v", err)
+	}
+
+	hooks, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if !hasHookNamed(hooks, "alert-bell") {
+		t.Errorf("show-hooks -t did not report a hook that was set on the target: %v", hooks)
+	}
+
+	// A window of that session reports its session's hooks as its own, which
+	// is why the doc says this reports what would fire rather than where it
+	// was set.
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil || len(windows) == 0 {
+		t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(windows))
+	}
+	if hooks, err = c.ShowHooks(ctx, windows[0].ID); err != nil {
+		t.Fatalf("ShowHooks on a window: %v", err)
+	}
+	if !hasHookNamed(hooks, "alert-bell") {
+		t.Errorf("a window did not report its session's hook: %v", hooks)
+	}
+}
+
+// hasHookNamed matches a hook regardless of the array index tmux appends,
+// which turns "alert-bell" into "alert-bell[0]".
+func hasHookNamed(hooks map[string]string, name string) bool {
+	for k := range hooks {
+		if k == name || strings.HasPrefix(k, name+"[") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIntegrationMissingTargetErrors is M5: a missing window and a missing
+// pane are distinguishable from a missing session.
+func TestIntegrationMissingTargetErrors(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	if _, err := c.NewSession(ctx, NewSessionOptions{Name: "targets", Width: 80, Height: 24, Command: []string{"cat"}}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if _, err := c.Window(ctx, WindowID("@999")); !errors.Is(err, ErrNoWindow) {
+		t.Errorf("Window on a missing window = %v, want ErrNoWindow", err)
+	}
+	if _, err := c.Pane(ctx, PaneID("%999")); !errors.Is(err, ErrNoPane) {
+		t.Errorf("Pane on a missing pane = %v, want ErrNoPane", err)
+	}
+	if _, err := c.Session(ctx, SessionID("$999")); !errors.Is(err, ErrNoSession) {
+		t.Errorf("Session on a missing session = %v, want ErrNoSession", err)
+	}
+
+	// And the same distinction as tmux itself reports it, through a command
+	// that resolves the target rather than scanning a listing.
+	_, err := c.ListWindowPanes(ctx, WindowID("@999"))
+	if err != nil {
+		t.Errorf("a listing of something that does not exist is empty, not an error: %v", err)
+	}
+}
+
+func TestIntegrationControlBlockFlagsMarkOurCommands(t *testing.T) {
+	opts := testOptions(t)
+	c := New(opts...)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "flags", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	cfg := newConfig(opts)
+	args, _ := cfg.argv([]string{"-C", "attach-session", "-t", string(s.ID)})
+	cmd := exec.Command(cfg.binary, args...)
+	cmd.Env = cfg.environ()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting tmux -C: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	// Written straight away: tmux is expected to open its own block before it
+	// reads any of this, which is the other half of what is being checked.
+	if _, err := io.WriteString(stdin, "display-message -p gotmucks-marker\n"); err != nil {
+		t.Fatalf("writing the command: %v", err)
+	}
+
+	type block struct {
+		flags int
+		body  []string
+	}
+	blocks := make(chan block, 4)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		var open *block
+		for sc.Scan() {
+			line := sc.Text()
+			switch {
+			case strings.HasPrefix(line, "%begin "):
+				fields := strings.Fields(line)
+				if len(fields) < 4 {
+					continue
+				}
+				flags, _ := strconv.Atoi(fields[3])
+				open = &block{flags: flags}
+			case strings.HasPrefix(line, "%end "), strings.HasPrefix(line, "%error "):
+				if open != nil {
+					blocks <- *open
+					open = nil
+				}
+			default:
+				if open != nil {
+					open.body = append(open.body, line)
+				}
+			}
+		}
+	}()
+
+	next := func(what string) block {
+		t.Helper()
+		select {
+		case b := <-blocks:
+			return b
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+			return block{}
+		}
+	}
+
+	opening := next("tmux's own opening block")
+	if opening.flags != 0 {
+		t.Errorf("the block tmux opened for its start command has flags %d, want 0;"+
+			" beginBlock treats a zero flags word as the mark of a block this client did not ask for",
+			opening.flags)
+	}
+
+	reply := next("the reply to our command")
+	if reply.flags != 1 {
+		t.Errorf("the reply to a command we sent has flags %d, want 1;"+
+			" a reply that looked unsolicited would never reach the caller", reply.flags)
+	}
+	if len(reply.body) != 1 || reply.body[0] != "gotmucks-marker" {
+		t.Errorf("reply body = %q, want the command's own output", reply.body)
+	}
+}
+
+// TestIntegrationControlFirstCommandGetsItsOwnReply is the regression test for
+// the off-by-one this package used to have on every connection: Connect writes
+// its probe as soon as the reader starts, and if that write won the race
+// against tmux's opening block, the probe took the block's empty body and
+// every later reply belonged to the command before it.
+//
+// It reconnects several times because the outcome was a race: the failure
+// showed up in roughly one run in fifteen.
+func TestIntegrationControlFirstCommandGetsItsOwnReply(t *testing.T) {
+	opts := testOptions(t)
+	c := New(opts...)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "first", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		cc, err := Connect(ctx, append(opts, WithAttach(s.ID))...)
+		if err != nil {
+			t.Fatalf("connection %d: Connect: %v", i, err)
+		}
+
+		want := fmt.Sprintf("marker-%d", i)
+		reply, err := cc.DoArgs(ctx, "display-message", "-p", want)
+		if err != nil {
+			t.Errorf("connection %d: DoArgs: %v", i, err)
+		} else if len(reply.Output) != 1 || reply.Output[0] != want {
+			t.Errorf("connection %d: reply = %q, want [%q]", i, reply.Output, want)
+		}
+		if err := cc.Close(); err != nil {
+			t.Errorf("connection %d: Close: %v", i, err)
+		}
+	}
+}
+
+// TestIntegrationControlReapsWithoutClose covers the path the documentation
+// does not push callers down: Done fires, the caller never calls Close, and
+// the child still has to be reaped rather than left with its pipes open.
+func TestIntegrationControlReapsWithoutClose(t *testing.T) {
+	opts := testOptions(t)
+	c := New(opts...)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "reap", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	cc, err := Connect(ctx, append(opts, WithAttach(s.ID))...)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cc.Close() })
+
+	// Killing the session detaches the control client, which then exits.
+	if err := c.KillSession(ctx, s.ID); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+
+	select {
+	case <-cc.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection never ended after its session was killed")
+	}
+
+	select {
+	case <-cc.reaped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the tmux process was never waited for, so it and its pipes are still held")
+	}
+	if cc.cmd.ProcessState == nil {
+		t.Error("the process was not reaped")
+	}
 }
 
 func TestIntegrationControlConnect(t *testing.T) {

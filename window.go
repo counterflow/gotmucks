@@ -118,7 +118,7 @@ func (c *Client) Window(ctx context.Context, id WindowID) (*Window, error) {
 			return &w, nil
 		}
 	}
-	return nil, fmt.Errorf("gotmucks: window %s: %w", id, ErrNoSession)
+	return nil, fmt.Errorf("gotmucks: window %s: %w", id, ErrNoWindow)
 }
 
 // RenameWindow gives a window a new name.

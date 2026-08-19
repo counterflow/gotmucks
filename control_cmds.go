@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -97,9 +98,15 @@ func (cc *ControlClient) PauseAfter(ctx context.Context, d time.Duration) error 
 		_, err := cc.DoArgs(ctx, "refresh-client", "-f", "")
 		return err
 	}
-	secs := int(d / time.Second)
+	// int64 throughout: a duration of more than 68 years is a nonsense, but
+	// converting one to int would wrap on a 32-bit build and ask tmux for a
+	// negative or tiny pause instead of an enormous one.
+	secs := int64(d / time.Second)
 	if d%time.Second != 0 || secs == 0 {
 		secs++
+	}
+	if secs > math.MaxInt32 {
+		secs = math.MaxInt32
 	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-f", fmt.Sprintf("pause-after=%d", secs))
 	return err

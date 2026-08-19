@@ -138,6 +138,24 @@ func TestEscapedFormIsSingleLine(t *testing.T) {
 	}
 }
 
+// TestUnescapeStringMatchesUnescape keeps the two entry points honest: they
+// share an implementation precisely so they cannot disagree.
+func TestUnescapeStringMatchesUnescape(t *testing.T) {
+	for _, in := range []string{
+		"",
+		"plain",
+		`a\012b`,
+		`\134`,
+		`trailing\`,
+		`\99 not an escape`,
+		string(Escape(allBytes())),
+	} {
+		if got, want := UnescapeString(in), Unescape([]byte(in)); !bytes.Equal(got, want) {
+			t.Errorf("UnescapeString(%q) = %q, Unescape = %q", in, got, want)
+		}
+	}
+}
+
 func TestUnescapeDoesNotAliasInput(t *testing.T) {
 	src := []byte(`a\012b`)
 	out := Unescape(src)
@@ -195,5 +213,17 @@ func BenchmarkUnescape(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = Unescape(in)
+	}
+}
+
+// BenchmarkUnescapeString measures what the library actually runs. %output
+// reaches the reader as a string, so this is the hot path; benchmarking only
+// the []byte entry point hid the conversion this one used to make.
+func BenchmarkUnescapeString(b *testing.B) {
+	in := EscapeString("\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/src\x1b[0m$ go test ./...\r\n")
+	b.SetBytes(int64(len(in)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = UnescapeString(in)
 	}
 }

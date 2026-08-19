@@ -44,10 +44,15 @@ var paneSpec = FormatSpec{
 	"pane_width",
 	"pane_height",
 	"pane_current_command",
-	"pane_current_path",
-	// Last: a pane title is caller-controlled text and the most likely field
-	// to contain something unexpected.
 	"pane_title",
+	// Last: of everything requested here this is the one field tmux hands
+	// back with a raw tab in it, so it is the one that must not have a column
+	// after it. Verified on 3.2a: a pane whose working directory contains a
+	// tab puts that tab in pane_current_path unaltered, while a tab in a
+	// session or window name is escaped to "\t" and select-pane -T refuses a
+	// title containing one at all. The ordering used to protect pane_title
+	// for a danger it does not have.
+	"pane_current_path",
 }
 
 func paneFromRow(r Row) (Pane, error) {
@@ -131,7 +136,7 @@ func (c *Client) Pane(ctx context.Context, id PaneID) (*Pane, error) {
 			return &p, nil
 		}
 	}
-	return nil, fmt.Errorf("gotmucks: pane %s: %w", id, ErrNoSession)
+	return nil, fmt.Errorf("gotmucks: pane %s: %w", id, ErrNoPane)
 }
 
 // CaptureOptions configures [Client.CapturePane].

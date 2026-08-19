@@ -19,6 +19,12 @@ var ErrNoServer = errors.New("gotmucks: no tmux server running")
 // ErrNoSession reports that the named session does not exist.
 var ErrNoSession = errors.New("gotmucks: session not found")
 
+// ErrNoWindow reports that the named window does not exist.
+var ErrNoWindow = errors.New("gotmucks: window not found")
+
+// ErrNoPane reports that the named pane does not exist.
+var ErrNoPane = errors.New("gotmucks: pane not found")
+
 // ErrClosed reports use of a [ControlClient] after [ControlClient.Close].
 var ErrClosed = errors.New("gotmucks: control client closed")
 
@@ -124,25 +130,46 @@ func isNoServerStderr(stderr string) bool {
 	return false
 }
 
-// noSessionPatterns are the stderr shapes tmux uses for a target that does
-// not resolve.
-var noSessionPatterns = []string{
-	"can't find session",
-	"can't find window",
-	"can't find pane",
-	"session not found",
-	"no current session",
+// missingTargetPatterns are the stderr shapes tmux uses for a target that
+// does not resolve, each mapped to the sentinel for the kind of object that
+// was not there. Keeping the three apart is what lets a caller tell "no such
+// window" from "no such session"; the identifier types are distinct for the
+// same reason.
+var missingTargetPatterns = []struct {
+	pattern string
+	err     error
+}{
+	{"can't find window", ErrNoWindow},
+	{"can't find pane", ErrNoPane},
+	{"can't find session", ErrNoSession},
+	{"session not found", ErrNoSession},
+	{"no current session", ErrNoSession},
+	{"no such session", ErrNoSession},
+	{"no such window", ErrNoWindow},
+	{"no such pane", ErrNoPane},
 }
 
-func isNoSessionStderr(stderr string) bool {
+// missingTargetErr reports which object tmux could not find, or nil if this
+// stderr does not say that at all.
+func missingTargetErr(stderr string) error {
 	s := strings.ToLower(strings.TrimSpace(stderr))
 	if s == "" {
-		return false
+		return nil
 	}
-	for _, p := range noSessionPatterns {
-		if strings.Contains(s, p) {
-			return true
+	for _, p := range missingTargetPatterns {
+		if strings.Contains(s, p.pattern) {
+			return p.err
 		}
 	}
-	return false
+	return nil
+}
+
+// isMissingTarget reports whether err says a session, window or pane was not
+// there. Read paths use it where the answer to "which object" does not change
+// what they do: a listing of something that does not exist is empty, and
+// destroying something that is already gone is success.
+func isMissingTarget(err error) bool {
+	return errors.Is(err, ErrNoSession) ||
+		errors.Is(err, ErrNoWindow) ||
+		errors.Is(err, ErrNoPane)
 }

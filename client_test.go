@@ -426,8 +426,8 @@ func TestListPanes(t *testing.T) {
 	f := newFake(t, faketmux.Script{
 		Responses: map[string]faketmux.Response{
 			"list-panes": {Stdout: tabbed(
-				[]string{"%0", "@0", "$0", "0", "1", "0", "4242", "80", "24", "bash", "/home/u", "shell"},
-				[]string{"%1", "@0", "$0", "1", "0", "1", "4243", "80", "24", "vim", "/src", "editor"},
+				[]string{"%0", "@0", "$0", "0", "1", "0", "4242", "80", "24", "bash", "shell", "/home/u"},
+				[]string{"%1", "@0", "$0", "1", "0", "1", "4243", "80", "24", "vim", "editor", "/src"},
 			)},
 		},
 	})
@@ -683,18 +683,27 @@ func TestSetOptionArgv(t *testing.T) {
 func TestShowOptions(t *testing.T) {
 	f := newFake(t, faketmux.Script{
 		Responses: map[string]faketmux.Response{
-			"show-options": {Stdout: "history-limit 2000\nstatus off\nstatus-left \"[#S] \"\nflagonly\n"},
+			"show-options": {Stdout: "history-limit 2000\nstatus off\nstatus-left \"[#S] \"\nflagonly\n" +
+				"tabbed has\\ttab\nlined a\\nb\nslashed a\\\\b\nocted a\\033b\nquoted 'a\"b'\n"},
 		},
 	})
 	got, err := f.client().ShowOptions(context.Background(), Global, ScopeGlobal)
 	if err != nil {
 		t.Fatalf("ShowOptions: %v", err)
 	}
+	// tmux escapes an option value with vis(3) whether or not it also quotes
+	// it, so undoing the quotes alone is not enough. Verified against 3.2a,
+	// which prints a value containing a tab unquoted as "has\ttab".
 	want := map[string]string{
 		"history-limit": "2000",
 		"status":        "off",
 		"status-left":   "[#S] ",
 		"flagonly":      "",
+		"tabbed":        "has\ttab",
+		"lined":         "a\nb",
+		"slashed":       `a\b`,
+		"octed":         "a\x1bb",
+		"quoted":        `a"b`,
 	}
 	for k, v := range want {
 		if got[k] != v {
@@ -703,18 +712,81 @@ func TestShowOptions(t *testing.T) {
 	}
 }
 
+// TestShowOptionUnknownIsAbsent pins both spellings tmux has used for an
+// option name it does not know. The first fixture here said "unknown option",
+// which no tmux emits: it was written from the implementation rather than from
+// the binary, and the branch it was checking could never fire. 3.2a says
+// "invalid option".
 func TestShowOptionUnknownIsAbsent(t *testing.T) {
+	for _, stderr := range []string{"invalid option: nope\n", "unknown option: nope\n"} {
+		t.Run(strings.Fields(stderr)[0], func(t *testing.T) {
+			f := newFake(t, faketmux.Script{
+				Responses: map[string]faketmux.Response{
+					"show-options": {Stderr: stderr, Exit: 1},
+				},
+			})
+			v, ok, err := f.client().ShowOption(context.Background(), Global, ScopeGlobal, "nope")
+			if err != nil {
+				t.Fatalf("ShowOption: %v", err)
+			}
+			if ok || v != "" {
+				t.Errorf("got (%q, %v), want (\"\", false)", v, ok)
+			}
+		})
+	}
+}
+
+// TestShowOptionUnsetIsAbsent is the case show-options -v cannot answer: an
+// option that is not set in the requested table exits 0 and prints nothing,
+// which -v renders as an empty value indistinguishable from one set to "".
+func TestShowOptionUnsetIsAbsent(t *testing.T) {
 	f := newFake(t, faketmux.Script{
 		Responses: map[string]faketmux.Response{
-			"show-options": {Stderr: "unknown option: nope\n", Exit: 1},
+			"show-options": {Stdout: ""},
 		},
 	})
-	v, ok, err := f.client().ShowOption(context.Background(), Global, ScopeGlobal, "nope")
+	v, ok, err := f.client().ShowOption(context.Background(), Global, ScopeGlobal, "status-left")
 	if err != nil {
 		t.Fatalf("ShowOption: %v", err)
 	}
 	if ok || v != "" {
-		t.Errorf("got (%q, %v), want (\"\", false)", v, ok)
+		t.Errorf("got (%q, %v), want (\"\", false) for an option that is not set", v, ok)
+	}
+	// -v would defeat the whole point of the bool, so its absence is pinned.
+	f.wantArgv(0, "show-options", "-g", "--", "status-left")
+}
+
+func TestShowOptionValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{"bare", "status-left value\n", "value"},
+		{"quoted", "status-left \"[#S] \"\n", "[#S] "},
+		{"set to the empty string", "status-left ''\n", ""},
+		{"escaped tab", "status-left has\\ttab\n", "has\ttab"},
+		{"escaped newline", "status-left a\\nb\n", "a\nb"},
+		{"flag option with no value", "focus-events\n", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{
+				Responses: map[string]faketmux.Response{
+					"show-options": {Stdout: tt.stdout},
+				},
+			})
+			v, ok, err := f.client().ShowOption(context.Background(), Global, ScopeGlobal, "status-left")
+			if err != nil {
+				t.Fatalf("ShowOption: %v", err)
+			}
+			if !ok {
+				t.Error("an option tmux printed should be reported as set")
+			}
+			if v != tt.want {
+				t.Errorf("value = %q, want %q", v, tt.want)
+			}
+		})
 	}
 }
 

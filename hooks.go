@@ -60,11 +60,11 @@ func (c *Client) UnsetGlobalHook(ctx context.Context, name string) error {
 // tmux prints one "name command" pair per line. A hook set on an array index
 // keeps its bracketed name, for instance "session-created[1]".
 //
-// Introspection of per-target hooks is unreliable on older tmux: on 3.2a,
-// "show-hooks -t" reports nothing even for a hook that was set successfully
-// and that demonstrably fires. Treat an empty result as "tmux would not say"
-// rather than as "no hooks are set", and use [Client.ShowGlobalHooks], which
-// does report reliably, where that will do.
+// What comes back is what would fire for that target, not what was set on it.
+// Hooks live in the session's option table, so a window or a pane reports its
+// session's hooks as its own — verified on 3.2a, where a hook set with
+// "set-hook -t $0" is reported for that session's windows and panes too.
+// Global hooks are not included; [Client.ShowGlobalHooks] reports those.
 func (c *Client) ShowHooks(ctx context.Context, t Target) (map[string]string, error) {
 	args := []string{"show-hooks"}
 	args = append(args, targetArgs(t)...)
@@ -79,7 +79,7 @@ func (c *Client) ShowGlobalHooks(ctx context.Context) (map[string]string, error)
 func (c *Client) hooks(ctx context.Context, args []string) (map[string]string, error) {
 	lines, err := c.runLines(ctx, args...)
 	if err != nil {
-		if errors.Is(err, ErrNoServer) || errors.Is(err, ErrNoSession) {
+		if errors.Is(err, ErrNoServer) || isMissingTarget(err) {
 			return map[string]string{}, nil
 		}
 		return nil, err

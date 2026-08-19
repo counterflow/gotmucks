@@ -61,14 +61,24 @@ type Line struct {
 	Raw string
 
 	// Time, Number and Flags are the three arguments of %begin, %end and
-	// %error: epoch seconds, the command number, and a flags word that is
-	// currently always 1.
+	// %error: epoch seconds, the command number, and a flags word.
 	//
-	// Number is the correlation key. Commands may be outstanding
-	// concurrently and their replies are matched by it.
+	// Number identifies the block: a %begin and the %end or %error that
+	// closes it carry the same one. It is not a key a client can predict —
+	// numbers neither start at zero nor run contiguously.
+	//
+	// Flags is 1 for a block that answers a command the control client sent
+	// and 0 for one tmux opened by itself, which is what makes an unsolicited
+	// block recognisable. In tmux's cmd-queue.c the field is
+	// !!(state->flags & CMDQ_STATE_CONTROL), and control.c sets that bit only
+	// for a line read from the control client's own input.
 	Time   int64
 	Number int
 	Flags  int
+	// HasFlags reports that the line carried a flags field at all. A tmux
+	// that stopped writing one would otherwise be indistinguishable from one
+	// writing zero, and zero is load-bearing.
+	HasFlags bool
 
 	// Name is a notification's name without its leading '%', for instance
 	// "output" or "window-add".
@@ -206,7 +216,7 @@ func parseBlockArgs(l *Line, args string) bool {
 	l.Time, l.Number = t, n
 	if len(fields) >= 3 {
 		if f, err := strconv.Atoi(fields[2]); err == nil {
-			l.Flags = f
+			l.Flags, l.HasFlags = f, true
 		}
 	}
 	return true
