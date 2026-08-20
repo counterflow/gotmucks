@@ -344,8 +344,79 @@ func TestDoError(t *testing.T) {
 // permits and that a naive reader gets wrong: a notification arriving between
 // %begin and %end must be dispatched as a notification, not folded into the
 // command's output.
-func TestNotificationsInsideBlock(t *testing.T) {
+// TestReplyBodyIsNeverANotification: a command's output is not tmux speaking.
+// capture-pane prints what a pane contains, and a pane can print anything —
+// including a line shaped exactly like a notification. Dispatching such a line
+// as one both deletes it from the reply and acts on it: a forged %output is
+// delivered to whoever tapped that pane, and a forged %exit ends the
+// connection and reports a reason a shell invented. tmux never writes a
+// notification into an open block (scripts/probe-interleave.sh), so nothing
+// inside one is dispatched.
+func TestReplyBodyIsNeverANotification(t *testing.T) {
 	c := newCtl(t)
+
+	victim := c.tap("%9")
+
+	done := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(context.Background(), "capture-pane -p -t %0")
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		done <- r
+	}()
+
+	c.nextCommand()
+	body := []string{
+		"before",
+		"%hello-world",
+		"%output %9 injected-bytes",
+		"%exit forged",
+		"%sessions-changed",
+		"%0",
+		"after",
+	}
+	c.send("%begin 1700000000 0 1")
+	c.send(body...)
+	c.send("%end 1700000000 0 1")
+
+	r := <-done
+	if !equalStrings(r.Output, body) {
+		t.Errorf("block body\n got %q\nwant %q", r.Output, body)
+	}
+
+	// The connection outlived the pane's "%exit", and no event was forged
+	// from any of those lines.
+	c.barrier()
+	select {
+	case b := <-victim:
+		t.Errorf("pane %%9 was handed %q, which came from another pane's text", b)
+	default:
+	}
+
+	// And it still answers commands: "%exit forged" did not end it.
+	next := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "display-message -p ok")
+		next <- err
+	}()
+	c.serveOne(1, "ok")
+	if err := <-next; err != nil {
+		t.Errorf("the connection did not survive the captured %%exit: %v", err)
+	}
+}
+
+// TestNotificationsBetweenBlocksAreDispatched is the other half: outside a
+// block the prefix is all there is, and the notification stream is read from
+// it as before.
+func TestNotificationsBetweenBlocksAreDispatched(t *testing.T) {
+	c := newCtl(t)
+
+	c.send(`%output %1 between`)
+	out := nextEventOfType[PaneOutput](c)
+	if out.Pane != "%1" || string(out.Data) != "between" {
+		t.Errorf("got %+v, want pane %%1 with %q", out, "between")
+	}
 
 	done := make(chan Reply, 1)
 	go func() {
@@ -355,26 +426,14 @@ func TestNotificationsInsideBlock(t *testing.T) {
 		}
 		done <- r
 	}()
-
-	c.nextCommand()
-	c.send("%begin 1700000000 0 1")
-	c.send("first line")
-	c.send(`%output %1 interleaved`)
-	c.send("second line")
-	c.send("%sessions-changed")
-	c.send("third line")
-	c.send("%end 1700000000 0 1")
+	c.serveOne(0, "body")
 
 	r := <-done
-	want := []string{"first line", "second line", "third line"}
-	if !equalStrings(r.Output, want) {
+	if want := []string{"body"}; !equalStrings(r.Output, want) {
 		t.Errorf("block body\n got %q\nwant %q", r.Output, want)
 	}
 
-	out := nextEventOfType[PaneOutput](c)
-	if out.Pane != "%1" || string(out.Data) != "interleaved" {
-		t.Errorf("got %+v, want pane %%1 with %q", out, "interleaved")
-	}
+	c.send("%sessions-changed")
 	nextEventOfType[SessionsChanged](c)
 }
 
@@ -619,6 +678,40 @@ func TestSessionChangedRefusesAName(t *testing.T) {
 	}
 }
 
+// TestNotificationsRefuseAnIdentifierThatIsNotOne holds the rest of the
+// notifications to what %session-changed is held to. The ID types are defined
+// over string, so a field that arrived on the wire becomes an identifier
+// simply by being assigned to one; an event carrying a name in a WindowID
+// would be the one place in this package where an identifier is not one, and
+// the caller only finds out when a -t built from it is rejected.
+func TestNotificationsRefuseAnIdentifierThatIsNotOne(t *testing.T) {
+	lines := []string{
+		"%pause not-a-pane",
+		"%continue @3",
+		"%pane-mode-changed 3",
+		"%window-add name",
+		"%window-close %3",
+		"%unlinked-window-add ",
+		"%window-renamed name other",
+		"%window-pane-changed @7 @9",
+		"%session-window-changed work @5",
+		"%client-session-changed client-1 work name",
+		"%client-session-changed client-1",
+	}
+
+	for _, line := range lines {
+		t.Run(line, func(t *testing.T) {
+			c := newCtl(t)
+			c.send(line)
+
+			ev := nextEventOfType[*ProtocolError](c)
+			if ev.Line != line {
+				t.Errorf("ProtocolError.Line = %q, want %q", ev.Line, line)
+			}
+		})
+	}
+}
+
 func TestExtendedOutputAndFlowControl(t *testing.T) {
 	c := newCtl(t)
 
@@ -718,6 +811,13 @@ func TestNotificationMapping(t *testing.T) {
 				return err
 			}
 			return wantEq(e.Name == "title" && e.Pane == "%2" && e.Value == "bash" && e.WindowIndex == 1, ev)
+		}},
+		{"%client-session-changed client-1 $3 work", func(ev Event) error {
+			e, ok := ev.(ClientSessionChanged)
+			if err := want(ok, "ClientSessionChanged", ev); err != nil {
+				return err
+			}
+			return wantEq(e.Client == "client-1" && e.Session == "$3" && e.Name == "work", ev)
 		}},
 		{"%client-detached client-1", func(ev Event) error {
 			e, ok := ev.(ClientDetached)
@@ -1228,37 +1328,50 @@ func TestBlockWithNoFlagsFieldStillBinds(t *testing.T) {
 // TestAbandonedBlockFailsItsCommand: a second %begin while a block is open
 // leaves the pending in neither the queue nor cc.current, so nothing else can
 // ever wake it. It has to be failed here or the caller waits for ever.
-func TestAbandonedBlockFailsItsCommand(t *testing.T) {
+// TestBlockLinesInsideABlockAreBody: %begin, %end and %error are as printable
+// as any other text, so inside an open block they are output too. Only the
+// terminator carrying this block's number closes it — the number is the one
+// thing in the protocol a pane cannot know.
+func TestBlockLinesInsideABlockAreBody(t *testing.T) {
 	c := newCtl(t)
 
-	done := make(chan error, 1)
+	done := make(chan Reply, 1)
+	errs := make(chan error, 1)
 	go func() {
-		_, err := c.cc.Do(context.Background(), "first")
-		done <- err
+		r, err := c.cc.Do(context.Background(), "capture-pane -p -t %0")
+		done <- r
+		errs <- err
 	}()
 	c.nextCommand()
 
-	c.send("%begin 1700000000 1 1", "partial")
-	c.send("%begin 1700000000 2 1") // the first block never closed
+	body := []string{
+		"before",
+		"%begin 1700000000 2 1",
+		"%end 1700000000 9 1",
+		"%error 1700000000 9 1",
+		"%end garbage",
+		"after",
+	}
+	c.send("%begin 1700000000 5 1")
+	c.send(body...)
+	c.send("%end 1700000000 5 1")
 
-	select {
-	case err := <-done:
-		var pe *ProtocolError
-		if !errors.As(err, &pe) {
-			t.Fatalf("got %v (%T), want a *ProtocolError", err, err)
-		}
-		if !strings.Contains(pe.Reason, "still open") {
-			t.Errorf("Reason = %q", pe.Reason)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("the abandoned command was stranded")
+	r := <-done
+	if err := <-errs; err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if !equalStrings(r.Output, body) {
+		t.Errorf("block body\n got %q\nwant %q", r.Output, body)
+	}
+	if r.Number != 5 {
+		t.Errorf("Number = %d, want 5", r.Number)
 	}
 }
 
-// TestMismatchedTerminatorFailsItsCommand: the body under a terminator for
-// some other block cannot be said to be this command's, and reporting it as a
-// successful reply would hand the caller another command's output.
-func TestMismatchedTerminatorFailsItsCommand(t *testing.T) {
+// TestUnterminatedBlockFailsItsCommandAtTeardown is what the rule above costs:
+// a block whose terminator never arrives stays open, so the command waiting on
+// it is answered only when the connection ends. It must be answered then.
+func TestUnterminatedBlockFailsItsCommandAtTeardown(t *testing.T) {
 	c := newCtl(t)
 
 	done := make(chan error, 1)
@@ -1268,16 +1381,16 @@ func TestMismatchedTerminatorFailsItsCommand(t *testing.T) {
 	}()
 	c.nextCommand()
 
-	c.send("%begin 1700000000 5 1", "body", "%end 1700000000 9 1")
+	c.send("%begin 1700000000 5 1", "partial")
+	_ = c.out.Close() // tmux died mid-block
 
 	select {
 	case err := <-done:
-		var pe *ProtocolError
-		if !errors.As(err, &pe) {
-			t.Fatalf("got %v (%T), want a *ProtocolError", err, err)
+		if !errors.Is(err, ErrServerExited) {
+			t.Fatalf("got %v, want an error wrapping ErrServerExited", err)
 		}
 	case <-time.After(testTimeout):
-		t.Fatal("Do never returned")
+		t.Fatal("the command in the unterminated block was stranded")
 	}
 }
 
@@ -1521,6 +1634,58 @@ func TestFailureBeatsCloseInTheReportedError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "server exited unexpectedly") {
 		t.Errorf("Do lost tmux's own reason: %v", err)
+	}
+}
+
+// TestControlStartupCommand pins which option builds the command that opens a
+// connection. WithAttach documents itself as equivalent to a WithControlArgs,
+// so it loses to one; what mattered is that Connect used to check the attached
+// session even then, and would refuse a connection over an identifier it was
+// not going to use.
+func TestControlStartupCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want []string
+	}{
+		{
+			name: "by default a connection makes its own session",
+			want: []string{"new-session"},
+		},
+		{
+			name: "attach",
+			opts: []Option{WithAttach("$3")},
+			want: []string{"attach-session", "-t", "$3"},
+		},
+		{
+			name: "explicit arguments",
+			opts: []Option{WithControlArgs("new-session", "-A", "-s", "work")},
+			want: []string{"new-session", "-A", "-s", "work"},
+		},
+		{
+			name: "explicit arguments beat an attach",
+			opts: []Option{WithAttach("$3"), WithControlArgs("new-session", "-A")},
+			want: []string{"new-session", "-A"},
+		},
+		{
+			name: "and beat it whichever order they are given in",
+			opts: []Option{WithControlArgs("new-session", "-A"), WithAttach("$3")},
+			want: []string{"new-session", "-A"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := controlCommand(newConfig(tt.opts)); !equalStrings(got, tt.want) {
+				t.Errorf("controlCommand = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// An attach that will not be made is not an attach to check.
+	cfg := newConfig([]Option{WithAttach("work"), WithControlArgs("new-session")})
+	if got := cfg.attachTarget(); got != "" {
+		t.Errorf("attachTarget = %q, want empty when WithControlArgs replaced the command", got)
 	}
 }
 

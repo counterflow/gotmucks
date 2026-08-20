@@ -17,8 +17,10 @@ import (
 //
 // Control mode is a two-way protocol on one pair of pipes: commands go down,
 // and command replies, live pane output and asynchronous notifications come
-// back interleaved. A single goroutine owns the read side and dispatches by
-// line prefix; nothing else touches the pipe.
+// back on the same stream. A single goroutine owns the read side; nothing else
+// touches the pipe. It dispatches by line prefix only between command blocks —
+// inside one, every line is that command's output, however much it may look
+// like a notification. See handleLine.
 //
 // The connection uses tmux's -C. The -CC form documented for applications
 // additionally puts the terminal out of canonical mode, which makes tmux call
@@ -110,11 +112,6 @@ type pending struct {
 	// orphan marks a block tmux opened for a command this client did not
 	// send. Its body is absorbed and nobody is waiting on it.
 	orphan bool
-	// err is set when the reader could not deliver a trustworthy reply: the
-	// block was abandoned, or closed by a terminator belonging to another
-	// one. The command fails with it rather than being handed a body that may
-	// not be its own.
-	err error
 
 	done chan struct{}
 	once sync.Once
@@ -171,9 +168,12 @@ func Connect(ctx context.Context, opts ...Option) (*ControlClient, error) {
 
 	// [WithAttach] cannot report anything itself, so the session it was given
 	// is checked here, before it becomes the -t of the command that opens the
-	// connection.
-	if cfg.attach != "" {
-		if err := cfg.attach.check(); err != nil {
+	// connection — and only when it is going to become one. [WithControlArgs]
+	// replaces that command outright, and a connection that was never going
+	// to attach has no business failing over an identifier it was never going
+	// to use.
+	if attach := cfg.attachTarget(); attach != "" {
+		if err := attach.check(); err != nil {
 			return nil, err
 		}
 	}
@@ -368,14 +368,13 @@ func (cc *ControlClient) started() bool {
 
 // controlCommand is the tmux command a control connection issues on startup.
 func controlCommand(cfg config) []string {
-	switch {
-	case len(cfg.controlArgs) > 0:
+	if len(cfg.controlArgs) > 0 {
 		return cfg.controlArgs
-	case cfg.attach != "":
-		return []string{"attach-session", "-t", string(cfg.attach)}
-	default:
-		return []string{"new-session"}
 	}
+	if attach := cfg.attachTarget(); attach != "" {
+		return []string{"attach-session", "-t", string(attach)}
+	}
+	return []string{"new-session"}
 }
 
 // Version reports the tmux version this connection checked at Connect time.
@@ -547,9 +546,14 @@ func (cc *ControlClient) Untap(pane PaneID) {
 // commands were written in.
 //
 // A command tmux answers with %error yields a [*ControlError]; the reply is
-// still returned with the error body in its output. A [*ProtocolError] means
-// tmux said something about this command that could not be made sense of, and
-// the reply must not be trusted.
+// still returned with the error body in its output.
+//
+// The reply body is whatever the command printed, line for line, including a
+// line that looks like part of the protocol: capture-pane on a pane containing
+// "%exit forged" puts that line in [Reply.Output] and nowhere else. Nothing in
+// a reply is interpreted as a notification. If the connection ends while this
+// command is outstanding the error wraps [ErrServerExited] and the partial
+// body is returned with it.
 func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	cc.ensure()
 
@@ -607,9 +611,6 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	}
 
 	reply := Reply{Number: p.number, Output: p.lines, Flags: p.flags, Time: p.replyTime}
-	if p.err != nil {
-		return reply, p.err
-	}
 	if !p.answered {
 		return reply, cc.terminalErr()
 	}

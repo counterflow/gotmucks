@@ -35,6 +35,18 @@ type config struct {
 	execPrefix []string
 }
 
+// attachTarget is the session the connection will actually attach to, which is
+// none once [WithControlArgs] has replaced the startup command. Both the check
+// in [Connect] and the command it builds ask this rather than reading attach
+// directly, so that neither can disagree with the other about which option
+// won.
+func (c config) attachTarget() SessionID {
+	if len(c.controlArgs) > 0 {
+		return ""
+	}
+	return c.attach
+}
+
 // withExecPrefix inserts args between the binary and tmux's own arguments.
 // Unexported: this is a testing seam, not part of the API.
 func withExecPrefix(args ...string) Option {
@@ -146,6 +158,9 @@ func WithoutParentEnv() Option {
 // startup. The default is "new-session", which creates a session and attaches
 // the control client to it.
 //
+// It replaces the whole command, so it also replaces the one [WithAttach]
+// would have built: given both, this one wins and the attach is not made.
+//
 // Control-mode only.
 func WithControlArgs(args ...string) Option {
 	return func(c *config) { c.controlArgs = append([]string(nil), args...) }
@@ -153,6 +168,10 @@ func WithControlArgs(args ...string) Option {
 
 // WithAttach makes a control connection attach to an existing session rather
 // than create one. Equivalent to WithControlArgs("attach-session", "-t", id).
+//
+// Being equivalent to one, it loses to one: a [WithControlArgs] anywhere in
+// the same option list replaces the whole startup command, and the session
+// given here is then neither attached to nor checked.
 //
 // Control-mode only.
 func WithAttach(id SessionID) Option {
@@ -197,7 +216,11 @@ func WithCloseTimeout(d time.Duration) Option {
 }
 
 // WithoutVersionCheck skips the tmux version check performed when a control
-// connection is opened. Intended for tests against stand-in binaries.
+// connection is opened. Intended for tests against stand-in binaries, and for
+// the one real build the check is deliberately strict about: a "next-" tmux
+// sorts before the release it is heading for, so next-3.2 does not satisfy the
+// 3.2 floor even though it may well have what the floor is there for. See
+// [Version.Compare].
 func WithoutVersionCheck() Option {
 	return func(c *config) { c.skipVersionCk = true }
 }

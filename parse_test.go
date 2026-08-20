@@ -75,6 +75,12 @@ func TestVersionCompare(t *testing.T) {
 		// not a revision of it.
 		{"3.4-rc1", "3.4"},
 		{"3.4-rc1", "3.4a"},
+		// "next-" is the tree heading towards a release, so it precedes it
+		// for the same reason a release candidate does.
+		{"next-3.2", "3.2"},
+		{"next-3.2", "3.2a"},
+		{"3.1", "next-3.2"},
+		{"next-3.2", "next-3.4"},
 	}
 	for _, tt := range older {
 		if got := v(tt.a).Compare(v(tt.b)); got != -1 {
@@ -94,6 +100,14 @@ func TestVersionCompare(t *testing.T) {
 	}
 	if !v("3.4-rc1").AtLeast(MinimumVersion()) {
 		t.Error("3.4-rc1 is newer than the minimum")
+	}
+	// next-3.2 is the tree on its way to 3.2 and may predate new-session -e,
+	// which is the whole reason the floor is 3.2.
+	if v("next-3.2").AtLeast(MinimumVersion()) {
+		t.Error("next-3.2 should not satisfy a floor of 3.2")
+	}
+	if !v("next-3.4").AtLeast(MinimumVersion()) {
+		t.Error("next-3.4 is past the floor")
 	}
 }
 

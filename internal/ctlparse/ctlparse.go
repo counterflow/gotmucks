@@ -6,9 +6,15 @@
 // and avoids the import cycle that would otherwise exist between the parser
 // and the package that defines the events.
 //
-// The one structural rule worth stating up front: notifications may arrive
-// between a %begin and its %end, so a reader must dispatch on the line prefix
-// and must not assume a command's output block is contiguous.
+// Classification here is of one line in isolation, which is all this package
+// sees. It is not on its own enough to dispatch on, and a reader that treats
+// it as if it were has a hole in it: a command's output block is contiguous,
+// so a line inside one is that command's output even when it is shaped like a
+// notification, and capture-pane will happily print such a line. The block
+// state that resolves it lives in the reader — see ControlClient.handleLine —
+// and scripts/probe-interleave.sh is what says tmux never writes a
+// notification into an open block, which is what makes that resolution
+// correct rather than merely convenient.
 package ctlparse
 
 import (

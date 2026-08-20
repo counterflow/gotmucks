@@ -20,9 +20,8 @@ const dcsEnter = "\x1bP1000p"
 const dcsExit = "\x1b\\"
 
 // readLoop owns the read side of the connection for its whole life. It is the
-// only goroutine that touches stdout, which is what makes dispatch by line
-// prefix sufficient: there is no interleaving to resolve beyond the
-// protocol's own.
+// only goroutine that touches stdout, so the only interleaving to resolve is
+// the protocol's own.
 func (cc *ControlClient) readLoop() {
 	r := bufio.NewReaderSize(cc.stdout, 64<<10)
 
@@ -59,6 +58,26 @@ func (cc *ControlClient) readLoop() {
 
 // handleLine dispatches one line. It reports whether the reader should carry
 // on; false means tmux said %exit.
+//
+// Dispatch is by line prefix only while no command block is open. Inside one
+// every line is that command's output, and a command's output is not tmux
+// speaking: capture-pane prints what a pane contains, show-buffer prints what
+// was pasted into a buffer, display-message -p '#{pane_title}' prints a title
+// the pane's own program chose. Any of them may produce a line shaped exactly
+// like a notification, and taking one as a notification both removes it from
+// the reply and acts on it — "%output %9 x" becomes fabricated bytes delivered
+// to whoever tapped %9, and "%exit forged" ends the connection and reports a
+// reason a shell invented.
+//
+// So while a block is open the only line that is not body is the terminator
+// carrying that block's number. That discriminator exists because tmux does
+// not interleave, which is a fact about tmux and therefore asked rather than
+// assumed — scripts/probe-interleave.sh, on 3.2a: 17,812 notifications across
+// five blocks, including a capture-pane of 2,000 lines and a run-shell that
+// held a block open for a full second while a pane produced output without
+// pause, and not one landed inside a block. Notifications a command causes
+// itself arrive after its own %end, and so does %exit, for kill-server,
+// detach-client and kill-session alike.
 func (cc *ControlClient) handleLine(line string) bool {
 	cl := ctlparse.Classify(line)
 
@@ -73,10 +92,19 @@ func (cc *ControlClient) handleLine(line string) bool {
 		}
 	}
 
+	if number, open := cc.openBlock(); open {
+		if closesBlock(cl, number) {
+			cc.endBlock(cl, cl.Kind == ctlparse.KindError)
+		} else {
+			cc.dataLine(line)
+		}
+		return true
+	}
+
 	// Malformed is only ever set for a block header, and a header whose
-	// arguments did not parse has no command number to bind by. Opening or
-	// closing a block on a guessed number would attach a command to a body
-	// that is not its own, so the line is reported and otherwise ignored.
+	// arguments did not parse has no command number to bind by. Opening a
+	// block on a guessed number would attach a command to a body that is not
+	// its own, so the line is reported and otherwise ignored.
 	if cl.Malformed {
 		cc.emit(&ProtocolError{
 			Line:   cl.Raw,
@@ -100,6 +128,33 @@ func (cc *ControlClient) handleLine(line string) bool {
 	return true
 }
 
+// closesBlock reports whether cl terminates the open block numbered number.
+//
+// A terminator whose arguments did not parse carries no number, so it closes
+// nothing. Neither does one carrying a different number: inside an open block
+// that is not a stray terminator to complain about but a line of output that
+// looks like one, and nothing on the wire tells the two apart.
+func closesBlock(cl ctlparse.Line, number int) bool {
+	if cl.Malformed || cl.Number != number {
+		return false
+	}
+	return cl.Kind == ctlparse.KindEnd || cl.Kind == ctlparse.KindError
+}
+
+// openBlock reports the number of the block being read, if there is one.
+//
+// cc.current is written only by beginBlock, endBlock and the teardown, all of
+// which run on the reader goroutine, so the answer cannot go stale between
+// here and the call it decides.
+func (cc *ControlClient) openBlock() (int, bool) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.current == nil {
+		return 0, false
+	}
+	return cc.current.number, true
+}
+
 // beginBlock binds the next written-but-unanswered command to the command
 // number tmux has just assigned it.
 //
@@ -121,22 +176,15 @@ func (cc *ControlClient) handleLine(line string) bool {
 //     so zero means the block answers something this client did not send.
 //     Verified on 3.2a: the opening block carries 0 and every reply carries 1.
 //     A tmux that stopped writing the field at all is not second-guessed.
+//
+// It is reached only with no block open, since a %begin arriving inside one is
+// body — see handleLine. A block that never gets its terminator therefore
+// stays open until the connection ends, and the teardown fails the command
+// waiting on it.
 func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
-	var (
-		stray     Event
-		abandoned *pending
-	)
-
 	cc.mu.Lock()
-	if cc.current != nil {
-		// The open block never got its terminator. Whoever is waiting on it
-		// must be told now: once it is neither in the queue nor in cc.current,
-		// even the teardown cannot find it, and Do would wait for ever.
-		pe := &ProtocolError{Line: cl.Raw, Reason: "%begin while a block was still open"}
-		abandoned, stray = cc.current, pe
-		abandoned.err = pe
-		cc.current = nil
-	}
+	defer cc.mu.Unlock()
+
 	switch {
 	case !cc.started(), unsolicitedBlock(cl), len(cc.queue) == 0:
 		// A block for a command this client did not send. Absorb its body so
@@ -148,14 +196,6 @@ func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
 		p.number = cl.Number
 		cc.current = p
 	}
-	cc.mu.Unlock()
-
-	if abandoned != nil && !abandoned.orphan {
-		abandoned.finish()
-	}
-	if stray != nil {
-		cc.emit(stray)
-	}
 }
 
 // unsolicitedBlock reports a block tmux opened for a command this client did
@@ -163,6 +203,9 @@ func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
 func unsolicitedBlock(cl ctlparse.Line) bool { return cl.HasFlags && cl.Flags == 0 }
 
 // endBlock closes the open block and wakes the command waiting on it.
+//
+// handleLine has already matched the terminator to the block by number, so the
+// only case left to report here is one arriving when no block is open at all.
 func (cc *ControlClient) endBlock(cl ctlparse.Line, failed bool) {
 	var (
 		p     *pending
@@ -171,27 +214,11 @@ func (cc *ControlClient) endBlock(cl ctlparse.Line, failed bool) {
 
 	cc.mu.Lock()
 	p, cc.current = cc.current, nil
-	switch {
-	case p == nil:
+	if p == nil {
 		stray = &ProtocolError{Line: cl.Raw, Reason: "block terminator with no open block"}
-	case p.number != cl.Number:
-		// The terminator belongs to some other block, so the body collected
-		// under it cannot be said to be this command's. Completing the command
-		// would hand the caller someone else's output with a nil error, and a
-		// %error would be reported as success; the only honest answer is to
-		// fail it. The event says the same thing to a consumer watching the
-		// stream, but that channel is lossy, so the error goes to the caller
-		// directly as well.
-		pe := &ProtocolError{
-			Line:   cl.Raw,
-			Reason: fmt.Sprintf("terminator for command %d closed block %d", cl.Number, p.number),
-		}
-		p.err, stray = pe, pe
-	default:
+	} else {
 		p.failed = failed
 		p.answered = true
-	}
-	if p != nil {
 		p.flags = cl.Flags
 		p.replyTime = time.Unix(cl.Time, 0)
 	}
@@ -227,6 +254,15 @@ func (cc *ControlClient) dataLine(line string) {
 
 // handleNotification turns a notification line into an event. It reports
 // whether the reader should carry on.
+//
+// Every identifier is checked before it is put into an ID type, and a
+// notification whose identifier is not one is reported as a protocol error
+// instead of being delivered. The ID types are defined over string, so this is
+// the only thing standing between a field that arrived on the wire and a value
+// a caller will hand to a call that builds a -t: an event carrying a name in a
+// WindowID would be the one place in this package where an identifier is not
+// an identifier. No tmux in the matrix sends anything else; a release that did
+// would say so here rather than quietly through every later call.
 func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 	switch cl.Name {
 	case "output":
@@ -245,27 +281,35 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		}
 
 	case "pause":
-		cc.emit(PanePaused{Pane: PaneID(strings.TrimSpace(cl.Args))})
+		if p, ok := paneArg(cl.Args); ok {
+			cc.emit(PanePaused{Pane: p})
+		} else {
+			cc.malformed(cl)
+		}
 
 	case "continue":
-		cc.emit(PaneContinued{Pane: PaneID(strings.TrimSpace(cl.Args))})
+		if p, ok := paneArg(cl.Args); ok {
+			cc.emit(PaneContinued{Pane: p})
+		} else {
+			cc.malformed(cl)
+		}
 
 	case "pane-mode-changed":
-		cc.emit(PaneModeChanged{Pane: PaneID(strings.TrimSpace(cl.Args))})
+		if p, ok := paneArg(cl.Args); ok {
+			cc.emit(PaneModeChanged{Pane: p})
+		} else {
+			cc.malformed(cl)
+		}
 
 	case "sessions-changed":
 		cc.emit(SessionsChanged{})
 
 	case "session-changed":
-		// The identifier is checked before it is stored, because this is the
-		// one notification whose payload becomes state a caller can read back
-		// through [ControlClient.AttachedSession] and hand to a call that
-		// builds a -t. ParseIDAndName is satisfied by any non-empty first
-		// field and says nothing about sigils, so on its own it would let a
-		// name into the one place this package promises there is never one.
-		// No tmux in the matrix sends anything else; a release that did would
-		// say so as a protocol error rather than quietly through every later
-		// call.
+		// This is also the one payload that becomes state a caller can read
+		// back later, through [ControlClient.AttachedSession], so the check
+		// keeps a name out of that as well as out of the event.
+		// ParseIDAndName is satisfied by any non-empty first field and says
+		// nothing about sigils.
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
 		if !ok || !SessionID(id).Valid() {
 			cc.malformed(cl)
@@ -277,8 +321,12 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		cc.emit(SessionChanged{Session: SessionID(id), Name: name})
 
 	case "session-renamed":
-		// tmux sends only the new name for the attached session in some
-		// releases, and "$id name" in others. Both are accepted.
+		// The exception to the rule above, and why it is one: tmux sends only
+		// the new name for the attached session in some releases and
+		// "$id name" in others, so a first field that is not an identifier is
+		// the older form rather than a fault. The event then names the
+		// session this client is attached to, which was itself checked when
+		// it arrived.
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
 		if !ok || !SessionID(id).Valid() {
 			cc.emit(SessionRenamed{Session: cc.AttachedSession(), Name: strings.TrimSpace(cl.Args)})
@@ -288,21 +336,29 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 
 	case "session-window-changed":
 		a, b, ok := ctlparse.ParseTwoIDs(cl.Args)
-		if !ok {
+		if !ok || !SessionID(a).Valid() || !WindowID(b).Valid() {
 			cc.malformed(cl)
 			break
 		}
 		cc.emit(SessionWindowChanged{Session: SessionID(a), Window: WindowID(b)})
 
 	case "window-add", "linked-window-add", "unlinked-window-add":
-		cc.emit(WindowAdded{Window: WindowID(strings.TrimSpace(cl.Args))})
+		if w, ok := windowArg(cl.Args); ok {
+			cc.emit(WindowAdded{Window: w})
+		} else {
+			cc.malformed(cl)
+		}
 
 	case "window-close", "linked-window-close", "unlinked-window-close":
-		cc.emit(WindowClosed{Window: WindowID(strings.TrimSpace(cl.Args))})
+		if w, ok := windowArg(cl.Args); ok {
+			cc.emit(WindowClosed{Window: w})
+		} else {
+			cc.malformed(cl)
+		}
 
 	case "window-renamed", "unlinked-window-rename":
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
-		if !ok {
+		if !ok || !WindowID(id).Valid() {
 			cc.malformed(cl)
 			break
 		}
@@ -310,7 +366,7 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 
 	case "window-pane-changed":
 		a, b, ok := ctlparse.ParseTwoIDs(cl.Args)
-		if !ok {
+		if !ok || !WindowID(a).Valid() || !PaneID(b).Valid() {
 			cc.malformed(cl)
 			break
 		}
@@ -345,14 +401,14 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		})
 
 	case "client-session-changed":
+		// "<client> <session-id> <session-name>". The client is a name — a
+		// tty path — so only the middle field is an identifier.
 		fields := strings.SplitN(cl.Args, " ", 3)
-		ev := ClientSessionChanged{}
-		if len(fields) > 0 {
-			ev.Client = fields[0]
+		if len(fields) < 2 || fields[0] == "" || !SessionID(fields[1]).Valid() {
+			cc.malformed(cl)
+			break
 		}
-		if len(fields) > 1 {
-			ev.Session = SessionID(fields[1])
-		}
+		ev := ClientSessionChanged{Client: fields[0], Session: SessionID(fields[1])}
 		if len(fields) > 2 {
 			ev.Name = fields[2]
 		}
@@ -389,6 +445,18 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 
 func (cc *ControlClient) malformed(cl ctlparse.Line) {
 	cc.emit(&ProtocolError{Line: cl.Raw, Reason: "could not parse %" + cl.Name + " arguments"})
+}
+
+// paneArg reads a notification whose whole argument is a pane identifier.
+func paneArg(args string) (PaneID, bool) {
+	p := PaneID(strings.TrimSpace(args))
+	return p, p.Valid()
+}
+
+// windowArg reads a notification whose whole argument is a window identifier.
+func windowArg(args string) (WindowID, bool) {
+	w := WindowID(strings.TrimSpace(args))
+	return w, w.Valid()
 }
 
 // deliverOutput publishes pane bytes to the event stream and, if one is

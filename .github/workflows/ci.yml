@@ -109,6 +109,7 @@ jobs:
           bash ./scripts/probe-formats.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-blocks.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-tabs.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-interleave.sh "$HOME/tmux-install/bin/tmux" || true
 
       - name: Integration tests
         run: |

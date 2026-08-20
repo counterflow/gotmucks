@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/counterflow/gotmucks/internal/ctlparse"
 )
 
 var socketSeq atomic.Int64
@@ -1114,6 +1116,156 @@ func TestIntegrationControlBlockFlagsMarkOurCommands(t *testing.T) {
 	}
 }
 
+// TestIntegrationControlNotificationsNeverEnterABlock holds the rule the
+// reader rests on against whatever tmux is under test.
+//
+// Inside an open block the reader treats every line as the command's output,
+// because a reply body is whatever the command printed and capture-pane will
+// happily print a line shaped like a notification. That is only safe while
+// tmux keeps notifications out of an open block, so the matrix checks it
+// rather than trusting one release's answer: a tmux that started interleaving
+// would lose those notifications into a reply body, and this says so on the
+// version that did it. scripts/probe-interleave.sh asks the same question by
+// hand and prints the shape of the answer.
+//
+// It talks to tmux directly rather than through [Connect], because what is
+// being measured is the raw stream the reader would see.
+func TestIntegrationControlNotificationsNeverEnterABlock(t *testing.T) {
+	opts := testOptions(t)
+	c := New(opts...)
+	ctx := testCtx(t)
+
+	// A pane that produces output without pause: the question is meaningless
+	// on a quiet server, where no notification wanted writing anyway.
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name:   "interleave",
+		Width:  200,
+		Height: 50,
+		Command: []string{"sh", "-c",
+			`i=0; while [ $i -lt 200000 ]; do echo "spam $i ------------------------------"; ` +
+				`i=$((i+1)); done; sleep 60`},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	panes, err := c.ListSessionPanes(ctx, s.ID)
+	if err != nil || len(panes) != 1 {
+		t.Fatalf("ListSessionPanes = (%v, %v)", panes, err)
+	}
+	pane := panes[0].ID
+
+	cfg := newConfig(opts)
+	args, _ := cfg.argv([]string{"-C", "attach-session", "-t", string(s.ID)})
+	cmd := exec.Command(cfg.binary, args...)
+	cmd.Env = cfg.environ()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting tmux -C: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	// The last command prints the marker that ends the measurement. Before it:
+	// a reply of thousands of lines, and a command that makes tmux hold a
+	// block open for a whole second while the pane keeps producing output.
+	const marker = "gotmucks-interleave-done"
+	script := strings.Join([]string{
+		"refresh-client -C 200x50",
+		"capture-pane -p -S -2000 -t '" + string(pane) + "'",
+		`run-shell "sleep 1"`,
+		"capture-pane -p -S -2000 -t '" + string(pane) + "'",
+		"display-message -p " + marker,
+	}, "\n") + "\n"
+	if _, err := io.WriteString(stdin, script); err != nil {
+		t.Fatalf("writing the commands: %v", err)
+	}
+
+	type counts struct {
+		blocks, inside, outside, body int
+		examples                      []string
+	}
+	results := make(chan counts, 1)
+	go func() {
+		// ReadString rather than a Scanner, for the same reason the reader
+		// uses one: a pane output line has no useful upper bound.
+		r := bufio.NewReaderSize(stdout, 64<<10)
+		var got counts
+		open := false
+		for {
+			raw, err := r.ReadString('\n')
+			line := strings.TrimSuffix(strings.TrimSuffix(raw, "\n"), "\r")
+			if line != "" {
+				switch cl := ctlparse.Classify(line); cl.Kind {
+				case ctlparse.KindBegin:
+					open = true
+					got.blocks++
+				case ctlparse.KindEnd, ctlparse.KindError:
+					open = false
+				case ctlparse.KindNotification:
+					if !open {
+						got.outside++
+						break
+					}
+					got.inside++
+					if len(got.examples) < 3 {
+						got.examples = append(got.examples, line)
+					}
+				default:
+					if open {
+						got.body++
+						if line == marker {
+							results <- got
+							return
+						}
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		results <- got
+	}()
+
+	var got counts
+	select {
+	case got = <-results:
+	case <-time.After(60 * time.Second):
+		t.Fatal("timed out waiting for the marker command's reply")
+	}
+
+	t.Logf("blocks=%d body lines=%d notifications: inside=%d outside=%d",
+		got.blocks, got.body, got.inside, got.outside)
+
+	if got.inside != 0 {
+		t.Errorf("%d notifications arrived inside an open block, e.g. %q.\n"+
+			"The reader treats a block's body as the command's own output, so on this tmux "+
+			"those notifications are being delivered as reply lines instead of events",
+			got.inside, got.examples)
+	}
+
+	// Guard against a green result that measured nothing: without notifications
+	// flowing and a block held open across them, there was no question asked.
+	if got.outside < 50 {
+		t.Errorf("only %d notifications arrived at all; the pane was not producing enough "+
+			"output for this to have tested anything", got.outside)
+	}
+	if got.blocks < 5 || got.body < 100 {
+		t.Errorf("saw %d blocks and %d body lines, want the five commands and a large capture; "+
+			"the measurement did not run to completion", got.blocks, got.body)
+	}
+}
+
 // TestIntegrationControlFirstCommandGetsItsOwnReply is the regression test for
 // the off-by-one this package used to have on every connection: Connect writes
 // its probe as soon as the reader starts, and if that write won the race
@@ -1360,6 +1512,84 @@ func TestIntegrationControlPaneOutput(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("timed out waiting for pane output; got %q", got.String())
 		}
+	}
+}
+
+// TestIntegrationControlPaneTextIsNotProtocol is G1 against real tmux.
+//
+// A reply body is not tmux speaking: it is whatever the command printed, and
+// capture-pane prints whatever is on the pane. When every line was dispatched
+// by its prefix, a pane containing "%output %999 ..." had those bytes
+// delivered to whoever tapped %999, and a pane containing "%exit" ended the
+// connection and reported a reason the pane had invented — with Err() and
+// Wait() both nil, since %exit is a clean end.
+func TestIntegrationControlPaneTextIsNotProtocol(t *testing.T) {
+	cc, c := testControl(t)
+	ctx := testCtx(t)
+
+	reply, err := cc.DoArgs(ctx, "list-panes", "-F", "#{pane_id}")
+	if err != nil || len(reply.Output) == 0 {
+		t.Fatalf("list-panes = (%v, %v)", reply.Output, err)
+	}
+	pane := PaneID(reply.Output[0])
+
+	// A tap on a pane that does not exist, so that the only bytes that could
+	// ever arrive on it are forged ones.
+	victim, err := cc.Output("%999")
+	if err != nil {
+		t.Fatalf("Output(%%999): %v", err)
+	}
+
+	// The pane runs cat, so a line sent to it is a line printed by it.
+	injected := []string{
+		"%hello-world",
+		"%output %999 injected-bytes",
+		"%exit forged",
+		"%end 1700000000 99 1",
+	}
+	for _, line := range injected {
+		if err := c.SendLine(ctx, pane, line); err != nil {
+			t.Fatalf("SendLine(%q): %v", line, err)
+		}
+	}
+
+	has := func(out []string, want string) bool {
+		for _, line := range out {
+			if line == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	var capture Reply
+	eventually(t, "the injected lines to reach the pane", 15*time.Second, func() bool {
+		capture, err = cc.DoArgs(ctx, "capture-pane", "-p", "-t", string(pane))
+		return err == nil && has(capture.Output, injected[len(injected)-1])
+	})
+
+	for _, line := range injected {
+		if !has(capture.Output, line) {
+			t.Errorf("the reply is missing %q, so it was read as protocol\nreply: %q",
+				line, capture.Output)
+		}
+	}
+
+	// The connection outlived the captured %exit and still answers.
+	if err := cc.Err(); err != nil {
+		t.Errorf("Err after capturing a pane containing %%exit: %v", err)
+	}
+	if _, err := cc.DoArgs(ctx, "display-message", "-p", "ok"); err != nil {
+		t.Errorf("the connection did not survive the captured %%exit: %v", err)
+	}
+
+	select {
+	case b := <-victim:
+		t.Errorf("pane %%999 was handed %q, which was another pane's text", b)
+	default:
+	}
+	if n := cc.DroppedOutput("%999"); n != 0 {
+		t.Errorf("DroppedOutput(%%999) = %d, want 0", n)
 	}
 }
 
