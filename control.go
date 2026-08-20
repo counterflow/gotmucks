@@ -669,12 +669,20 @@ func (cc *ControlClient) terminalErr() error {
 	return cc.terminalErrLocked()
 }
 
+// terminalErrLocked says why the connection can no longer be used.
+//
+// The order is by how much the answer tells the caller. A recorded failure or
+// tmux's own reason for exiting is news; "you closed it" is only news when
+// there is nothing else to report, which is exactly the case [ErrClosed]
+// names. Close after a crash therefore still reports the crash.
 func (cc *ControlClient) terminalErrLocked() error {
 	switch {
 	case cc.exitErr != nil:
 		return cc.exitErr
 	case cc.exitMsg != "":
 		return fmt.Errorf("gotmucks: %s: %w", cc.exitMsg, ErrServerExited)
+	case cc.userClose:
+		return ErrClosed
 	default:
 		return ErrServerExited
 	}
@@ -735,12 +743,19 @@ func (cc *ControlClient) Stderr() string {
 // Close ends the connection.
 //
 // It writes the empty line that detaches a control client, then waits for
-// tmux to exit, killing it if it outstays [WithCloseTimeout]. That timeout
-// bounds the whole of Close, the detach write included. Close is idempotent
-// and safe to call concurrently with anything else.
+// tmux to exit, killing it if it outstays [WithCloseTimeout]. Close is
+// idempotent and safe to call concurrently with anything else.
+//
+// The bound is two of those timeouts, and it holds whatever tmux does: one for
+// the detach, including the write, and one more for the kill to take effect.
+// The second has never been reached — killing the client makes the reader see
+// end of file at once, and with the tmux client stopped outright Close still
+// returned in 1.09s under a one-second timeout — but a guarantee that rests on
+// the kill working is not a guarantee.
 //
 // It returns an error if tmux did not end the way it was asked to — an exit
-// status of its own, or a signal this package did not send.
+// status of its own, a signal this package did not send, or the process
+// outstaying the kill.
 //
 // Calling it is good manners rather than a requirement for tidiness: the
 // reader reaps the process whenever the connection ends, so a caller that
@@ -775,7 +790,20 @@ func (cc *ControlClient) Close() error {
 			if cc.cmd != nil && cc.cmd.Process != nil {
 				_ = cc.cmd.Process.Kill()
 			}
-			<-cc.done
+			select {
+			case <-cc.done:
+			case <-time.After(cc.cfg.closeTimeout):
+				// Waiting here with no bound of its own is what made the
+				// documented one incidental: it ends because the kill makes
+				// the reader see end of file, not because anything says it
+				// must. Reaping is left to the reader, which calls it when it
+				// does finish — cmd.Wait would block here for exactly as long
+				// as this wait was going to.
+				err = fmt.Errorf(
+					"gotmucks: tmux did not exit within %s of being killed: %w",
+					cc.cfg.closeTimeout, ErrServerExited)
+				return
+			}
 		}
 		err = cc.reap()
 	})

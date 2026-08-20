@@ -1,6 +1,7 @@
 package gotmucks
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -103,14 +104,30 @@ func TestFormatSpecArg(t *testing.T) {
 		want string
 	}{
 		{
-			name: "bare names are wrapped",
+			// Every column but the last asks tmux to take a raw tab out of the
+			// value, since only the last one can be given an extra field back.
+			name: "bare names are wrapped, all but the last against a tab",
 			spec: FormatSpec{"session_id", "session_name"},
-			want: "#{session_id}\t#{session_name}",
+			want: "#{s/\t/ /:session_id}\t#{session_name}",
+		},
+		{
+			name: "a single entry is the last one",
+			spec: FormatSpec{"session_id"},
+			want: "#{session_id}",
 		},
 		{
 			name: "an expression is used verbatim",
 			spec: FormatSpec{"pane_id", "#{?pane_dead,dead,live}"},
-			want: "#{pane_id}\t#{?pane_dead,dead,live}",
+			want: "#{s/\t/ /:pane_id}\t#{?pane_dead,dead,live}",
+		},
+		{
+			// A substitution's operand is expanded as a format, so "#{...}"
+			// would nest, but "#H" inside one expands to nothing at all —
+			// verified on 3.2a. An entry the caller wrote is left as written
+			// rather than risked.
+			name: "an expression is left alone in a column that is not last",
+			spec: FormatSpec{"#H", "#{?pane_dead,dead,live}", "pane_id"},
+			want: "#H\t#{?pane_dead,dead,live}\t#{pane_id}",
 		},
 		{
 			name: "a shell expansion is used verbatim",
@@ -123,6 +140,24 @@ func TestFormatSpecArg(t *testing.T) {
 			name: "a single-character form is used verbatim",
 			spec: FormatSpec{"#H", "#S"},
 			want: "#H\t#S",
+		},
+		{
+			// A prefixed expansion is not a name a modifier can be put in
+			// front of, so it is rendered as written even though it is not
+			// the last column.
+			name: "a prefixed expansion is left alone",
+			spec: FormatSpec{"T:status-left", "pane_id"},
+			want: "#{T:status-left}\t#{pane_id}",
+		},
+		{
+			name: "an option name may contain a hyphen",
+			spec: FormatSpec{"@user-option", "pane_id"},
+			want: "#{s/\t/ /:@user-option}\t#{pane_id}",
+		},
+		{
+			name: "an empty spec renders nothing",
+			spec: FormatSpec{},
+			want: "",
 		},
 	}
 
@@ -181,6 +216,35 @@ func TestParseRows(t *testing.T) {
 		rows, err := ParseRows(spec, nil)
 		if err != nil || rows != nil {
 			t.Errorf("got (%v, %v), want (nil, nil)", rows, err)
+		}
+	})
+
+	t.Run("an empty spec is an error, not a panic", func(t *testing.T) {
+		// Folding the overflow into the last field computed that field's index
+		// as len(spec)-1, which for no spec at all is -1: any non-empty line
+		// panicked on the slice bound. Both exported entry points reached it.
+		for _, tt := range []struct {
+			name string
+			call func() ([]Row, error)
+		}{
+			{"ParseRows", func() ([]Row, error) {
+				return ParseRows(FormatSpec{}, []string{"anything"})
+			}},
+			{"Reply.Rows", func() ([]Row, error) {
+				return Reply{Output: []string{"$0"}}.Rows(nil)
+			}},
+			{"no lines either", func() ([]Row, error) {
+				return ParseRows(nil, nil)
+			}},
+		} {
+			rows, err := tt.call()
+			if err == nil {
+				t.Errorf("%s with an empty spec: got %v, want an error", tt.name, rows)
+				continue
+			}
+			if !errors.Is(err, errEmptySpec) {
+				t.Errorf("%s: err = %v, want the empty-spec error", tt.name, err)
+			}
 		}
 	})
 }

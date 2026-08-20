@@ -24,10 +24,13 @@ type Pane struct {
 	PID int
 	// Width and Height are the pane's dimensions in cells.
 	Width, Height int
-	// CurrentCommand is the name of the running foreground command.
+	// CurrentCommand is the name of the running foreground command. tmux takes
+	// it from the operating system, so a binary whose file name contains a tab
+	// puts one here; it arrives as a space, for the reason [FormatSpec] gives.
 	CurrentCommand string
 	// CurrentPath is the working directory of the running command, when tmux
-	// can determine it.
+	// can determine it. It is the one field here that comes back exactly as
+	// tmux wrote it, tab and all.
 	CurrentPath string
 	// Title is the pane title.
 	Title string
@@ -45,13 +48,22 @@ var paneSpec = FormatSpec{
 	"pane_height",
 	"pane_current_command",
 	"pane_title",
-	// Last: of everything requested here this is the one field tmux hands
-	// back with a raw tab in it, so it is the one that must not have a column
-	// after it. Verified on 3.2a: a pane whose working directory contains a
-	// tab puts that tab in pane_current_path unaltered, while a tab in a
-	// session or window name is escaped to "\t" and select-pane -T refuses a
-	// title containing one at all. The ordering used to protect pane_title
-	// for a danger it does not have.
+	// Last, which is the one place a raw tab survives: every other entry is
+	// requested through a substitution that turns one into a space, and this
+	// one is asked for as it stands so that a working directory containing a
+	// tab reads back byte for byte. Of the three fields here that could carry
+	// one it has the best claim to the place — a tab-named directory is
+	// ordinary, and the path is the value a caller is most likely to hand
+	// straight to the operating system again.
+	//
+	// The other two, verified on 3.2a by scripts/probe-tabs.sh:
+	// pane_current_command carries a raw tab whenever the binary's own file
+	// name does, and pane_title cannot be given one at all — tmux discards
+	// control bytes inside an OSC string, and select-pane -T exits 0 and
+	// silently drops a title that is not printable ASCII rather than refusing
+	// it. The substitution covers pane_title regardless, because the title is
+	// whatever the program in the pane says it is and the only thing between
+	// that program and this row is a filter in another process.
 	"pane_current_path",
 }
 

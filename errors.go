@@ -26,7 +26,16 @@ var ErrNoWindow = errors.New("gotmucks: window not found")
 var ErrNoPane = errors.New("gotmucks: pane not found")
 
 // ErrClosed reports use of a [ControlClient] after [ControlClient.Close].
-var ErrClosed = errors.New("gotmucks: control client closed")
+//
+// It wraps [ErrServerExited], because to a caller asking whether the
+// connection is still usable the answer is the same and testing for both would
+// be a trap. Test for this one to tell a connection this program ended from
+// one tmux ended: a command sent after Close reports it, and a genuine failure
+// that happened first is reported instead, since that is the more useful news.
+//
+// [ControlClient.Wait] and [ControlClient.Err] still report nil after Close.
+// Being asked to end is not a fault.
+var ErrClosed = fmt.Errorf("gotmucks: control client closed: %w", ErrServerExited)
 
 // ErrInvalidID reports a [SessionID], [WindowID] or [PaneID] that is not an
 // identifier: a name, an index, or anything else that is not the object's

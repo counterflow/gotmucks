@@ -1332,6 +1332,91 @@ func TestCloseIsBoundedByItsTimeout(t *testing.T) {
 	}
 }
 
+// TestCloseReturnsEvenIfNothingEnds: the wait after the kill had no bound of
+// its own, so the documented one held only because killing the client makes
+// the reader see end of file. This connection has no process to kill, which is
+// the shape that used to wait for ever.
+func TestCloseReturnsEvenIfNothingEnds(t *testing.T) {
+	c := newBareCtl(t, WithCloseTimeout(100*time.Millisecond))
+	c.sent.block()
+
+	done := make(chan error, 1)
+	go func() { done <- c.cc.Close() }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrServerExited) {
+			t.Errorf("Close: err = %v, want one reporting that tmux never exited", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Close never returned although its timeout had expired twice over")
+	}
+}
+
+// TestUseAfterCloseReportsErrClosed: ErrClosed was exported and documented as
+// what this reports, and nothing ever returned it — a caller who followed the
+// documentation and wrote errors.Is(err, ErrClosed) got a branch that could
+// not run.
+func TestUseAfterCloseReportsErrClosed(t *testing.T) {
+	c := newCtl(t)
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.cc.Close() }()
+
+	// The detach is what makes real tmux go away; the scripted server has to
+	// be told, so answer the empty line with end of file.
+	if line := c.nextCommand(); line != "" {
+		t.Fatalf("Close sent %q, want the empty line that detaches", line)
+	}
+	_ = c.out.Close()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Close did not return")
+	}
+
+	_, err := c.cc.Do(context.Background(), "list-sessions")
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("Do after Close: err = %v, want ErrClosed", err)
+	}
+	// The answer a caller gets today has to keep working: ErrClosed wraps the
+	// sentinel that used to be all this reported.
+	if !errors.Is(err, ErrServerExited) {
+		t.Errorf("Do after Close: err = %v, want it to still wrap ErrServerExited", err)
+	}
+	// Being asked to end is not a fault, so the two calls that report faults
+	// still report none.
+	if err := c.cc.Wait(context.Background()); err != nil {
+		t.Errorf("Wait after Close: %v, want nil", err)
+	}
+	if err := c.cc.Err(); err != nil {
+		t.Errorf("Err after Close: %v, want nil", err)
+	}
+}
+
+// TestFailureBeatsCloseInTheReportedError: a connection that died and was then
+// tidied up with Close must still report why it died. "You closed it" is only
+// the answer when there is nothing better to say.
+func TestFailureBeatsCloseInTheReportedError(t *testing.T) {
+	c := newCtl(t)
+
+	c.send("%exit server exited unexpectedly")
+	nextEventOfType[Exited](c)
+	_ = c.cc.Close()
+
+	_, err := c.cc.Do(context.Background(), "list-sessions")
+	if errors.Is(err, ErrClosed) {
+		t.Errorf("Do reported ErrClosed for a connection tmux ended: %v", err)
+	}
+	if !strings.Contains(err.Error(), "server exited unexpectedly") {
+		t.Errorf("Do lost tmux's own reason: %v", err)
+	}
+}
+
 func TestControlCommandArgv(t *testing.T) {
 	tests := []struct {
 		name string

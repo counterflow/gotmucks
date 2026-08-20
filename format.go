@@ -13,9 +13,10 @@ import (
 //
 // tmux expands a -F template verbatim, so the separator has to be a byte the
 // expansion will not itself produce. Tab is the conventional choice and is
-// what this package uses; a value that does contain a tab produces a field
-// count mismatch and a loud error from [ParseRows] rather than silently
-// misaligned columns.
+// what this package uses. Some values can contain one all the same — a working
+// directory, the name of the binary a pane is running — so [FormatSpec.Arg]
+// asks tmux to take it out of every column but the last, which is the only one
+// [ParseRows] can attribute an extra field to.
 const fieldSep = "\t"
 
 // FormatSpec is an ordered list of tmux format variables to request.
@@ -29,19 +30,67 @@ const fieldSep = "\t"
 //
 // The name a value is looked up by in a [Row] is the entry as written.
 //
-// Order matters for more than presentation. tmux escapes a tab in most fields
-// but passes some through raw, and a raw tab is an extra field as far as
-// [ParseRows] is concerned; put any field that can contain one last, where the
-// overflow belongs to it rather than shifting every column after it.
+// Order matters for more than presentation. tmux hands some values back with a
+// raw tab in them, and a raw tab is an extra field as far as [ParseRows] is
+// concerned, so [FormatSpec.Arg] requests every entry but the last through a
+// substitution that replaces one with a space. The last entry is asked for as
+// it stands, because an extra field there can be folded back into it: put the
+// field whose value must come back byte for byte at the end, and expect a tab
+// anywhere else to arrive as a space.
 type FormatSpec []string
 
 // Arg renders the spec as the value of tmux's -F flag.
+//
+// Every entry but the last is wrapped in tmux's substitution modifier so that
+// a raw tab in the value cannot split the column. Only a plain variable name
+// is wrapped. Anything else the caller wrote — a format expression, a prefixed
+// expansion such as "T:status-left" — is rendered as it stands and is the
+// caller's own business: a substitution's operand is itself expanded, so
+// "#{...}" nests inside one, but "#{s/<tab>/ /:#H}" expands to nothing at all
+// on 3.2a, and turning a working column into an empty one is the worse trade.
 func (s FormatSpec) Arg() string {
 	parts := make([]string, len(s))
 	for i, f := range s {
+		if i < len(s)-1 && isBareVar(f) {
+			parts[i] = tabSafeVar(f)
+			continue
+		}
 		parts[i] = formatVar(f)
 	}
 	return strings.Join(parts, fieldSep)
+}
+
+// isBareVar reports whether an entry is a plain variable or option name, which
+// is what may be wrapped in a modifier without changing what it means. tmux
+// variables are letters, digits and underscores; option names may contain a
+// hyphen, and a user option begins with '@'.
+func isBareVar(f string) bool {
+	if f == "" {
+		return false
+	}
+	for i := 0; i < len(f); i++ {
+		c := f[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_' || c == '-' || c == '@':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// tabSafeVar wraps a bare variable name in the substitution that replaces a
+// raw tab in its value with a space.
+//
+// The pattern is a literal tab. tmux substitutes with a POSIX extended regular
+// expression, where "\t" matches a t and nothing else, and a character class
+// is worse than useless: the ':' inside "[[:cntrl:]]" ends the modifier as far
+// as the format parser is concerned and the whole expression then expands to
+// nothing rather than failing. scripts/probe-tabs.sh prints all three forms
+// against a real tmux, and says which variables need this.
+func tabSafeVar(f string) string {
+	return "#{s/" + fieldSep + "/ /:" + f + "}"
 }
 
 // formatVar wraps a bare variable name in #{...}, leaving anything that
@@ -57,6 +106,11 @@ func formatVar(f string) string {
 	}
 	return "#{" + f + "}"
 }
+
+// errEmptySpec is what the two entry points that need columns say when they
+// were given none. [Client.QueryArgs] would otherwise ask tmux for an empty
+// -F, and [ParseRows] has nothing to align a line against.
+var errEmptySpec = errors.New("gotmucks: empty format spec")
 
 // Row is one line of format output, addressed by the spec entries that
 // produced it.
@@ -179,15 +233,21 @@ func (r Row) PaneID(name string) (PaneID, error) {
 // for instance — can be parsed with the same rules as a one-shot command.
 //
 // Too few fields is an error: the row cannot be aligned with the spec at all,
-// and guessing which column is missing would be worse than saying so. Too
-// many are folded into the last field, because tmux does not escape the tab
-// in every value it expands — verified on 3.2a, where a pane whose working
-// directory contains one puts a raw tab in pane_current_path while escaping
-// it in session_name and window_name and refusing it outright in pane_title.
-// A spec that keeps such a field last therefore reads back the value intact;
-// one that does not silently mixes two columns, which is why [FormatSpec]
-// says to put it last.
+// and guessing which column is missing would be worse than saying so. Too many
+// are folded into the last field, because tmux does not escape the tab in
+// every value it expands — verified on 3.2a, where a pane whose working
+// directory contains one puts a raw tab in pane_current_path. Folding is only
+// correct if no earlier column can overflow, which is what [FormatSpec.Arg]
+// arranges; a caller who builds the -F template some other way and hands the
+// output here owes itself the same discipline, or an earlier tab will shift
+// every column after it without saying so.
+//
+// An empty spec is a caller error rather than an unusual line: there is
+// nothing for a row to be aligned against.
 func ParseRows(spec FormatSpec, lines []string) ([]Row, error) {
+	if len(spec) == 0 {
+		return nil, errEmptySpec
+	}
 	if len(lines) == 0 {
 		return nil, nil
 	}
@@ -227,7 +287,7 @@ func (c *Client) Query(ctx context.Context, cmd string, spec FormatSpec) ([]Row,
 // built from spec is appended after args.
 func (c *Client) QueryArgs(ctx context.Context, spec FormatSpec, args ...string) ([]Row, error) {
 	if len(spec) == 0 {
-		return nil, errors.New("gotmucks: empty format spec")
+		return nil, errEmptySpec
 	}
 	full := append(append([]string(nil), args...), "-F", spec.Arg())
 

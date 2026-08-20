@@ -19,7 +19,11 @@ type Window struct {
 	// Index is the window's position in its session. Indexes renumber; do not
 	// address windows by them.
 	Index int
-	// Name is the current window name.
+	// Name is the current window name. rename-window and automatic-rename
+	// escape a tab in it to "\t", but new-session -n and new-window -n store
+	// one as it was given — verified on 3.2a — so a name from either of those
+	// arrives here with the tab replaced by a space, for the reason
+	// [FormatSpec] gives.
 	Name string
 	// Active reports whether this is the session's current window.
 	Active bool
@@ -40,9 +44,12 @@ var windowSpec = FormatSpec{
 	"window_panes",
 	"window_width",
 	"window_height",
-	// Last: the layout string is the only field with a plausible claim to
-	// containing surprising bytes, and a trailing field fails loudly rather
-	// than shifting every column after it.
+	// Last, which is the one entry a raw tab survives in: the layout string is
+	// the only field here with a plausible claim to containing surprising
+	// bytes, and it is the one worth having back unaltered. window_name is the
+	// field that actually carries a tab on 3.2a, and the substitution
+	// [FormatSpec.Arg] puts around every earlier entry is what stops it
+	// shifting the four columns after it.
 	"window_layout",
 }
 

@@ -790,6 +790,51 @@ func TestShowOptionValue(t *testing.T) {
 	}
 }
 
+// TestShowOptionArrayIsRefused: show-options prints one "name[index] value"
+// line per element for an array option, and reading the first line as the
+// whole answer returned element 0 with ok true and no hint that there was
+// anything else. The fixture is 3.2a's own output for status-format.
+func TestShowOptionArrayIsRefused(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"show-options": {Stdout: "status-format[0] \"#[align=left]\"\nstatus-format[1] \"#[align=centre]\"\n"},
+		},
+	})
+	v, ok, err := f.client().ShowOption(context.Background(), Global, ScopeGlobal, "status-format")
+	if err == nil {
+		t.Fatalf("got (%q, %v, nil), want an error naming the array", v, ok)
+	}
+	if ok || v != "" {
+		t.Errorf("got (%q, %v) beside the error, want (\"\", false)", v, ok)
+	}
+	if !strings.Contains(err.Error(), "2 elements") {
+		t.Errorf("error does not say how many elements there were: %v", err)
+	}
+}
+
+// TestIsArrayElement pins what separates an indexed name from an ordinary one,
+// since the value of a plain option may well end in a bracket.
+func TestIsArrayElement(t *testing.T) {
+	tests := []struct {
+		printed, name string
+		want          bool
+	}{
+		{"status-format[0]", "status-format", true},
+		{"command-alias[10]", "command-alias", true},
+		{"status-format", "status-format", false},
+		{"status-format[]", "status-format", false},
+		{"status-format[x]", "status-format", false},
+		{"status-format[0", "status-format", false},
+		{"@user[0]", "@user", true},
+		{"other[0]", "status-format", false},
+	}
+	for _, tt := range tests {
+		if got := isArrayElement(tt.printed, tt.name); got != tt.want {
+			t.Errorf("isArrayElement(%q, %q) = %v, want %v", tt.printed, tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestSetHookArgv(t *testing.T) {
 	f := newFake(t, faketmux.Script{})
 	c := f.client()

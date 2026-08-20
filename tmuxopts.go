@@ -3,6 +3,7 @@ package gotmucks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -131,6 +132,11 @@ func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, n
 // to the empty string — verified on 3.2a. The named form prints nothing at
 // all when the option is not set there, which is the distinction the bool
 // reports.
+//
+// An array option — status-format, command-alias — has no single value and is
+// an error here rather than a quiet answer of its first element. Read one with
+// [Client.ShowOptions], which reports every element under its own indexed
+// name.
 func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, name string) (string, bool, error) {
 	if name == "" {
 		return "", false, errors.New("gotmucks: empty option name")
@@ -158,11 +164,39 @@ func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, na
 		return "", false, nil
 	}
 	// "name value", or the name alone for a flag option set with no value.
-	_, value, ok := strings.Cut(lines[0], " ")
+	printed, value, ok := strings.Cut(lines[0], " ")
+	if isArrayElement(printed, name) {
+		return "", false, fmt.Errorf(
+			"gotmucks: option %s is an array of %d elements; read it with ShowOptions",
+			name, len(lines))
+	}
 	if !ok {
 		return "", true, nil
 	}
 	return unquoteOptionValue(value), true, nil
+}
+
+// isArrayElement reports whether the name tmux printed for a value is an
+// element of an array option rather than the option itself.
+//
+// show-options prints one "name[index] value" line per element for those, so
+// reading the first line as the whole answer returns element 0 and says
+// nothing about the rest — verified on 3.2a, where status-format has two
+// elements and command-alias has six.
+func isArrayElement(printed, name string) bool {
+	if !strings.HasPrefix(printed, name+"[") || !strings.HasSuffix(printed, "]") {
+		return false
+	}
+	index := printed[len(name)+1 : len(printed)-1]
+	if index == "" {
+		return false
+	}
+	for i := 0; i < len(index); i++ {
+		if index[i] < '0' || index[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // unknownOptionPatterns are how tmux says it has never heard of an option
@@ -185,6 +219,11 @@ func isUnknownOptionStderr(stderr string) bool {
 // tmux prints one "name value" pair per line, quoting values that need it and
 // escaping the characters that would otherwise break the line; both are undone
 // here, so a value containing a tab or a newline comes back intact.
+//
+// An array option appears as one entry per element, keyed by the name tmux
+// printed: "status-format[0]", "status-format[1]". That is what makes this the
+// call for reading one — [Client.ShowOption] refuses an array rather than
+// answering with its first element.
 func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (map[string]string, error) {
 	if err := checkTarget(t); err != nil {
 		return nil, err

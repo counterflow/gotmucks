@@ -616,20 +616,9 @@ func testControl(t *testing.T, extra ...Option) (*ControlClient, *Client) {
 	return cc, c
 }
 
-// TestIntegrationControlBlockFlagsMarkOurCommands pins the assumption the
-// reader's second orphan rule rests on, against whichever tmux is under test.
-//
-// tmux computes a block's flags word from CMDQ_STATE_CONTROL, which it sets
-// only for a command line read from the control client's own input, so a block
-// it opened for itself carries 0 and a reply to us carries 1. If a release
-// ever stops doing that, the reader would start binding unsolicited blocks to
-// commands again — silently — so this is checked rather than assumed. It talks
-// to tmux directly instead of through [Connect], because the client absorbs
-// the opening block and the point here is to look at it.
-// TestIntegrationPaneWithTabInItsPath is H1 against real tmux: tmux escapes a
-// tab in a session or window name but hands pane_current_path back with the
-// tab in it, and a single such pane used to make every pane listing on the
-// whole server fail.
+// TestIntegrationPaneWithTabInItsPath is H1 against real tmux: tmux hands
+// pane_current_path back with a raw tab in it, and a single such pane used to
+// make every pane listing on the whole server fail.
 func TestIntegrationPaneWithTabInItsPath(t *testing.T) {
 	c, _ := testClient(t)
 	ctx := testCtx(t)
@@ -672,6 +661,125 @@ func pathsOf(panes []Pane) []string {
 		out[i] = p.CurrentPath
 	}
 	return out
+}
+
+// TestIntegrationRawTabsDoNotShiftColumns is N2 against real tmux.
+//
+// Folding an overflowing field into the last column recovers the value when
+// the last column is the one that overflowed, and shifts every field between
+// when some earlier one did. The path is not the only field that can overflow:
+// pane_current_command carries a raw tab whenever the running binary's own
+// file name does, and window_name carries one whenever the window was named
+// through new-session -n or new-window -n. Both were middle columns, and both
+// turned a listing that used to fail loudly into three wrong values and no
+// error.
+//
+// So this asks for a row with a raw tab available in two places at once and
+// looks at every column of it. The fields either side of the sanitised one are
+// the assertion that matters: a shift moves them, and their values here are
+// ones the test chose.
+func TestIntegrationRawTabsDoNotShiftColumns(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	dir := filepath.Join(t.TempDir(), "dir\tname")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Skipf("this filesystem will not hold a directory with a tab in its name: %v", err)
+	}
+	prog := tabbedCopyOf(t, "cat")
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name:       "tabs",
+		WindowName: "win\tname",
+		Width:      80,
+		Height:     24,
+		StartDir:   dir,
+		// Two elements, so tmux execs this directly and the tab in the path is
+		// inert. "-" is cat's own spelling for standard input, which in a pane
+		// is the terminal, so it stays in the foreground.
+		Command: []string{prog, "-"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	panes, err := c.ListSessionPanes(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ListSessionPanes: %v", err)
+	}
+	if len(panes) != 1 {
+		t.Fatalf("got %d panes, want 1 — a pane whose command exited leaves nothing to look at", len(panes))
+	}
+	p := panes[0]
+
+	// The columns before the one that could overflow.
+	if p.Session != s.ID {
+		t.Errorf("Session = %q, want %q", p.Session, s.ID)
+	}
+	if p.Index != 0 {
+		t.Errorf("Index = %d, want 0", p.Index)
+	}
+	if p.PID <= 0 {
+		t.Errorf("PID = %d, want the pane's child", p.PID)
+	}
+	if p.Width != 80 || p.Height != 24 {
+		t.Errorf("size = %dx%d, want 80x24", p.Width, p.Height)
+	}
+	// The one that could, and the two after it.
+	if p.CurrentCommand != "ab cd" {
+		t.Errorf("CurrentCommand = %q, want %q with its tab replaced", p.CurrentCommand, "ab\tcd")
+	}
+	if strings.Contains(p.Title, "\t") {
+		t.Errorf("Title = %q, which has taken a raw tab", p.Title)
+	}
+	if !strings.HasSuffix(p.CurrentPath, "dir\tname") {
+		t.Errorf("CurrentPath = %q, want it to end in the tabbed directory unaltered", p.CurrentPath)
+	}
+
+	// The same question of the window row, where the name is the field that
+	// can overflow and four columns sit after it.
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ListSessionWindows: %v", err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("got %d windows, want 1", len(windows))
+	}
+	w := windows[0]
+	if w.Name != "win name" {
+		t.Errorf("Name = %q, want %q with its tab replaced", w.Name, "win\tname")
+	}
+	if !w.Active || w.Panes != 1 || w.Index != 0 {
+		t.Errorf("active=%v panes=%d index=%d, want true/1/0", w.Active, w.Panes, w.Index)
+	}
+	if w.Width != 80 || w.Height != 24 {
+		t.Errorf("window size = %dx%d, want 80x24", w.Width, w.Height)
+	}
+	if !strings.Contains(w.Layout, "80x24") {
+		t.Errorf("Layout = %q, want tmux's layout string for an 80x24 window", w.Layout)
+	}
+}
+
+// tabbedCopyOf copies a program to a file called "ab<tab>cd" and returns the
+// path, so that a pane running it reports a raw tab in pane_current_command.
+// It has to be a copy of a real binary: tmux takes the name from the operating
+// system, so a wrapper script would report whatever the wrapper ran.
+func tabbedCopyOf(t *testing.T, name string) string {
+	t.Helper()
+
+	src, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s is not on PATH: %v", name, err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Skipf("reading %s: %v", src, err)
+	}
+	dst := filepath.Join(t.TempDir(), "ab\tcd")
+	if err := os.WriteFile(dst, data, 0o755); err != nil {
+		t.Skipf("this filesystem will not hold a file with a tab in its name: %v", err)
+	}
+	return dst
 }
 
 // TestIntegrationShowOption is H2 against real tmux. The unit test for this
@@ -802,6 +910,16 @@ func TestIntegrationMissingTargetErrors(t *testing.T) {
 	}
 }
 
+// TestIntegrationControlBlockFlagsMarkOurCommands pins the assumption the
+// reader's second orphan rule rests on, against whichever tmux is under test.
+//
+// tmux computes a block's flags word from CMDQ_STATE_CONTROL, which it sets
+// only for a command line read from the control client's own input, so a block
+// it opened for itself carries 0 and a reply to us carries 1. If a release
+// ever stops doing that, the reader would start binding unsolicited blocks to
+// commands again — silently — so this is checked rather than assumed. It talks
+// to tmux directly instead of through [Connect], because the client absorbs
+// the opening block and the point here is to look at it.
 func TestIntegrationControlBlockFlagsMarkOurCommands(t *testing.T) {
 	opts := testOptions(t)
 	c := New(opts...)
@@ -1024,6 +1142,39 @@ func TestIntegrationControlQuoting(t *testing.T) {
 	}
 	if !PaneID(first[0]).Valid() {
 		t.Errorf("first field %q is not a pane id; the format was mangled", first[0])
+	}
+}
+
+// TestIntegrationControlSpecArg sends a real [FormatSpec] over the connection.
+//
+// Arg now renders every column but the last inside a substitution, so what
+// DoArgs has to quote is a string holding tabs, braces, slashes and a '#' —
+// and tmux parses that line itself. This is the one place both halves are
+// exercised together: quoteArg's output and tmux's parser.
+func TestIntegrationControlSpecArg(t *testing.T) {
+	cc, _ := testControl(t)
+	ctx := testCtx(t)
+
+	reply, err := cc.DoArgs(ctx, "list-panes", "-a", "-F", paneSpec.Arg())
+	if err != nil {
+		t.Fatalf("DoArgs: %v", err)
+	}
+	rows, err := reply.Rows(paneSpec)
+	if err != nil {
+		t.Fatalf("Rows: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("no panes returned")
+	}
+	p, err := paneFromRow(rows[0])
+	if err != nil {
+		t.Fatalf("paneFromRow: %v (row %q)", err, reply.Output[0])
+	}
+	// A substitution tmux did not understand expands to nothing rather than
+	// failing, so an empty column is the failure mode to look for.
+	if p.CurrentCommand == "" || p.Width == 0 || p.Height == 0 {
+		t.Errorf("command=%q size=%dx%d from %q; a column expanded to nothing",
+			p.CurrentCommand, p.Width, p.Height, reply.Output[0])
 	}
 }
 
