@@ -160,10 +160,46 @@ func (cc *ControlClient) Pause(ctx context.Context, pane PaneID) error {
 // protected. Single quotes are preferred because tmux performs no expansion
 // inside them, which matters for format strings; an argument that itself
 // contains a single quote falls back to backslash escaping.
+//
+// A newline is the one byte no quoting reaches, because the control protocol
+// reads one command per line: a raw one ends the command wherever it sits,
+// inside quotes or not. tmux's own escape for it is "\n" within double quotes,
+// and adjacent quoted tokens concatenate into a single argument — both
+// verified on 3.2a, where 'a'"\n"'b' arrives as one argument of three bytes.
+// So a newline is spliced in as a double-quoted chunk of its own, and
+// everything between the newlines stays inside single quotes.
+//
+// Only the newline gets that treatment, and only as a chunk containing nothing
+// else. Double quotes are not a general substitute for single ones here: tmux
+// expands both "$HOME" and "#{host}" inside them, so a format string wrapped
+// in double quotes would be expanded once by the lexer before the command that
+// was meant to expand it ever saw it. [FormatSpec.Arg] is exactly such a
+// string, and it carries a newline, which is what made this necessary.
 func quoteArg(s string) string {
 	if s == "" {
 		return "''"
 	}
+	if !strings.Contains(s, "\n") {
+		return quoteToken(s)
+	}
+
+	parts := strings.Split(s, "\n")
+	var b strings.Builder
+	b.Grow(len(s) + 4*len(parts))
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteString(`"\n"`)
+		}
+		if part != "" {
+			b.WriteString(quoteToken(part))
+		}
+	}
+	return b.String()
+}
+
+// quoteToken quotes a run with no newline in it, which is the only kind
+// [quoteArg] hands it.
+func quoteToken(s string) string {
 	if !needsQuoting(s) {
 		return s
 	}

@@ -120,19 +120,21 @@ func TestFormatSpecArg(t *testing.T) {
 		{
 			// Every column but the last asks tmux to take a raw tab out of the
 			// value, since only the last one can be given an extra field back.
+			// Every column including the last asks it to take a newline out,
+			// since no column can be given a whole extra row back.
 			name: "bare names are wrapped, all but the last against a tab",
 			spec: FormatSpec{"session_id", "session_name"},
-			want: "#{s/\t/ /:session_id}\t#{session_name}",
+			want: "#{s/\t/ /;s/\n/ /:session_id}\t#{s/\n/ /:session_name}",
 		},
 		{
 			name: "a single entry is the last one",
 			spec: FormatSpec{"session_id"},
-			want: "#{session_id}",
+			want: "#{s/\n/ /:session_id}",
 		},
 		{
 			name: "an expression is used verbatim",
 			spec: FormatSpec{"pane_id", "#{?pane_dead,dead,live}"},
-			want: "#{s/\t/ /:pane_id}\t#{?pane_dead,dead,live}",
+			want: "#{s/\t/ /;s/\n/ /:pane_id}\t#{?pane_dead,dead,live}",
 		},
 		{
 			// A substitution's operand is expanded as a format, so "#{...}"
@@ -141,7 +143,7 @@ func TestFormatSpecArg(t *testing.T) {
 			// rather than risked.
 			name: "an expression is left alone in a column that is not last",
 			spec: FormatSpec{"#H", "#{?pane_dead,dead,live}", "pane_id"},
-			want: "#H\t#{?pane_dead,dead,live}\t#{pane_id}",
+			want: "#H\t#{?pane_dead,dead,live}\t#{s/\n/ /:pane_id}",
 		},
 		{
 			name: "a shell expansion is used verbatim",
@@ -161,12 +163,12 @@ func TestFormatSpecArg(t *testing.T) {
 			// the last column.
 			name: "a prefixed expansion is left alone",
 			spec: FormatSpec{"T:status-left", "pane_id"},
-			want: "#{T:status-left}\t#{pane_id}",
+			want: "#{T:status-left}\t#{s/\n/ /:pane_id}",
 		},
 		{
 			name: "an option name may contain a hyphen",
 			spec: FormatSpec{"@user-option", "pane_id"},
-			want: "#{s/\t/ /:@user-option}\t#{pane_id}",
+			want: "#{s/\t/ /;s/\n/ /:@user-option}\t#{s/\n/ /:pane_id}",
 		},
 		{
 			name: "an empty spec renders nothing",
@@ -287,6 +289,17 @@ func TestUnquoteOptionValue(t *testing.T) {
 		// The case a two-pass ReplaceAll gets wrong: an escaped backslash
 		// followed by a literal t must not become a tab.
 		{`a\\tb`, `a\tb`},
+		// tmux escapes a '$' so that the value it prints can be fed back
+		// through set-option, where a bare one is a variable. It is the escape
+		// this decoder was missing, and the only one a caller picked up
+		// silently: read-modify-write of an ordinary PATH gained a backslash
+		// every cycle. All four lines are 3.2a's own output.
+		{`"a\$b"`, `a$b`},
+		{`"PATH=\$HOME/bin"`, `PATH=$HOME/bin`},
+		// A value that really contains a backslash before a '$' is
+		// unambiguous, because tmux escapes the backslash too.
+		{`"a\\\$b"`, `a\$b`},
+		{`"a\\\\\$b"`, `a\\$b`},
 	}
 
 	for _, tt := range tests {
@@ -295,6 +308,145 @@ func TestUnquoteOptionValue(t *testing.T) {
 				t.Errorf("unquoteOptionValue(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestOptionValueSurvivesReadModifyWrite is the shape of the bug rather than
+// one of its values: a caller that reads an option, changes part of it and
+// writes it back is the only way to edit one element of status-left or append
+// to a user option, and every cycle used to add a backslash.
+//
+// tmuxEscape stands in for tmux here — it is what 3.2a does to a value on its
+// way out of show-options, checked against the real thing by
+// scripts/probe-roundtrip.sh — so that the loop can run further than an
+// integration test would want to.
+func TestOptionValueSurvivesReadModifyWrite(t *testing.T) {
+	tmuxEscape := func(v string) string {
+		v = strings.ReplaceAll(v, `\`, `\\`)
+		v = strings.ReplaceAll(v, `$`, `\$`)
+		return `"` + v + `"`
+	}
+
+	const want = `PATH=$HOME/bin:$HOME/.local/bin`
+	stored := want
+	for i := 1; i <= 20; i++ {
+		got := unquoteOptionValue(tmuxEscape(stored))
+		if got != want {
+			t.Fatalf("after %d read-modify-write cycles the value is %q, want %q", i, got, want)
+		}
+		stored = got
+	}
+}
+
+// TestVisEncodeMatchesTmux pins the encoder against what tmux 3.2a stores for
+// the same name, measured by scripts/probe-roundtrip.sh. It exists because the
+// encoder's whole job is to agree with tmux: new-session -n is the one name
+// argument tmux does not escape itself, and a form that did not match would
+// make the same name read back two different ways.
+func TestVisEncodeMatchesTmux(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{`plain`, `plain`},
+		{`a b`, `a b`},
+		{"a\tb", `a\tb`},
+		{"a\nb", `a\nb`},
+		{"a\rb", `a\rb`},
+		{"a\ab", `a\ab`},
+		{"a\bb", `a\bb`},
+		{"a\vb", `a\vb`},
+		{"a\fb", `a\fb`},
+		{"a\x01b", `a\001b`},
+		{"a\x1bb", `a\033b`},
+		{"a\x7fb", `a\177b`},
+		{`a\b`, `a\\b`},
+		{`a$b`, `a\$b`},
+		{`$HOME`, `\$HOME`},
+		// tmux leaves these alone even though vis(3) has flags that would not.
+		{`a"b`, `a"b`},
+		{`a'b`, `a'b`},
+		{"a`b", "a`b"},
+		{`a#b`, `a#b`},
+		// Valid UTF-8 passes through, which is what tmux does with it.
+		{"aéb", "aéb"},
+		{"a→b", "a→b"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := visEncode(tt.in); got != tt.want {
+				t.Errorf("visEncode(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if got := visDecode(tt.want); got != tt.in {
+				t.Errorf("visDecode(%q) = %q, want %q", tt.want, got, tt.in)
+			}
+		})
+	}
+}
+
+// TestVisRoundTrip is the property the pair exists for, over the bytes a name
+// can be built from. Encoding then decoding has to be the identity, including
+// for the strings that look like an escape already.
+func TestVisRoundTrip(t *testing.T) {
+	cases := []string{
+		``, `plain`, `a\tb`, `a\\tb`, `a\$b`, `\`, `\\`, `$`, `$$`,
+		"\t", "\n", "\\\t", "a\\\nb", `\001`, "\x01", "\x00", "\xff\xfe",
+		"#{host}", "##{host}", "a b\tc\nd", "é\\→",
+	}
+	for _, s := range cases {
+		if got := visDecode(visEncode(s)); got != s {
+			t.Errorf("visDecode(visEncode(%q)) = %q", s, got)
+		}
+	}
+}
+
+// TestEscapeFormat pins the escape for the four name arguments tmux expands as
+// a format before it stores them.
+func TestEscapeFormat(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{`plain`, `plain`},
+		{`v#{host}`, `v##{host}`},
+		{`a#Hb`, `a##Hb`},
+		{`a#b`, `a##b`},
+		{`#(touch /tmp/x)`, `##(touch /tmp/x)`},
+		{`###`, `######`},
+		{``, ``},
+		// Nothing else is touched: the expansion is the only thing being
+		// defended against, and the name is otherwise the caller's.
+		{`a$b\c`, `a$b\c`},
+	}
+	for _, tt := range tests {
+		if got := escapeFormat(tt.in); got != tt.want {
+			t.Errorf("escapeFormat(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestSplitArrayElement pins the parse both ShowOption and ShowHooks lean on.
+func TestSplitArrayElement(t *testing.T) {
+	tests := []struct {
+		printed, base string
+		indexed       bool
+	}{
+		{"alert-bell[0]", "alert-bell", true},
+		{"status-format[10]", "status-format", true},
+		{"@user[0]", "@user", true},
+		{"alert-bell", "alert-bell", false},
+		{"alert-bell[]", "alert-bell[]", false},
+		{"alert-bell[x]", "alert-bell[x]", false},
+		{"alert-bell[0", "alert-bell[0", false},
+		// A leading bracket is a name in its own right, not an index with no
+		// name in front of it.
+		{"[0]", "[0]", false},
+	}
+	for _, tt := range tests {
+		base, indexed := splitArrayElement(tt.printed)
+		if base != tt.base || indexed != tt.indexed {
+			t.Errorf("splitArrayElement(%q) = (%q, %v), want (%q, %v)",
+				tt.printed, base, indexed, tt.base, tt.indexed)
+		}
 	}
 }
 

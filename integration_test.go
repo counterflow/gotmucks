@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +76,28 @@ func testOptions(t *testing.T) []Option {
 func testClient(t *testing.T) (*Client, []Option) {
 	opts := testOptions(t)
 	return New(opts...), opts
+}
+
+// rawTmux runs one command against the test's own server without going
+// through the package, and returns its output with the trailing newline off.
+//
+// It is how a test arranges something the package deliberately does not do —
+// naming a window through new-window -n with nothing escaped, or appending a
+// second command to a hook — so that the reading side can be tested against
+// what another program on the same server would leave behind.
+func rawTmux(t *testing.T, opts []Option, args ...string) string {
+	t.Helper()
+
+	cfg := newConfig(opts)
+	full, _ := cfg.argv(args)
+	cmd := exec.Command(cfg.binary, full...)
+	cmd.Env = cfg.environ()
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("tmux %v: %v (%s)", args, err, out)
+	}
+	return strings.TrimRight(string(out), "\n")
 }
 
 // testCtx bounds a test's tmux calls so a hang fails rather than stalls.
@@ -821,15 +844,18 @@ func TestIntegrationEmptyColumnRowsSurvive(t *testing.T) {
 // the last column is the one that overflowed, and shifts every field between
 // when some earlier one did. The path is not the only field that can overflow:
 // pane_current_command carries a raw tab whenever the running binary's own
-// file name does, and window_name carries one whenever the window was named
-// through new-session -n or new-window -n. Both were middle columns, and both
-// turned a listing that used to fail loudly into three wrong values and no
-// error.
+// file name does. That is a middle column, and it turned a listing that used
+// to fail loudly into three wrong values and no error.
 //
-// So this asks for a row with a raw tab available in two places at once and
-// looks at every column of it. The fields either side of the sanitised one are
-// the assertion that matters: a shift moves them, and their values here are
-// ones the test chose.
+// So this asks for a row with a raw tab in it and looks at every column. The
+// fields either side of the sanitised one are the assertion that matters: a
+// shift moves them, and their values here are ones the test chose.
+//
+// window_name is the other field that can carry one, but no longer from a name
+// this package sent: WindowName is escaped on its way to new-session -n, so
+// the tab given here comes back as a tab rather than shifting anything.
+// TestIntegrationExternallyNamedWindowStillAligns keeps the column-shift
+// question, through a window named by another program.
 func TestIntegrationRawTabsDoNotShiftColumns(t *testing.T) {
 	c, _ := testClient(t)
 	ctx := testCtx(t)
@@ -898,8 +924,8 @@ func TestIntegrationRawTabsDoNotShiftColumns(t *testing.T) {
 		t.Fatalf("got %d windows, want 1", len(windows))
 	}
 	w := windows[0]
-	if w.Name != "win name" {
-		t.Errorf("Name = %q, want %q with its tab replaced", w.Name, "win\tname")
+	if w.Name != "win\tname" {
+		t.Errorf("Name = %q, want the name that was given back unaltered", w.Name)
 	}
 	if !w.Active || w.Panes != 1 || w.Index != 0 {
 		t.Errorf("active=%v panes=%d index=%d, want true/1/0", w.Active, w.Panes, w.Index)
@@ -1004,8 +1030,12 @@ func TestIntegrationShowHooksReportsPerTargetHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ShowHooks: %v", err)
 	}
-	if !hasHookNamed(hooks, "alert-bell") {
-		t.Errorf("show-hooks -t did not report a hook that was set on the target: %v", hooks)
+	// Looked up by the name it was set under, with no allowance made for the
+	// index tmux appends. That allowance used to live in a helper here rather
+	// than in the package, which is how the defect stayed hidden: the tests
+	// passed and every caller had to write the loop for itself.
+	if hooks["alert-bell"] != "display-message hooked" {
+		t.Errorf("show-hooks -t did not report the hook set on the target under its own name: %v", hooks)
 	}
 
 	// A window of that session reports its session's hooks as its own, which
@@ -1018,20 +1048,76 @@ func TestIntegrationShowHooksReportsPerTargetHooks(t *testing.T) {
 	if hooks, err = c.ShowHooks(ctx, windows[0].ID); err != nil {
 		t.Fatalf("ShowHooks on a window: %v", err)
 	}
-	if !hasHookNamed(hooks, "alert-bell") {
+	if hooks["alert-bell"] != "display-message hooked" {
 		t.Errorf("a window did not report its session's hook: %v", hooks)
 	}
 }
 
-// hasHookNamed matches a hook regardless of the array index tmux appends,
-// which turns "alert-bell" into "alert-bell[0]".
-func hasHookNamed(hooks map[string]string, name string) bool {
-	for k := range hooks {
-		if k == name || strings.HasPrefix(k, name+"[") {
-			return true
+// TestIntegrationHookRoundTrip is the hook half of the round trip: a hook set
+// through this package has to be findable under the name it was set with, and
+// the command it comes back as has to be one that can be set again.
+//
+// On 3.2a tmux prints an index on every hook, so the name was never the name;
+// and it prints the command by re-serialising the parsed command list, so
+// running that through the option-value decoder turned an escaped tab back
+// into a raw one and split the argument the next time round.
+func TestIntegrationHookRoundTrip(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "hookrt", Width: 80, Height: 24, Command: []string{"cat"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	commands := map[string]string{
+		"alert-bell":     "display-message hooked",
+		"alert-activity": `display-message "two words"`,
+		// Single-quoted, because tmux expands "$HOME" inside double quotes at
+		// the point the hook is set. A hook command carrying a shell variable
+		// is not an unusual thing to want to read back.
+		"alert-silence":   `run-shell 'echo $HOME'`,
+		"client-attached": `display-message "a;b"`,
+		// A tab has to be quoted here, because a hook command is a tmux
+		// command line and tmux would otherwise read it as the separator
+		// between two arguments. tmux prints it back as "\t", which is the
+		// case that shows why the command must not be decoded as an option
+		// value: doing so put the raw tab back and split the argument.
+		"client-detached": "display-message \"a\tb\"",
+	}
+	for name, command := range commands {
+		if err := c.SetHook(ctx, s.ID, name, command); err != nil {
+			t.Fatalf("SetHook(%q, %q): %v", name, command, err)
 		}
 	}
-	return false
+
+	first, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	for name := range commands {
+		if _, ok := first[name]; !ok {
+			t.Errorf("hook %q is not in the map under its own name: %v", name, first)
+		}
+	}
+
+	// tmux may print a command differently from the way it was written — it
+	// quotes what needs quoting and escapes a tab — so what is asserted is not
+	// that the command comes back verbatim but that it is stable: setting what
+	// was read has to leave the same thing to read again. That is the property
+	// a caller needs, and the one decoding the command destroyed.
+	for name, command := range first {
+		if err := c.SetHook(ctx, s.ID, name, command); err != nil {
+			t.Fatalf("SetHook(%q) with the command ShowHooks returned: %v", name, err)
+		}
+	}
+	second, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks the second time: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("a hook read and set again changed:\n first  %#v\n second %#v", first, second)
+	}
 }
 
 // TestIntegrationMissingTargetErrors is M5: a missing window and a missing
@@ -2014,5 +2100,417 @@ func TestIntegrationControlRefusesCommandBlocks(t *testing.T) {
 	}
 	if reply.String() != "in-step" {
 		t.Errorf("reply = %q, want %q", reply.String(), "in-step")
+	}
+}
+
+// The round trip. Every test from here down asks the one question no test in
+// this tree asked for eight review rounds: send a value through the package
+// and read the same value back.
+//
+// Five defects lived in that gap, all of them silent — a plausible value and a
+// nil error. Four were escaping tmux applies on the way in or on the way out
+// and the package did not undo; the fifth was a byte no column ordering can
+// survive. None was reachable from a test that only ever checked a value it
+// had never sent, or sent a value it never read.
+
+// nameRoundTrip is the table the three name tests share. Everything in it is a
+// name a caller could plausibly want, and every entry below the first was
+// wrong through at least one of the four calls before this round.
+var nameRoundTrip = []struct {
+	label, name string
+}{
+	{"plain", "plain"},
+	{"two words", "two words"},
+	{"a dollar", `a$b`},
+	{"a variable", `$HOME`},
+	{"a backslash", `a\b`},
+	{"an escape that is not one", `a\tb`},
+	{"a real tab", "a\tb"},
+	{"a real newline", "a\nb"},
+	{"a control byte", "a\x01b"},
+	{"a hash", `a#b`},
+	{"a format", `v#{host}`},
+	{"a single-character format", `a#Hb`},
+	{"a job", `#(echo ran)`},
+	{"a double quote", `a"b`},
+	{"a single quote", `a'b`},
+	{"a backtick", "a`b"},
+	{"not ascii", "héllo→"},
+}
+
+// TestIntegrationWindowNameRoundTrip is D2 and D5 against real tmux, through
+// the call that renames a window.
+//
+// tmux stores a name escaped with vis(3) and expands "#{window_name}" to the
+// escaped form, so a window renamed to "$HOME" reported "\$HOME"; and it runs
+// the name through format_expand first, so one renamed to "v#{host}" was
+// called after the host instead. Both were silent.
+func TestIntegrationWindowNameRoundTrip(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "wnames", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(windows))
+	}
+	w := windows[0].ID
+
+	for _, tt := range nameRoundTrip {
+		t.Run(tt.label, func(t *testing.T) {
+			if err := c.RenameWindow(ctx, w, tt.name); err != nil {
+				t.Fatalf("RenameWindow(%q): %v", tt.name, err)
+			}
+			got, err := c.Window(ctx, w)
+			if err != nil {
+				t.Fatalf("Window: %v", err)
+			}
+			if got.Name != tt.name {
+				t.Errorf("RenameWindow(%q) then Window().Name = %q", tt.name, got.Name)
+			}
+		})
+	}
+
+	// The job form is worth its own look. On 3.2a "#(...)" in a name does not
+	// run, but what it leaves behind is tmux's placeholder for a job it has
+	// queued rather than anything the caller asked for, which says the name
+	// reached the job machinery rather than being refused by it. The escape
+	// has to keep it away from there altogether.
+	if err := c.RenameWindow(ctx, w, `#(touch `+filepath.Join(t.TempDir(), "ran")+`)`); err != nil {
+		t.Fatalf("RenameWindow with a job: %v", err)
+	}
+	raw := rawTmux(t, opts, "display-message", "-p", "-t", string(w), "#{window_name}")
+	if strings.Contains(raw, "not ready") {
+		t.Errorf("window_name = %q, which means the name reached tmux's job machinery", raw)
+	}
+}
+
+// TestIntegrationSessionNameRoundTrip is the same question of the call that
+// renames a session.
+func TestIntegrationSessionNameRoundTrip(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "snames", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	for _, tt := range nameRoundTrip {
+		t.Run(tt.label, func(t *testing.T) {
+			if err := c.RenameSession(ctx, s.ID, tt.name); err != nil {
+				t.Fatalf("RenameSession(%q): %v", tt.name, err)
+			}
+			got, err := c.Session(ctx, s.ID)
+			if err != nil {
+				t.Fatalf("Session: %v", err)
+			}
+			if got.Name != tt.name {
+				t.Errorf("RenameSession(%q) then Session().Name = %q", tt.name, got.Name)
+			}
+		})
+	}
+}
+
+// TestIntegrationNewSessionNamesRoundTrip is the third and fourth name
+// arguments: new-session's -s and -n.
+//
+// "-n" is the one name argument tmux stores without escaping it — verified on
+// 3.2a — so the escaping is done for it here. Without that, the decoding that
+// makes the other three exact would turn a backslash in a name given through
+// this call into something else entirely.
+func TestIntegrationNewSessionNamesRoundTrip(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	for _, tt := range nameRoundTrip {
+		t.Run(tt.label, func(t *testing.T) {
+			s, err := c.NewSession(ctx, NewSessionOptions{
+				Name:       tt.name,
+				WindowName: tt.name,
+				Width:      80,
+				Height:     24,
+				Command:    []string{"cat"},
+			})
+			if err != nil {
+				t.Fatalf("NewSession(%q): %v", tt.name, err)
+			}
+			t.Cleanup(func() { _ = c.KillSession(context.Background(), s.ID) })
+
+			got, err := c.Session(ctx, s.ID)
+			if err != nil {
+				t.Fatalf("Session: %v", err)
+			}
+			if got.Name != tt.name {
+				t.Errorf("NewSession Name %q read back as %q", tt.name, got.Name)
+			}
+
+			windows, err := c.ListSessionWindows(ctx, s.ID)
+			if err != nil || len(windows) != 1 {
+				t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(windows))
+			}
+			if windows[0].Name != tt.name {
+				t.Errorf("NewSession WindowName %q read back as %q", tt.name, windows[0].Name)
+			}
+		})
+	}
+}
+
+// TestIntegrationOptionValueRoundTrip is D1 against real tmux.
+//
+// tmux escapes a '$' in an option value on its way out of show-options, so
+// that what it prints can be fed back through set-option where a bare one is a
+// variable. The decoder had a case for every other escape and not that one, so
+// every value containing a '$' came back with a backslash in front of it and
+// nothing said so.
+func TestIntegrationOptionValueRoundTrip(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "optrt", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	values := []string{
+		"plain", "two words", `a$b`, `$HOME`, `PATH=$HOME/bin:$PATH`,
+		`a\b`, `a\tb`, "a\tb", "a\nb", "a\x01b", `a#b`, `v#{host}`,
+		`a"b`, `a'b`, "a`b", `a;b`, `a|b`, `a*b`, "héllo→",
+		`a\$b`, `\$`, `$`, `\`,
+	}
+	for _, want := range values {
+		t.Run(want, func(t *testing.T) {
+			if err := c.SetOption(ctx, s.ID, "@probe", want); err != nil {
+				t.Fatalf("SetOption(%q): %v", want, err)
+			}
+
+			got, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "@probe")
+			if err != nil || !ok {
+				t.Fatalf("ShowOption: (%q, %v, %v)", got, ok, err)
+			}
+			if got != want {
+				t.Errorf("SetOption(%q) then ShowOption = %q", want, got)
+			}
+
+			all, err := c.ShowOptions(ctx, s.ID, ScopeSession)
+			if err != nil {
+				t.Fatalf("ShowOptions: %v", err)
+			}
+			if all["@probe"] != want {
+				t.Errorf("SetOption(%q) then ShowOptions = %q", want, all["@probe"])
+			}
+		})
+	}
+}
+
+// TestIntegrationOptionSurvivesReadModifyWrite is the shape the '$' defect
+// took in use.
+//
+// Reading an option, changing part of it and writing it back is the only way
+// to edit one element of status-left or to append to a user option. Each cycle
+// added a backslash and kept it, so a value drifted further from itself the
+// more it was maintained.
+func TestIntegrationOptionSurvivesReadModifyWrite(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "rmw", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	const want = `PATH=$HOME/bin:$HOME/.local/bin`
+	if err := c.SetOption(ctx, s.ID, "@path", want); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	for i := 1; i <= 10; i++ {
+		got, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "@path")
+		if err != nil || !ok {
+			t.Fatalf("ShowOption on cycle %d: (%q, %v, %v)", i, got, ok, err)
+		}
+		if got != want {
+			t.Fatalf("after %d read-modify-write cycles the value is %q, want %q", i, got, want)
+		}
+		if err := c.SetOption(ctx, s.ID, "@path", got); err != nil {
+			t.Fatalf("SetOption on cycle %d: %v", i, err)
+		}
+	}
+}
+
+// TestIntegrationNewlineInPanePathDoesNotBreakListings is D4 against real
+// tmux.
+//
+// A raw newline in a value does not overflow into the next field, it ends the
+// line, so no column ordering survives one: the row is two rows before
+// ParseRows sees it, and the second has one field where the spec wants twelve.
+// One pane started in a directory whose name contained a newline therefore
+// failed ListPanes for the whole server, and Pane with it for every pane on
+// it, however unrelated.
+//
+// A newline in a directory name is legal on every filesystem this runs on, and
+// no more exotic than the tab the package already went to the trouble of
+// substituting out.
+func TestIntegrationNewlineInPanePathDoesNotBreakListings(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	dir := filepath.Join(t.TempDir(), "two\nlines")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Skipf("this filesystem will not hold a directory with a newline in its name: %v", err)
+	}
+
+	// An ordinary session first, so that what is asserted is not only that the
+	// affected pane can be read but that it does not take the others down.
+	plain, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "plain", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	odd, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "odd", Width: 80, Height: 24, StartDir: dir, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession in the newline directory: %v", err)
+	}
+
+	panes, err := c.ListPanes(ctx)
+	if err != nil {
+		t.Fatalf("ListPanes with one pane in a newline directory: %v", err)
+	}
+	if len(panes) != 2 {
+		t.Fatalf("got %d panes, want 2", len(panes))
+	}
+
+	seen := make(map[PaneID]bool, len(panes))
+	for _, p := range panes {
+		seen[p.ID] = true
+		if strings.Contains(p.CurrentPath, "\n") {
+			t.Errorf("pane %s CurrentPath = %q, which still carries a raw newline", p.ID, p.CurrentPath)
+		}
+	}
+
+	oddPanes, err := c.ListSessionPanes(ctx, odd.ID)
+	if err != nil || len(oddPanes) != 1 {
+		t.Fatalf("ListSessionPanes on the affected session: %v (%d panes)", err, len(oddPanes))
+	}
+	// The newline is replaced rather than kept, which is the trade: a value
+	// that cannot be carried on one line is worth more with a space in it than
+	// as a failed listing of every pane on the server.
+	if want := "two lines"; !strings.HasSuffix(oddPanes[0].CurrentPath, want) {
+		t.Errorf("CurrentPath = %q, want it to end in %q", oddPanes[0].CurrentPath, want)
+	}
+	if !seen[oddPanes[0].ID] {
+		t.Error("the affected pane is missing from ListPanes")
+	}
+
+	plainPanes, err := c.ListSessionPanes(ctx, plain.ID)
+	if err != nil || len(plainPanes) != 1 {
+		t.Fatalf("ListSessionPanes on the unaffected session: %v (%d panes)", err, len(plainPanes))
+	}
+	// Pane goes through ListPanes, so every pane on the server was unreadable
+	// while any one of them was in a directory like this.
+	for _, p := range panes {
+		if _, err := c.Pane(ctx, p.ID); err != nil {
+			t.Errorf("Pane(%s): %v", p.ID, err)
+		}
+	}
+}
+
+// TestIntegrationExternallyNamedWindowStillAligns keeps the column-shift
+// coverage that TestIntegrationRawTabsDoNotShiftColumns used to get from this
+// package's own WindowName.
+//
+// new-session -n and new-window -n are the one path that stores a name without
+// escaping it, so a window named through either by another program has a raw
+// tab in window_name — a middle column, with four fields after it. The package
+// escapes the name it sends itself, so only a window it did not create can
+// still be in this state.
+func TestIntegrationExternallyNamedWindowStillAligns(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "extern", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rawTmux(t, opts, "new-window", "-d", "-t", string(s.ID), "-n", "win\tname", "--", "cat")
+
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ListSessionWindows: %v", err)
+	}
+	if len(windows) != 2 {
+		t.Fatalf("got %d windows, want 2", len(windows))
+	}
+
+	var named *Window
+	for i := range windows {
+		if strings.HasPrefix(windows[i].Name, "win") {
+			named = &windows[i]
+		}
+	}
+	if named == nil {
+		t.Fatalf("the externally named window is not in %v", windows)
+	}
+	// The substitution replaces the tab before it can split the column; the
+	// four fields after the name are the assertion that it did.
+	if named.Name != "win name" {
+		t.Errorf("Name = %q, want %q with its tab replaced", named.Name, "win\tname")
+	}
+	if named.Panes != 1 || named.Width != 80 || named.Height != 24 {
+		t.Errorf("panes=%d size=%dx%d, want 1 and 80x24 — a shifted column moves these",
+			named.Panes, named.Width, named.Height)
+	}
+	if !strings.Contains(named.Layout, "80x24") {
+		t.Errorf("Layout = %q, want tmux's layout string", named.Layout)
+	}
+}
+
+// TestIntegrationShowHooksKeepsTheIndexWhenAHookHasSeveral is the other half
+// of D3 against real tmux: a hook with more than one command cannot lose its
+// bracketed names, because a map holds one value per key.
+//
+// Only tmux's set-hook -a and an explicit index produce this, and this package
+// offers neither, so the second command is appended through tmux directly.
+func TestIntegrationShowHooksKeepsTheIndexWhenAHookHasSeveral(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "hookarr", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := c.SetHook(ctx, s.ID, "alert-bell", "display-message one"); err != nil {
+		t.Fatalf("SetHook: %v", err)
+	}
+	rawTmux(t, opts, "set-hook", "-a", "-t", string(s.ID), "--", "alert-bell", "display-message two")
+
+	hooks, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	for _, key := range []string{"alert-bell[0]", "alert-bell[1]"} {
+		if _, ok := hooks[key]; !ok {
+			t.Errorf("%s is missing from %v", key, hooks)
+		}
+	}
+	if _, ok := hooks["alert-bell"]; ok {
+		t.Errorf("alert-bell is keyed without an index as well, which loses one of the two: %v", hooks)
 	}
 }

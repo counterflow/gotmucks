@@ -19,11 +19,21 @@ type Window struct {
 	// Index is the window's position in its session. Indexes renumber; do not
 	// address windows by them.
 	Index int
-	// Name is the current window name. rename-window and automatic-rename
-	// escape a tab in it to "\t", but new-session -n and new-window -n store
-	// one as it was given — verified on 3.2a — so a name from either of those
-	// arrives here with the tab replaced by a space, for the reason
-	// [FormatSpec] gives.
+	// Name is the current window name, as it was set.
+	//
+	// tmux stores a name escaped with vis(3) and "#{window_name}" expands to
+	// the escaped form, so the raw field is not the name: a window renamed to
+	// "$HOME" reports "\$HOME" and one renamed to a tab reports "\t". It is
+	// decoded here, which is exact in both directions — a window genuinely
+	// named backslash-t-b is stored as "\\tb" and decodes back to itself.
+	//
+	// The one name that does not survive is one set by another program
+	// through new-window -n or new-session -n, which is the single path tmux
+	// does not escape — verified on 3.2a. A plain name is unaffected; one
+	// containing a backslash or a raw tab is not, the tab because
+	// [FormatSpec] has to replace it with a space before it splits the
+	// column. This package escapes the name it passes to -n itself, so a
+	// window it created is not affected either.
 	Name string
 	// Active reports whether this is the session's current window.
 	Active bool
@@ -47,7 +57,8 @@ var windowSpec = FormatSpec{
 	// Last, which is the one entry a raw tab survives in: the layout string is
 	// the only field here with a plausible claim to containing surprising
 	// bytes, and it is the one worth having back unaltered. window_name is the
-	// field that actually carries a tab on 3.2a, and the substitution
+	// field that actually carries a tab on 3.2a — only from new-window -n,
+	// since every other path escapes it — and the substitution
 	// [FormatSpec.Arg] puts around every earlier entry is what stops it
 	// shifting the four columns after it.
 	"window_layout",
@@ -65,7 +76,7 @@ func windowFromRow(r Row) (Window, error) {
 	if w.Index, err = r.Int("window_index"); err != nil {
 		return Window{}, err
 	}
-	w.Name = r.Get("window_name")
+	w.Name = visDecode(r.Get("window_name"))
 	if w.Active, err = r.Bool("window_active"); err != nil {
 		return Window{}, err
 	}
@@ -142,9 +153,15 @@ func (c *Client) Window(ctx context.Context, id WindowID) (*Window, error) {
 // unknown option, "-tother" is consumed as a second -t and leaves the command
 // with no name at all, and "--" is eaten as the separator; with it, all three
 // become the window's name.
+//
+// The separator is not enough on its own, because tmux expands the name as a
+// format before storing it. A '#' in the name is doubled so that it stays a
+// '#' — see [escapeFormat] for what happens otherwise — which means a caller
+// that wants tmux to expand a format into the name cannot get it through here
+// and should send rename-window itself.
 func (c *Client) RenameWindow(ctx context.Context, id WindowID, name string) error {
 	if err := id.check(); err != nil {
 		return err
 	}
-	return c.runOK(ctx, "rename-window", "-t", string(id), "--", name)
+	return c.runOK(ctx, "rename-window", "-t", string(id), "--", escapeFormat(name))
 }

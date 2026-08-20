@@ -723,6 +723,13 @@ func commandBreakErr(b byte, i int) error {
 // that name — this is one of the four exceptions to the identifier rule
 // described in the package documentation, not an escape from it. Build the -t
 // from a [SessionID], [WindowID] or [PaneID] that came from tmux.
+//
+// Nor does quoting stop a command expanding its own argument. rename-window,
+// rename-session and new-session's -s and -n run the name they are given
+// through tmux's format expansion before storing it, so "v#{host}" names an
+// object after the host and no quoting here prevents it: the expansion happens
+// after the lexer, inside the command. Double the '#' — see [escapeFormat],
+// which is what [Client.RenameWindow] and the other three do.
 func (cc *ControlClient) DoArgs(ctx context.Context, args ...string) (Reply, error) {
 	if len(args) == 0 {
 		return Reply{}, errors.New("gotmucks: no command given")

@@ -3,6 +3,7 @@ package gotmucks
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -441,6 +442,149 @@ func TestRenameSeparatesOptionsFromTheName(t *testing.T) {
 	}
 	f.wantArgv(0, "rename-window", "-t", "@1", "--", "-a")
 	f.wantArgv(1, "rename-session", "-t", "$0", "--", "-tother")
+}
+
+// TestNameArgumentsAreEscapedAgainstFormatExpansion pins the second thing that
+// stands between a caller's name and tmux, on all four calls that pass one.
+//
+// tmux runs the name through format_expand before storing it, so on 3.2a a
+// window renamed to "v#{host}" is called "vianf-laptop" and one renamed to
+// "#(cmd)" is called "<'cmd' not ready>". The separator does not help — this is
+// the command expanding its own argument, after the parser is done with it.
+// Doubling the '#' is what stops it, verified by scripts/probe-roundtrip.sh.
+func TestNameArgumentsAreEscapedAgainstFormatExpansion(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"new-session":   {Stdout: "$7\n"},
+			"list-sessions": {Stdout: tabbed([]string{"$7", "n#{host}", "1", "1", "1", "0"})},
+		},
+	})
+	c := f.client()
+	ctx := context.Background()
+
+	if err := c.RenameWindow(ctx, "@1", "v#{host}"); err != nil {
+		t.Fatalf("RenameWindow: %v", err)
+	}
+	if err := c.RenameSession(ctx, "$0", "#(touch /tmp/x)"); err != nil {
+		t.Fatalf("RenameSession: %v", err)
+	}
+	if _, err := c.NewSession(ctx, NewSessionOptions{
+		Name:       "n#{host}",
+		WindowName: "w#H",
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	f.wantArgv(0, "rename-window", "-t", "@1", "--", "v##{host}")
+	f.wantArgv(1, "rename-session", "-t", "$0", "--", "##(touch /tmp/x)")
+	f.wantArgv(2, "new-session", "-d", "-P", "-F", "#{session_id}",
+		"-s", "n##{host}", "-n", "w##H")
+}
+
+// TestNewSessionWindowNameIsVisEncoded pins the extra escaping "-n" needs and
+// the other three name arguments do not.
+//
+// tmux stores a name it was given through rename-window, rename-session or
+// new-session -s escaped with vis(3), and "-n" is the one that stores it raw —
+// verified on 3.2a. Since [Window.Name] decodes, a name that reached tmux
+// unescaped would come back as something else: "a\tb" would read as a tab.
+func TestNewSessionWindowNameIsVisEncoded(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"new-session":   {Stdout: "$7\n"},
+			"list-sessions": {Stdout: tabbed([]string{"$7", "s", "1", "1", "1", "0"})},
+		},
+	})
+
+	if _, err := f.client().NewSession(context.Background(), NewSessionOptions{
+		WindowName: "a\tb\\c$d",
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	f.wantArgv(0, "new-session", "-d", "-P", "-F", "#{session_id}",
+		"-n", `a\tb\\c\$d`)
+}
+
+// TestShowHooksStripsTheArrayIndex pins the key of the map ShowHooks returns.
+//
+// tmux 3.2a prints an index on every hook, not only on one set at an index, so
+// the name a hook was set under was never the name it could be found under and
+// the obvious use of the call — look up the hook you just set — returned the
+// zero value with no way to tell that from "no such hook". The lines here are
+// 3.2a's own output.
+func TestShowHooksStripsTheArrayIndex(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"show-hooks": {Stdout: "alert-bell[0] display-message hi\n" +
+				"pane-exited[0] run-shell \"echo gone\"\n" +
+				"client-attached[0] display-message \"a;b\"\n"},
+		},
+	})
+
+	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	want := map[string]string{
+		"alert-bell":      "display-message hi",
+		"pane-exited":     `run-shell "echo gone"`,
+		"client-attached": `display-message "a;b"`,
+	}
+	if !reflect.DeepEqual(hooks, want) {
+		t.Errorf("ShowHooks() = %#v, want %#v", hooks, want)
+	}
+}
+
+// TestShowHooksKeepsTheIndexWhenAHookHasSeveral is the other half: a map
+// cannot hold two commands under one name, so a hook with more than one
+// element keeps the bracketed names rather than losing all but one of them.
+// tmux's set-hook -a and an explicit index are what produce this; SetHook
+// always writes element zero.
+func TestShowHooksKeepsTheIndexWhenAHookHasSeveral(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"show-hooks": {Stdout: "alert-bell[0] display-message one\n" +
+				"alert-bell[1] display-message two\n" +
+				"pane-exited[0] display-message solo\n"},
+		},
+	})
+
+	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	want := map[string]string{
+		"alert-bell[0]": "display-message one",
+		"alert-bell[1]": "display-message two",
+		"pane-exited":   "display-message solo",
+	}
+	if !reflect.DeepEqual(hooks, want) {
+		t.Errorf("ShowHooks() = %#v, want %#v", hooks, want)
+	}
+}
+
+// TestShowHooksDoesNotDecodeTheCommand pins the value beside the key.
+//
+// A hook command is a tmux command line, not an option value: show-hooks
+// re-serialises the parsed command list, so a tab inside an argument comes
+// back as "\t" and is meant to. Running it through the option-value decoder
+// turned that into a raw tab, which splits the argument in two the next time
+// the command is set.
+func TestShowHooksDoesNotDecodeTheCommand(t *testing.T) {
+	const command = `display-message a\tb`
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"show-hooks": {Stdout: "alert-bell[0] " + command + "\n"},
+		},
+	})
+
+	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if got := hooks["alert-bell"]; got != command {
+		t.Errorf("hook command = %q, want %q", got, command)
+	}
 }
 
 func TestListPanes(t *testing.T) {

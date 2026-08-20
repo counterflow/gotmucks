@@ -19,6 +19,18 @@ import (
 // [ParseRows] can attribute an extra field to.
 const fieldSep = "\t"
 
+// lineSep separates rows, and is the one byte no column ordering can survive:
+// a raw newline in a value does not overflow into the next field, it ends the
+// line, and the row is two rows before [ParseRows] ever sees it. Putting the
+// value that carries one last does not help, so [FormatSpec.Arg] asks tmux to
+// take a newline out of every column including the last.
+//
+// It is as reachable as the tab and worse. A single pane whose working
+// directory contains a newline — legal on every filesystem this runs on —
+// split the row for that pane and failed ListPanes for the whole server,
+// taking Pane with it for every pane on it.
+const lineSep = "\n"
+
 // FormatSpec is an ordered list of tmux format variables to request.
 //
 // Entries are normally bare variable names ("session_id", "pane_active").
@@ -33,26 +45,33 @@ const fieldSep = "\t"
 // Order matters for more than presentation. tmux hands some values back with a
 // raw tab in them, and a raw tab is an extra field as far as [ParseRows] is
 // concerned, so [FormatSpec.Arg] requests every entry but the last through a
-// substitution that replaces one with a space. The last entry is asked for as
-// it stands, because an extra field there can be folded back into it: put the
-// field whose value must come back byte for byte at the end, and expect a tab
-// anywhere else to arrive as a space.
+// substitution that replaces one with a space. The last entry keeps its tabs,
+// because an extra field there can be folded back into it: put the field whose
+// value must come back byte for byte at the end, and expect a tab anywhere
+// else to arrive as a space.
+//
+// A raw newline is not an ordering question, because no position survives one:
+// it ends the line rather than adding a field, so the row is already two rows
+// by the time [ParseRows] sees it. Every entry is therefore requested through
+// a substitution that takes a newline out, the last one included, and no
+// column can come back carrying one.
 type FormatSpec []string
 
 // Arg renders the spec as the value of tmux's -F flag.
 //
-// Every entry but the last is wrapped in tmux's substitution modifier so that
-// a raw tab in the value cannot split the column. Only a plain variable name
-// is wrapped. Anything else the caller wrote — a format expression, a prefixed
-// expansion such as "T:status-left" — is rendered as it stands and is the
-// caller's own business: a substitution's operand is itself expanded, so
-// "#{...}" nests inside one, but "#{s/<tab>/ /:#H}" expands to nothing at all
-// on 3.2a, and turning a working column into an empty one is the worse trade.
+// Every entry is wrapped in tmux's substitution modifier so that a raw newline
+// in the value cannot split the row, and every entry but the last so that a
+// raw tab cannot split the column. Only a plain variable name is wrapped.
+// Anything else the caller wrote — a format expression, a prefixed expansion
+// such as "T:status-left" — is rendered as it stands and is the caller's own
+// business: a substitution's operand is itself expanded, so "#{...}" nests
+// inside one, but "#{s/<tab>/ /:#H}" expands to nothing at all on 3.2a, and
+// turning a working column into an empty one is the worse trade.
 func (s FormatSpec) Arg() string {
 	parts := make([]string, len(s))
 	for i, f := range s {
-		if i < len(s)-1 && isBareVar(f) {
-			parts[i] = tabSafeVar(f)
+		if isBareVar(f) {
+			parts[i] = rowSafeVar(f, i < len(s)-1)
 			continue
 		}
 		parts[i] = formatVar(f)
@@ -80,17 +99,53 @@ func isBareVar(f string) bool {
 	return true
 }
 
-// tabSafeVar wraps a bare variable name in the substitution that replaces a
-// raw tab in its value with a space.
+// rowSafeVar wraps a bare variable name in the substitutions that stop its
+// value breaking the row it is a field of: always the one that replaces a raw
+// newline with a space, and for every column but the last the one that
+// replaces a raw tab.
 //
-// The pattern is a literal tab. tmux substitutes with a POSIX extended regular
-// expression, where "\t" matches a t and nothing else, and a character class
-// is worse than useless: the ':' inside "[[:cntrl:]]" ends the modifier as far
-// as the format parser is concerned and the whole expression then expands to
-// nothing rather than failing. scripts/probe-tabs.sh prints all three forms
-// against a real tmux, and says which variables need this.
-func tabSafeVar(f string) string {
-	return "#{s/" + fieldSep + "/ /:" + f + "}"
+// Both patterns are the literal byte. tmux substitutes with a POSIX extended
+// regular expression, where "\t" matches a t and nothing else, and a character
+// class is worse than useless: the ':' inside "[[:cntrl:]]" ends the modifier
+// as far as the format parser is concerned and the whole expression then
+// expands to nothing rather than failing. scripts/probe-tabs.sh prints all
+// three forms against a real tmux, and says which variables need this.
+//
+// Two substitutions go in one modifier separated by ';' rather than nested one
+// inside the other. Both work on 3.2a — scripts/probe-roundtrip.sh runs the
+// pair against a pane whose working directory contains a tab and a newline —
+// and the flat form is the shorter template.
+func rowSafeVar(f string, dropTab bool) string {
+	subs := "s/" + lineSep + "/ /"
+	if dropTab {
+		subs = "s/" + fieldSep + "/ /;" + subs
+	}
+	return "#{" + subs + ":" + f + "}"
+}
+
+// escapeFormat protects a caller's string from tmux's format expansion by
+// doubling every '#', which is tmux's own escape for one.
+//
+// tmux runs the name argument of rename-window, rename-session, new-session -s
+// and new-session -n through format_expand before storing it, so a name
+// containing "#{" is not a name: verified on 3.2a, where renaming a window to
+// "v#{host}" leaves it called "vianf-laptop", and where "#(...)" reaches
+// tmux's job machinery and leaves the placeholder "<'...' not ready>" behind
+// as the name. This is the command expanding its own argument rather than the
+// control-mode lexer, so it happens through [ControlClient.DoArgs] too and
+// quoteArg neither causes it nor prevents it.
+//
+// Doubling covers the single-character forms as well as "#{": "a##Hb" gives
+// "a#Hb" where "a#Hb" gives the hostname. It is correct for a name with no
+// format in it, since "a#b" has no format sequence today and "a##b" expands
+// back to "a#b" — but it is a deliberate behaviour change for a caller that
+// was passing a format on purpose, which is why the four calls that do it say
+// so.
+func escapeFormat(s string) string {
+	if !strings.Contains(s, "#") {
+		return s
+	}
+	return strings.ReplaceAll(s, "#", "##")
 }
 
 // formatVar wraps a bare variable name in #{...}, leaving anything that
@@ -241,6 +296,12 @@ func (r Row) PaneID(name string) (PaneID, error) {
 // arranges; a caller who builds the -F template some other way and hands the
 // output here owes itself the same discipline, or an earlier tab will shift
 // every column after it without saying so.
+//
+// A short row is that caller's other way of arriving here. tmux writes a raw
+// newline in a value out as it stands, which ends the line and leaves the
+// remainder of the value as a row of its own with too few fields in it; the
+// substitution [FormatSpec.Arg] wraps every column in is what keeps that from
+// happening, and a template built by hand has to do the same.
 //
 // An empty spec is a caller error rather than an unusual line: there is
 // nothing for a row to be aligned against.

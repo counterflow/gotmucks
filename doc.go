@@ -58,6 +58,25 @@
 // each argument, which is about how tmux splits the line and not about what it
 // addresses: a quoted -t still takes a name.
 //
+// # Names
+//
+// A name is not an address, but it is data, and tmux does not hand a value
+// back the way it was given. It expands a name as a format before storing it,
+// so "v#{host}" would name a window after the host; and it stores names and
+// prints option values escaped with vis(3), so a session called "$HOME" reads
+// back as "\$HOME". Both are undone here: [Client.RenameWindow],
+// [Client.RenameSession] and [Client.NewSession] escape what they send, and
+// [Window.Name], [Session.Name], [Client.ShowOption] and [Client.ShowOptions]
+// decode what they read, so what was set is what comes back.
+//
+// The cost is that a caller who wants tmux to expand a format into a name
+// cannot get one through these calls — a '#' is a '#' — and should send
+// rename-window itself. The other edge is a window named by another program
+// through "new-window -n", which is the one path tmux stores unescaped: a
+// plain name is unaffected, but a backslash or a tab in one is not.
+//
+// [Row] is the raw view and decodes nothing: it is what tmux wrote.
+//
 // # No server running
 //
 // tmux exits non-zero when no server is listening, but for a read that is an

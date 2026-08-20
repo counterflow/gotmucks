@@ -122,6 +122,17 @@ jobs:
         # and exits non-zero if either set has a name the table lacks.
         run: bash ./scripts/probe-notify.sh "$HOME/tmux-install/bin/tmux"
 
+      - name: Check the round trip against this tmux
+        # An assertion too, and for the same reason: what tmux escapes on the
+        # way in and on the way out is a claim about tmux, and a unit test can
+        # only assert the package's own spelling of it back at itself. This
+        # sends values through a real server and reads them back, and exits
+        # non-zero if this release escapes a byte the decoder does not undo,
+        # stops expanding a name argument the package doubles the '#' in,
+        # changes which of the name arguments it escapes, or will not
+        # substitute a newline out of a value.
+        run: bash ./scripts/probe-roundtrip.sh "$HOME/tmux-install/bin/tmux"
+
       - name: Integration tests
         run: |
           GOTMUCKS_TMUX="$HOME/tmux-install/bin/tmux" \

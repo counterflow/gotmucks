@@ -2174,10 +2174,46 @@ func TestQuoteArg(t *testing.T) {
 		{"a=b,c", "a=b,c"},
 		{`it's`, `it\'s`},
 		{`a b 'c'`, `a\ b\ \'c\'`},
+		// A newline is the one byte quoting cannot reach, since the protocol
+		// reads one command per line. tmux's escape for it is "\n" inside
+		// double quotes and adjacent quoted tokens concatenate, so it is
+		// spliced in as a chunk of its own and everything around it stays in
+		// single quotes, which expand nothing.
+		// A chunk that needs no quoting keeps none: tmux concatenates a bare
+		// token with a quoted one just as readily.
+		{"a\nb", `a"\n"b`},
+		{"\n", `"\n"`},
+		{"a\n", `a"\n"`},
+		{"\nb", `"\n"b`},
+		{"a\n\nb", `a"\n""\n"b`},
+		{"a b\n#{x}", `'a b'"\n"'#{x}'`},
+		{"it's\nb", `it\'s"\n"b`},
 	}
 	for _, tt := range tests {
 		if got := quoteArg(tt.in); got != tt.want {
 			t.Errorf("quoteArg(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestQuoteArgLeavesNoRawNewline is the property behind the table above, over
+// the shapes a [FormatSpec] produces: whatever quoteArg returns has to be
+// something [ControlClient.Do] will accept, and Do refuses a raw newline
+// because one would end the command wherever it sat.
+func TestQuoteArgLeavesNoRawNewline(t *testing.T) {
+	specs := []FormatSpec{
+		paneSpec, windowSpec, sessionSpec,
+		{"session_id"},
+		{"#H", "pane_id"},
+	}
+	for _, spec := range specs {
+		arg := spec.Arg()
+		if !strings.Contains(arg, "\n") {
+			t.Errorf("%v renders without a newline; this test is checking nothing", []string(spec))
+			continue
+		}
+		if quoted := quoteArg(arg); strings.ContainsAny(quoted, "\n\r\x00") {
+			t.Errorf("quoteArg(%q) still contains a byte Do refuses: %q", arg, quoted)
 		}
 	}
 }

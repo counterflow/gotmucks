@@ -14,7 +14,10 @@ type Session struct {
 	// ID is the stable identifier, "$0". Address sessions by this, never by
 	// Name: names are neither unique nor stable.
 	ID SessionID
-	// Name is the current session name.
+	// Name is the current session name, as it was set. tmux stores it escaped
+	// with vis(3) and "#{session_name}" expands to the escaped form, so it is
+	// decoded here for the reason [Window.Name] gives; unlike a window name
+	// there is no path that skips the escaping, so this one is always exact.
 	Name string
 	// Windows is the number of windows in the session.
 	Windows int
@@ -50,7 +53,7 @@ func sessionFromRow(r Row) (Session, error) {
 	if s.ID, err = r.SessionID("session_id"); err != nil {
 		return Session{}, err
 	}
-	s.Name = r.Get("session_name")
+	s.Name = visDecode(r.Get("session_name"))
 	if s.Windows, err = r.Int("session_windows"); err != nil {
 		return Session{}, err
 	}
@@ -76,6 +79,10 @@ type NewSessionOptions struct {
 	//
 	// A name is a convenience for humans reading tmux output; it is not how
 	// this package addresses the session afterwards.
+	//
+	// tmux expands it as a format before storing it, so a '#' in it is
+	// doubled to keep it a '#' — see [escapeFormat]. [Session.Name] reads
+	// back what was given here.
 	Name string
 
 	// StartDir is the working directory for the session's first window.
@@ -102,6 +109,13 @@ type NewSessionOptions struct {
 	Command []string
 
 	// WindowName names the session's first window.
+	//
+	// It is escaped twice on the way out, where [NewSessionOptions.Name] is
+	// escaped once. tmux expands "-n" as a format like the others, but it is
+	// the one name argument it then stores without applying vis(3) — verified
+	// on 3.2a — so the escaping tmux would have done is done here instead.
+	// That is what makes [Window.Name] read back what was given, whichever
+	// call named the window.
 	WindowName string
 
 	// Width and Height set the size of the detached session. tmux defaults to
@@ -115,10 +129,10 @@ func (o NewSessionOptions) args() []string {
 	args := []string{"new-session", "-d", "-P", "-F", "#{session_id}"}
 
 	if o.Name != "" {
-		args = append(args, "-s", o.Name)
+		args = append(args, "-s", escapeFormat(o.Name))
 	}
 	if o.WindowName != "" {
-		args = append(args, "-n", o.WindowName)
+		args = append(args, "-n", escapeFormat(visEncode(o.WindowName)))
 	}
 	if o.StartDir != "" {
 		args = append(args, "-c", o.StartDir)
@@ -340,10 +354,11 @@ func (c *Client) KillSession(ctx context.Context, id SessionID) error {
 //
 // The name goes after "--" for the reason [Client.RenameWindow] gives: it is
 // positional, so without the separator a name beginning with a dash is read as
-// a flag and the session keeps its old name.
+// a flag and the session keeps its old name. A '#' in it is doubled for the
+// other reason that call gives: tmux expands the name as a format first.
 func (c *Client) RenameSession(ctx context.Context, id SessionID, name string) error {
 	if err := id.check(); err != nil {
 		return err
 	}
-	return c.runOK(ctx, "rename-session", "-t", string(id), "--", name)
+	return c.runOK(ctx, "rename-session", "-t", string(id), "--", escapeFormat(name))
 }

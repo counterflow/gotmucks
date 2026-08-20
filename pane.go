@@ -29,8 +29,15 @@ type Pane struct {
 	// puts one here; it arrives as a space, for the reason [FormatSpec] gives.
 	CurrentCommand string
 	// CurrentPath is the working directory of the running command, when tmux
-	// can determine it. It is the one field here that comes back exactly as
-	// tmux wrote it, tab and all.
+	// can determine it. It is the one field here that keeps a raw tab, since
+	// it is last in the spec and an overflowing final column folds back.
+	//
+	// A newline in it arrives as a space. Nothing can be last enough to
+	// survive one — it ends the format line rather than adding a field — so
+	// [FormatSpec.Arg] asks tmux to substitute it out of this column too. It
+	// used to be left in, and one pane started in a directory whose name
+	// contained a newline failed [Client.ListPanes] for every pane on the
+	// server.
 	CurrentPath string
 	// Title is the pane title.
 	Title string
@@ -50,11 +57,12 @@ var paneSpec = FormatSpec{
 	"pane_title",
 	// Last, which is the one place a raw tab survives: every other entry is
 	// requested through a substitution that turns one into a space, and this
-	// one is asked for as it stands so that a working directory containing a
-	// tab reads back byte for byte. Of the three fields here that could carry
-	// one it has the best claim to the place — a tab-named directory is
-	// ordinary, and the path is the value a caller is most likely to hand
-	// straight to the operating system again.
+	// one keeps its tabs so that a working directory containing one reads back
+	// byte for byte. Of the three fields here that could carry one it has the
+	// best claim to the place — a tab-named directory is ordinary, and the
+	// path is the value a caller is most likely to hand straight to the
+	// operating system again. A newline is taken out of this column as well as
+	// the others, for the reason [FormatSpec] gives.
 	//
 	// The other two, verified on 3.2a by scripts/probe-tabs.sh:
 	// pane_current_command carries a raw tab whenever the binary's own file

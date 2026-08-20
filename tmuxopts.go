@@ -184,19 +184,33 @@ func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, na
 // nothing about the rest — verified on 3.2a, where status-format has two
 // elements and command-alias has six.
 func isArrayElement(printed, name string) bool {
-	if !strings.HasPrefix(printed, name+"[") || !strings.HasSuffix(printed, "]") {
-		return false
+	base, indexed := splitArrayElement(printed)
+	return indexed && base == name
+}
+
+// splitArrayElement takes the "[index]" off a name tmux printed, reporting
+// whether there was one. "status-format[1]" is the option status-format;
+// "@weird[x]" and "@weird[]" are options in their own right, since the index
+// tmux writes is always decimal and never empty.
+//
+// Hooks need this as much as array options do: 3.2a prints an index on every
+// hook, not only on one set at an index, so the bracket is the rule there
+// rather than the exception.
+func splitArrayElement(printed string) (string, bool) {
+	open := strings.LastIndexByte(printed, '[')
+	if open <= 0 || !strings.HasSuffix(printed, "]") {
+		return printed, false
 	}
-	index := printed[len(name)+1 : len(printed)-1]
+	index := printed[open+1 : len(printed)-1]
 	if index == "" {
-		return false
+		return printed, false
 	}
 	for i := 0; i < len(index); i++ {
 		if index[i] < '0' || index[i] > '9' {
-			return false
+			return printed, false
 		}
 	}
-	return true
+	return printed[:open], true
 }
 
 // unknownOptionPatterns are how tmux says it has never heard of an option
@@ -260,83 +274,19 @@ func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (
 // of show-options.
 //
 // tmux quotes a value that contains a space or a metacharacter, and escapes
-// the rest with vis(3) in its C style: a backslash becomes "\\", a tab "\t", a
-// newline "\n", and anything else unprintable three octal digits. The
-// escaping is applied whether or not the value ends up quoted, so unquoting
-// alone is not enough — verified on 3.2a, where a value containing a tab is
-// printed unquoted as "has\ttab".
+// the rest with vis(3) — see [visDecode]. The escaping is applied whether or
+// not the value ends up quoted, so unquoting alone is not enough: verified on
+// 3.2a, where a value containing a tab is printed unquoted as "has\ttab" and
+// one containing a '$' is printed quoted as "a\$b".
 //
-// This is one left-to-right pass rather than a sequence of replacements. Two
-// passes over the whole string — undoing "\\" and then "\t" or the other way
-// round — is the shape that turns a literal backslash followed by a t into a
-// tab, and it happens to be safe here only because of the order the escapes
-// are written in.
+// Which quote tmux reaches for depends on what is inside, so both are
+// accepted: a value containing a double quote is wrapped in single quotes and
+// a value containing a space in double ones.
 func unquoteOptionValue(v string) string {
 	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
 		v = v[1 : len(v)-1]
 	}
-	if !strings.Contains(v, `\`) {
-		return v
-	}
-
-	var b strings.Builder
-	b.Grow(len(v))
-	for i := 0; i < len(v); i++ {
-		if v[i] != '\\' || i+1 >= len(v) {
-			b.WriteByte(v[i])
-			continue
-		}
-		i++
-		switch c := v[i]; c {
-		case 'a':
-			b.WriteByte('\a')
-		case 'b':
-			b.WriteByte('\b')
-		case 'f':
-			b.WriteByte('\f')
-		case 'n':
-			b.WriteByte('\n')
-		case 'r':
-			b.WriteByte('\r')
-		case 't':
-			b.WriteByte('\t')
-		case 'v':
-			b.WriteByte('\v')
-		case 's':
-			b.WriteByte(' ')
-		case '\\', '"', '\'':
-			b.WriteByte(c)
-		default:
-			if o, ok := octalByte(v, i); ok {
-				b.WriteByte(o)
-				i += 2
-				continue
-			}
-			// Not an escape this package knows. Keep both bytes: the value is
-			// worth more than the objection.
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
-
-// octalByte decodes exactly three octal digits starting at i.
-func octalByte(s string, i int) (byte, bool) {
-	if i+3 > len(s) {
-		return 0, false
-	}
-	n := 0
-	for j := i; j < i+3; j++ {
-		if s[j] < '0' || s[j] > '7' {
-			return 0, false
-		}
-		n = n*8 + int(s[j]-'0')
-	}
-	if n > 0xFF {
-		return 0, false
-	}
-	return byte(n), true
+	return visDecode(v)
 }
 
 // SetRemainOnExit controls whether a pane stays after its process exits.
