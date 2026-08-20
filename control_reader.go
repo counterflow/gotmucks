@@ -85,7 +85,8 @@ func (cc *ControlClient) handleLine(line string) bool {
 	// opens one for the command that started the connection, before it reads
 	// anything from standard input. If the connection opens with anything
 	// else, there is none, and commands may be written at once.
-	if !cc.sawFirstLine {
+	firstLine := !cc.sawFirstLine
+	if firstLine {
 		cc.sawFirstLine = true
 		if cl.Kind != ctlparse.KindBegin || cl.Malformed {
 			cc.releaseStartup()
@@ -102,14 +103,35 @@ func (cc *ControlClient) handleLine(line string) bool {
 	}
 
 	// Malformed is only ever set for a block header, and a header whose
-	// arguments did not parse has no command number to bind by. Opening a
-	// block on a guessed number would attach a command to a body that is not
-	// its own, so the line is reported and otherwise ignored.
+	// arguments did not parse has no command number to bind by, so no block
+	// is opened for it: doing that on a guessed number would attach a command
+	// to a body that is not its own.
+	//
+	// Reporting the line is not on its own enough. A %begin that opens no
+	// block leaves the command it would have answered at the front of the
+	// queue, so the next %begin binds that command to the next command's
+	// block, and from there every reply is delivered to the caller before the
+	// one it belongs to — with a nil error, since each block still ends in a
+	// perfectly good %end. That is the failure awaitStartup exists to remove,
+	// arriving by a different door, and it outlives the line that caused it.
+	// So the command at the head of the queue is failed along with the
+	// report, which confines the damage to the one command.
+	//
+	// Only a header does that, and only one that was not the connection's
+	// first line. The first line is tmux's own opening block, which answers
+	// nothing this client sent; failing a command for it would be failing one
+	// that has only just been let past the startup barrier this line lifted.
+	// A terminator arriving with no block open binds nothing and consumes no
+	// command either, so it is reported and nothing else.
 	if cl.Malformed {
-		cc.emit(&ProtocolError{
+		pe := &ProtocolError{
 			Line:   cl.Raw,
 			Reason: "block " + cl.Kind.String() + " with arguments that do not parse",
-		})
+		}
+		cc.emit(pe)
+		if cl.Kind == ctlparse.KindBegin && !firstLine {
+			cc.failHead(pe)
+		}
 		return true
 	}
 
@@ -201,6 +223,37 @@ func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
 // unsolicitedBlock reports a block tmux opened for a command this client did
 // not send, by the flags word of its header. See beginBlock.
 func unsolicitedBlock(cl ctlparse.Line) bool { return cl.HasFlags && cl.Flags == 0 }
+
+// failHead fails the command at the front of the queue, for a line that
+// destroyed the binding between commands and blocks rather than one that
+// answered anything.
+//
+// It is a guess, and deliberately the loud one. The queue is bound by order,
+// so the front is the command the ruined block header would have answered —
+// unless tmux had opened that block for itself, which its flags word would
+// have said had the header parsed. Failing the wrong command reports an error
+// to a caller whose command tmux may yet answer; not failing any hands the
+// next caller another command's output with no error at all, and the one
+// after that the same, for the life of the connection. The first is a bounded
+// lie about one command and the second is an unbounded one about all of them.
+//
+// The startup block is the one unsolicited block that certainly arrives, and
+// handleLine keeps it out of here by hand: a ruined header on the connection's
+// first line lifts the startup barrier, so a command could be queued a moment
+// later and would be failed for a block that was never going to answer it.
+func (cc *ControlClient) failHead(err error) {
+	cc.mu.Lock()
+	if len(cc.queue) == 0 {
+		cc.mu.Unlock()
+		return
+	}
+	p := cc.queue[0]
+	cc.queue = cc.queue[1:]
+	p.err = fmt.Errorf("gotmucks: control command %q cannot be answered: %w", p.cmd, err)
+	cc.mu.Unlock()
+
+	p.finish()
+}
 
 // endBlock closes the open block and wakes the command waiting on it.
 //
@@ -342,21 +395,27 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		}
 		cc.emit(SessionWindowChanged{Session: SessionID(a), Window: WindowID(b)})
 
-	case "window-add", "linked-window-add", "unlinked-window-add":
+	// Each of the three window notifications has two spellings, and which one
+	// arrives says nothing about the window — only whether this client's own
+	// session has a link to it. A caller watching for windows wants both, so
+	// both produce the same event. The names are tmux's own, taken from
+	// scripts/probe-notify.sh rather than from the manual; there is no
+	// "linked-" spelling of any of them.
+	case "window-add", "unlinked-window-add":
 		if w, ok := windowArg(cl.Args); ok {
 			cc.emit(WindowAdded{Window: w})
 		} else {
 			cc.malformed(cl)
 		}
 
-	case "window-close", "linked-window-close", "unlinked-window-close":
+	case "window-close", "unlinked-window-close":
 		if w, ok := windowArg(cl.Args); ok {
 			cc.emit(WindowClosed{Window: w})
 		} else {
 			cc.malformed(cl)
 		}
 
-	case "window-renamed", "unlinked-window-rename":
+	case "window-renamed", "unlinked-window-renamed":
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
 		if !ok || !WindowID(id).Valid() {
 			cc.malformed(cl)

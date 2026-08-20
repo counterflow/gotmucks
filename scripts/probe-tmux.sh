@@ -102,6 +102,35 @@ fi
 out=$("${T[@]}" list-panes -a -F '#{pane_id}	#{window_id}	#{session_id}' 2>/dev/null | head -1)
 say "list-panes -a tab format" "[$(printf '%s' "$out" | tr '\t' '|')]"
 
+# --- stderr for a socket with no server behind it -------------------------
+# tmux exits 1 for this the same as for a real failure, so errors.go tells the
+# two apart by the wording, and the wording has drifted across releases. The
+# classification is load-bearing in the direction that fails quietly:
+# ErrNoServer is what makes KillSession report success and HasSession report
+# false, so a message wrongly classified as "no server" turns a failure into an
+# answer.
+#
+# Printed here rather than asserted, because what is wanted is the exact text
+# to match against — and, just as much, the text of failures that are NOT this
+# one. "No such file or directory" is the phrase tmux writes for any missing
+# file, so it says nothing on its own about the socket.
+noserver=$("$TMUX_BIN" -L "gotmucks-absent-$$" list-sessions 2>&1 >/dev/null)
+say "no such socket (-L)" "[$noserver]"
+
+noserver=$("$TMUX_BIN" -S "/tmp/gotmucks-absent-$$/sock" list-sessions 2>&1 >/dev/null)
+say "socket path in a missing dir" "[$noserver]"
+
+"${T[@]}" kill-server 2>/dev/null
+"${T[@]}" new-session -d -s stderr -x 80 -y 24 2>/dev/null
+for cmd in "source-file /gotmucks-absent-$$.conf" \
+	"load-buffer /gotmucks-absent-$$.txt" \
+	"save-buffer -b nosuchbuffer /tmp/gotmucks-out-$$" \
+	"pipe-pane -t nosuchpane cat"; do
+	# shellcheck disable=SC2086
+	msg=$("${T[@]}" $cmd 2>&1 >/dev/null)
+	say "${cmd%% *} on a live server" "[$msg]"
+done
+
 # --- control mode ---------------------------------------------------------
 "${T[@]}" kill-server 2>/dev/null
 "${T[@]}" new-session -d -s ctl -x 80 -y 24 2>/dev/null

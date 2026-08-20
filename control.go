@@ -112,6 +112,11 @@ type pending struct {
 	// orphan marks a block tmux opened for a command this client did not
 	// send. Its body is absorbed and nobody is waiting on it.
 	orphan bool
+	// err is why this command will never be answered, for the one case where
+	// that is neither a reply nor the end of the connection: a line arrived
+	// that destroyed the binding between commands and blocks. See failHead.
+	// Nil everywhere else, which leaves answered to say what happened.
+	err error
 
 	done chan struct{}
 	once sync.Once
@@ -554,6 +559,12 @@ func (cc *ControlClient) Untap(pane PaneID) {
 // a reply is interpreted as a notification. If the connection ends while this
 // command is outstanding the error wraps [ErrServerExited] and the partial
 // body is returned with it.
+//
+// One error is neither of those: a [*ProtocolError] means a block header
+// arrived that carried no command number, so the reply this command was owed
+// can no longer be told from the next one's. The command is abandoned rather
+// than answered from a body that might belong to another, and the connection
+// stays up.
 func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	cc.ensure()
 
@@ -611,6 +622,12 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	}
 
 	reply := Reply{Number: p.number, Output: p.lines, Flags: p.flags, Time: p.replyTime}
+	if p.err != nil {
+		// The reader abandoned this command over a line it could not bind a
+		// block by. The connection is still up, so terminalErr would be a
+		// worse answer than the reason itself.
+		return reply, p.err
+	}
 	if !p.answered {
 		return reply, cc.terminalErr()
 	}

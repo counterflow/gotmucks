@@ -51,6 +51,11 @@
 // Identifiers come back from tmux — [Session.ID], [Row.PaneID] — or from
 // [ParseSessionID] and its siblings; a name is not an address.
 //
+// The exceptions are the three calls that take a tmux command line rather than
+// an identifier — [ControlClient.Do], [Client.QueryArgs] and [WithControlArgs].
+// A command line is passed to tmux as written, -t included, so a name in one
+// resolves as a name.
+//
 // # No server running
 //
 // tmux exits non-zero when no server is listening, but for a read that is an

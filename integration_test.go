@@ -1593,6 +1593,138 @@ func TestIntegrationControlPaneTextIsNotProtocol(t *testing.T) {
 	}
 }
 
+// TestIntegrationControlWindowNotifications is the check the notification
+// table never had: its names asserted against tmux instead of against itself.
+//
+// The unit suite feeds the reader lines the tests themselves spell, so a name
+// spelled wrong in the table is spelled the same wrong way in the test and the
+// two agree forever. That is how the reader came to watch for
+// "%unlinked-window-rename" — tmux writes "%unlinked-window-renamed" — and for
+// "%linked-window-add" and "%linked-window-close", which tmux has never
+// written at all. Here every line comes from tmux.
+//
+// Each of the three window notifications has two spellings, and which one
+// arrives is a fact about the receiving client rather than about the window:
+// tmux writes the plain form for a window the client's own session has a link
+// to and the "unlinked-" form for any other. So each operation is done twice,
+// once in the session this connection is attached to and once in a session it
+// is not, and both are required to produce the same event.
+func TestIntegrationControlWindowNotifications(t *testing.T) {
+	cc, c := testControl(t)
+	ctx := testCtx(t)
+
+	attached := cc.AttachedSession()
+	if !attached.Valid() {
+		t.Fatalf("AttachedSession = %q, want the session testControl attached to", attached)
+	}
+
+	// A second session, whose windows this connection has no link to.
+	other, err := c.NewSession(ctx, NewSessionOptions{
+		Name:    "unlinked",
+		Width:   80,
+		Height:  24,
+		Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	go func() {
+		for ev := range cc.Events() {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}
+	}()
+	seen := func(match func(Event) bool) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, ev := range events {
+			if match(ev) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// newWindow makes a window in one session and returns its identifier. -P
+	// -F is what turns the command into a question; without it the reply is
+	// empty and the identifier would have to be guessed from a listing.
+	newWindow := func(s SessionID) WindowID {
+		t.Helper()
+		reply, err := cc.DoArgs(ctx, "new-window", "-d", "-P", "-F", "#{window_id}", "-t", string(s))
+		if err != nil || len(reply.Output) != 1 {
+			t.Fatalf("new-window -t %s = (%q, %v)", s, reply.Output, err)
+		}
+		w := WindowID(strings.TrimSpace(reply.Output[0]))
+		if !w.Valid() {
+			t.Fatalf("new-window printed %q, which is not a window id", reply.Output[0])
+		}
+		return w
+	}
+
+	for _, tc := range []struct {
+		what    string
+		session SessionID
+		name    string
+	}{
+		{"linked", attached, "linked-rename"},
+		{"unlinked", other.ID, "unlinked-rename"},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			w := newWindow(tc.session)
+			eventually(t, "a WindowAdded for "+string(w), 15*time.Second, func() bool {
+				return seen(func(ev Event) bool {
+					e, ok := ev.(WindowAdded)
+					return ok && e.Window == w
+				})
+			})
+
+			if _, err := cc.DoArgs(ctx, "rename-window", "-t", string(w), tc.name); err != nil {
+				t.Fatalf("rename-window: %v", err)
+			}
+			eventually(t, "a WindowRenamed for "+string(w), 15*time.Second, func() bool {
+				return seen(func(ev Event) bool {
+					e, ok := ev.(WindowRenamed)
+					return ok && e.Window == w && e.Name == tc.name
+				})
+			})
+
+			if _, err := cc.DoArgs(ctx, "kill-window", "-t", string(w)); err != nil {
+				t.Fatalf("kill-window: %v", err)
+			}
+			eventually(t, "a WindowClosed for "+string(w), 15*time.Second, func() bool {
+				return seen(func(ev Event) bool {
+					e, ok := ev.(WindowClosed)
+					return ok && e.Window == w
+				})
+			})
+		})
+	}
+
+	// The other half of the same question. Everything above says the names the
+	// table knows are tmux's; this says the table knows all of the names tmux
+	// used. An UnknownNotification here is either a name spelled wrong, as
+	// "unlinked-window-rename" was, or one a newer tmux has added — and both
+	// are worth being told about, since only a name in the table gets an
+	// event of its own.
+	mu.Lock()
+	for _, ev := range events {
+		if u, ok := ev.(UnknownNotification); ok {
+			t.Errorf("tmux sent %%%s, which the notification table does not know: %q",
+				u.Name, u.Args)
+		}
+		if pe, ok := ev.(*ProtocolError); ok {
+			t.Errorf("protocol error during window operations: %v", pe)
+		}
+	}
+	mu.Unlock()
+}
+
 func TestIntegrationControlSetSize(t *testing.T) {
 	cc, _ := testControl(t)
 	ctx := testCtx(t)

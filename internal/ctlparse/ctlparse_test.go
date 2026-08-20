@@ -348,14 +348,25 @@ func TestParseTwoIDs(t *testing.T) {
 }
 
 // TestNotificationNamesAreKnown guards the set that separates a notification
-// from command output. Every name tmux is documented to send must be in it,
-// because one that is not would be silently swallowed as block data.
+// from command output. Every name tmux sends must be in it, because one that
+// is not loses the typed event tmux sent it for.
+//
+// What this test cannot do is say whether these are tmux's spellings, since
+// the names here and the names in the map were written by the same hand: it
+// asserts the table against itself, and did so happily while the reader
+// watched for "unlinked-window-rename" and for two "linked-" names tmux has
+// never emitted. scripts/probe-notify.sh is what asks tmux, by scanning a
+// binary's format strings and a live server's stream and diffing both against
+// the map, and TestIntegrationControlWindowNotifications is what asserts the
+// window names end to end. What is kept here is coverage of the three
+// spellings that pair up, so that a future edit cannot quietly drop one.
 func TestNotificationNamesAreKnown(t *testing.T) {
 	documented := []string{
 		"output", "extended-output", "pause", "continue", "exit",
 		"sessions-changed", "session-changed", "session-renamed",
 		"session-window-changed", "window-add", "window-close",
-		"window-renamed", "window-pane-changed", "pane-mode-changed",
+		"window-renamed", "unlinked-window-add", "unlinked-window-close",
+		"unlinked-window-renamed", "window-pane-changed", "pane-mode-changed",
 		"layout-change", "subscription-changed", "client-session-changed",
 		"client-detached", "message", "config-error",
 		"paste-buffer-changed", "paste-buffer-deleted",
@@ -366,6 +377,19 @@ func TestNotificationNamesAreKnown(t *testing.T) {
 		}
 		if got := Classify("%" + name + " args"); got.Kind != KindNotification {
 			t.Errorf("Classify(%%%s ...) = %v, want notification", name, got.Kind)
+		}
+	}
+
+	// Names tmux does not have. They were in the table for three review
+	// rounds, matched by two arms of the reader's switch, and every test
+	// passed the whole time — see control-notify.c, which pairs window-add
+	// with unlinked-window-add and window-close with unlinked-window-close
+	// and has no "linked-" spelling of anything.
+	for _, name := range []string{
+		"linked-window-add", "linked-window-close", "unlinked-window-rename",
+	} {
+		if IsKnownNotification(name) {
+			t.Errorf("%%%s is in the known notification set, but tmux does not send it", name)
 		}
 	}
 }

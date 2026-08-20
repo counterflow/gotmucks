@@ -121,10 +121,21 @@ func (*ProtocolError) isEvent() {}
 // noServerPatterns are the stderr shapes tmux uses to say the server is not
 // there. They have drifted across releases, so all the known forms are
 // matched rather than just the current one.
+//
+// Every one of them names connecting. "No such file or directory" on its own
+// is deliberately not here, though one of them ends in it: the phrase is what
+// strerror gives for ENOENT, so tmux writes it for any missing file, and a
+// live server answers "source-file /nowhere.conf" with
+// "/nowhere.conf: No such file or directory" — verified on 3.2a by
+// scripts/probe-tmux.sh, which prints both that and the real no-server text.
+// Matching the bare phrase would classify that failure as [ErrNoServer], and
+// this package treats ErrNoServer as an answer rather than a fault:
+// [Client.KillSession] reports success on it, [Client.HasSession] and
+// [Client.ServerRunning] report false, and the listings report emptiness. A
+// command that failed would report having found nothing to do.
 var noServerPatterns = []string{
 	"no server running on",
 	"error connecting to",
-	"no such file or directory",
 	"connect failed: no such file or directory",
 	"server not found",
 	// Emitted when the server goes away while a command is in flight. A

@@ -912,6 +912,47 @@ func TestMissingBinary(t *testing.T) {
 	}
 }
 
+// TestNoServerIsNotAnyMissingFile guards the direction this classifier fails
+// quietly in. [ErrNoServer] is how this package says "there was nothing to do":
+// KillSession maps it to success, HasSession and ServerRunning to false, and
+// every listing to emptiness. A failure classified as ErrNoServer by mistake is
+// therefore a failure reported as an answer.
+//
+// "No such file or directory" is strerror's text for ENOENT, so tmux writes it
+// for any missing file, on a running server as readily as for an absent socket.
+// It used to be matched on its own, which made "source-file /nowhere.conf"
+// indistinguishable from a socket with nothing behind it. Both columns below
+// are 3.2a's own wording — see scripts/probe-tmux.sh.
+func TestNoServerIsNotAnyMissingFile(t *testing.T) {
+	noServer := []string{
+		"error connecting to /tmp/tmux-1000/gotmucks-absent (No such file or directory)",
+		"no server running on /tmp/tmux-1000/default",
+		"connect failed: No such file or directory",
+		"lost server",
+		"server exited unexpectedly",
+	}
+	for _, s := range noServer {
+		if !isNoServerStderr(s) {
+			t.Errorf("isNoServerStderr(%q) = false, want true", s)
+		}
+	}
+
+	// Failures from a server that is running, three of which name a file.
+	live := []string{
+		"/nowhere/gotmucks.conf: No such file or directory",
+		"/nowhere/buffer.txt: No such file or directory",
+		"open /nowhere/out.txt: No such file or directory",
+		"can't find pane: nosuchpane",
+		"no buffer nosuchbuffer",
+	}
+	for _, s := range live {
+		if isNoServerStderr(s) {
+			t.Errorf("isNoServerStderr(%q) = true; a command that failed on a live "+
+				"server would be reported as having found no server to talk to", s)
+		}
+	}
+}
+
 // TestIdentifiersMustBeIdentifiers is this package's central claim, and the one
 // the types alone cannot keep. SessionID, WindowID and PaneID are string types,
 // so SessionID("work") compiles; tmux then resolves "work" as a name and acts

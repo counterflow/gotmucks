@@ -19,9 +19,16 @@ import (
 // check first and fails with [ErrInvalidID] rather than acting on whatever the
 // name reached. That is every call that builds a -t, and
 // [ControlClient.Output], which builds none but would otherwise register a tap
-// that matches nothing. [ControlClient.Do] and [Client.QueryArgs] are the
-// deliberate exceptions: a command line assembled by the caller is the
-// caller's own.
+// that matches nothing.
+//
+// Three are deliberate exceptions, on one argument: a command line assembled
+// by the caller is the caller's own, and this package does not parse tmux
+// command lines looking for a -t to disagree with. [ControlClient.Do] and
+// [Client.QueryArgs] take one. So does [WithControlArgs], which is the one
+// worth saying out loud, because [WithAttach] sits beside it doing the
+// opposite: WithAttach("work") is refused, while
+// WithControlArgs("attach-session", "-t", "work") connects and attaches to
+// whichever session answered to that name.
 
 // SessionID is a tmux session identifier, of the form "$0".
 type SessionID string

@@ -692,7 +692,9 @@ func TestNotificationsRefuseAnIdentifierThatIsNotOne(t *testing.T) {
 		"%window-add name",
 		"%window-close %3",
 		"%unlinked-window-add ",
+		"%unlinked-window-close name",
 		"%window-renamed name other",
+		"%unlinked-window-renamed name other",
 		"%window-pane-changed @7 @9",
 		"%session-window-changed work @5",
 		"%client-session-changed client-1 work name",
@@ -778,6 +780,34 @@ func TestNotificationMapping(t *testing.T) {
 			return wantEq(e.Window == "@7", ev)
 		}},
 		{"%window-renamed @7 a name with spaces", func(ev Event) error {
+			e, ok := ev.(WindowRenamed)
+			if err := want(ok, "WindowRenamed", ev); err != nil {
+				return err
+			}
+			return wantEq(e.Window == "@7" && e.Name == "a name with spaces", ev)
+		}},
+		// The unlinked spellings of the same three. tmux picks between them
+		// by whether this client's session has a link to the window, which is
+		// a fact about the client and not about the window, so both produce
+		// the same event. These lines are tmux's own spelling — see
+		// scripts/probe-notify.sh, which is what caught the reader looking
+		// for "unlinked-window-rename" for a notification tmux writes as
+		// "unlinked-window-renamed".
+		{"%unlinked-window-add @7", func(ev Event) error {
+			e, ok := ev.(WindowAdded)
+			if err := want(ok, "WindowAdded", ev); err != nil {
+				return err
+			}
+			return wantEq(e.Window == "@7", ev)
+		}},
+		{"%unlinked-window-close @7", func(ev Event) error {
+			e, ok := ev.(WindowClosed)
+			if err := want(ok, "WindowClosed", ev); err != nil {
+				return err
+			}
+			return wantEq(e.Window == "@7", ev)
+		}},
+		{"%unlinked-window-renamed @7 a name with spaces", func(ev Event) error {
 			e, ok := ev.(WindowRenamed)
 			if err := want(ok, "WindowRenamed", ev); err != nil {
 				return err
@@ -1398,7 +1428,77 @@ func TestUnterminatedBlockFailsItsCommandAtTeardown(t *testing.T) {
 // has no command number, so binding on it would attach a command to a body
 // that may not be its own. It used to consume a queued command and deliver
 // the body as a successful reply.
+//
+// Refusing to open a block is only half of it. The command the ruined header
+// would have answered stays at the front of the queue, so the next %begin —
+// the next command's — binds to it, and from there every reply goes to the
+// caller before the one that earned it, each with a nil error. So the head of
+// the queue is failed along with the report, and the test that matters is the
+// second command's: it must get its own reply, not the first's.
 func TestMalformedBlockHeaderIsNotABlock(t *testing.T) {
+	c := newCtl(t)
+
+	do := func(cmd string) <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.cc.Do(context.Background(), cmd)
+			done <- err
+		}()
+		c.nextCommand()
+		return done
+	}
+
+	first := do("list-sessions")
+	second := do("display-message -p second")
+
+	c.send("%begin garbage", "payload", "%end garbage")
+
+	ev := nextEventOfType[*ProtocolError](c)
+	if !strings.Contains(ev.Reason, "do not parse") {
+		t.Errorf("Reason = %q", ev.Reason)
+	}
+
+	// The command that block would have answered is abandoned, with the line
+	// that caused it as the reason. The connection is still up, so this must
+	// not be reported as the connection having ended.
+	select {
+	case err := <-first:
+		var pe *ProtocolError
+		if !errors.As(err, &pe) {
+			t.Fatalf("Do = %v, want an error wrapping *ProtocolError", err)
+		}
+		if !strings.Contains(pe.Line, "%begin garbage") {
+			t.Errorf("ProtocolError.Line = %q, want the header that caused it", pe.Line)
+		}
+		if errors.Is(err, ErrServerExited) {
+			t.Errorf("Do = %v, want an error that does not claim the connection ended", err)
+		}
+		if !strings.Contains(err.Error(), "list-sessions") {
+			t.Errorf("Do = %v, want the abandoned command named", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the command the malformed header displaced was never failed")
+	}
+
+	// The next block is the second command's, and it gets it. Before, this is
+	// where the queue slipped: the body below was delivered to "list-sessions"
+	// with a nil error and every later reply was one command behind.
+	c.reply(7, "second")
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the second command never got its reply")
+	}
+}
+
+// TestMalformedBlockTerminatorFailsNothing is the other half of the rule.
+// A terminator arriving with no block open binds nothing and consumes no
+// command, so there is no desync to confine: it is reported and the queue is
+// left alone.
+func TestMalformedBlockTerminatorFailsNothing(t *testing.T) {
 	c := newCtl(t)
 
 	done := make(chan error, 1)
@@ -1408,18 +1508,14 @@ func TestMalformedBlockHeaderIsNotABlock(t *testing.T) {
 	}()
 	c.nextCommand()
 
-	c.send("%begin garbage", "payload", "%end garbage")
-
-	ev := nextEventOfType[*ProtocolError](c)
-	if !strings.Contains(ev.Reason, "do not parse") {
+	c.send("%end garbage")
+	if ev := nextEventOfType[*ProtocolError](c); !strings.Contains(ev.Reason, "do not parse") {
 		t.Errorf("Reason = %q", ev.Reason)
 	}
 
-	// The command is still outstanding: nothing bound to it, so a real reply
-	// still can.
 	select {
 	case err := <-done:
-		t.Fatalf("Do returned %v; the malformed block should not have answered it", err)
+		t.Fatalf("Do returned %v; a stray terminator answers nothing", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -1431,6 +1527,40 @@ func TestMalformedBlockHeaderIsNotABlock(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("the real reply never arrived")
+	}
+}
+
+// TestMalformedFirstLineFailsNoCommand: a ruined header on the connection's
+// first line is tmux's own opening block. It answers nothing this client sent,
+// and it is what lifts the startup barrier — so the command released by it is
+// the one that would be failed if the head of the queue were taken here.
+//
+// The command is started first, so it is waiting on the barrier when the line
+// arrives and is queued the instant it lifts. It must still get its own reply.
+func TestMalformedFirstLineFailsNoCommand(t *testing.T) {
+	c := newBareCtl(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "list-sessions")
+		done <- err
+	}()
+
+	c.send("%begin garbage")
+	if ev := nextEventOfType[*ProtocolError](c); !strings.Contains(ev.Reason, "do not parse") {
+		t.Errorf("Reason = %q", ev.Reason)
+	}
+
+	c.nextCommand()
+	c.reply(4, "$0")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Do: %v, want the command answered; tmux's own opening block "+
+				"answers nothing this client sent", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the command was never answered")
 	}
 }
 

@@ -106,37 +106,62 @@ type Line struct {
 // Unknown names beginning with '%' followed by a non-digit are also treated
 // as notifications, so that a newer tmux is reported rather than mistaken for
 // command output; see [Classify].
+//
+// The names come from tmux, not from this package's reading of the manual,
+// and scripts/probe-notify.sh is what says so: it lists the "%name" format
+// strings a tmux binary contains, lists the ones a live server emits with a
+// control client attached to one session while a second client mutates
+// another, and diffs both against this map. A name spelled by hand instead
+// passes every unit test — those feed the reader lines the tests themselves
+// spell — and then matches nothing on the wire. Three did: the rename of an
+// unlinked window was spelled without its trailing 'd', and there were entries
+// for "linked-window-add" and "linked-window-close", which were invented
+// whole. tmux pairs window-add with unlinked-window-add and window-close with
+// unlinked-window-close, and has no "linked-" spelling of anything.
+//
+// Only one direction of that diff is a defect. A name tmux sends and this map
+// does not have loses the typed event for it; a name this map has and tmux
+// never sends costs nothing, so the table may run ahead of the floor and
+// does. 3.2a's binary contains none of config-error, message,
+// paste-buffer-changed or paste-buffer-deleted; the first is written by
+// cfg.c and the last two by control-notify.c in later tmux, and message is
+// carried from the protocol documentation and has not been seen on a wire
+// here — it is the one entry in this map still resting on reading.
+//
+// begin, end and error are block framing rather than notifications and are
+// here so Classify can switch on them. They are also the three names the
+// probe cannot find in a binary, because tmux writes all three through one
+// format with the word passed as an argument: xasprintf(&line,
+// "%%%s %ld %u %d", guard, ...) in control_write_guard.
 var notifications = map[string]bool{
-	"begin":                  true,
-	"end":                    true,
-	"error":                  true,
-	"output":                 true,
-	"extended-output":        true,
-	"pause":                  true,
-	"continue":               true,
-	"exit":                   true,
-	"sessions-changed":       true,
-	"session-changed":        true,
-	"session-renamed":        true,
-	"session-window-changed": true,
-	"window-add":             true,
-	"window-close":           true,
-	"window-renamed":         true,
-	"window-pane-changed":    true,
-	"unlinked-window-add":    true,
-	"unlinked-window-close":  true,
-	"unlinked-window-rename": true,
-	"linked-window-add":      true,
-	"linked-window-close":    true,
-	"pane-mode-changed":      true,
-	"layout-change":          true,
-	"client-session-changed": true,
-	"client-detached":        true,
-	"subscription-changed":   true,
-	"message":                true,
-	"config-error":           true,
-	"paste-buffer-changed":   true,
-	"paste-buffer-deleted":   true,
+	"begin":                   true,
+	"end":                     true,
+	"error":                   true,
+	"output":                  true,
+	"extended-output":         true,
+	"pause":                   true,
+	"continue":                true,
+	"exit":                    true,
+	"sessions-changed":        true,
+	"session-changed":         true,
+	"session-renamed":         true,
+	"session-window-changed":  true,
+	"window-add":              true,
+	"window-close":            true,
+	"window-renamed":          true,
+	"window-pane-changed":     true,
+	"unlinked-window-add":     true,
+	"unlinked-window-close":   true,
+	"unlinked-window-renamed": true,
+	"pane-mode-changed":       true,
+	"layout-change":           true,
+	"client-session-changed":  true,
+	"client-detached":         true,
+	"subscription-changed":    true,
+	"message":                 true,
+	"config-error":            true,
+	"paste-buffer-changed":    true,
+	"paste-buffer-deleted":    true,
 }
 
 // IsKnownNotification reports whether name, given without its '%', is a
