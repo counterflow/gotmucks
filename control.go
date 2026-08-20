@@ -725,11 +725,32 @@ func commandBreakErr(b byte, i int) error {
 // from a [SessionID], [WindowID] or [PaneID] that came from tmux.
 //
 // Nor does quoting stop a command expanding its own argument. rename-window,
-// rename-session and new-session's -s and -n run the name they are given
-// through tmux's format expansion before storing it, so "v#{host}" names an
-// object after the host and no quoting here prevents it: the expansion happens
-// after the lexer, inside the command. Double the '#' — see [escapeFormat],
-// which is what [Client.RenameWindow] and the other three do.
+// rename-session, new-session's -s and -n and new-session's -c run what they
+// are given through tmux's format expansion before using it, so "v#{host}"
+// names an object after the host and no quoting here prevents it: the
+// expansion happens after the lexer, inside the command. Double the '#' — see
+// [escapeFormat], which is what [Client.RenameWindow] and the other four do.
+//
+// On this path that is not a cosmetic difference. A "#(...)" reaches tmux's
+// job machinery, and a job belongs to the client that asked for the expansion:
+// a one-shot tmux exits before its own job can run, but a control connection
+// stays alive, so the job runs. Measured on 3.2a, the same rename-window line
+// that left a one-shot client's window merely misnamed executed the shell
+// command when sent down a control connection, twice. Through DoArgs, an
+// unescaped '#' in caller data is arbitrary command execution rather than a
+// wrong name.
+//
+// One further thing changed with the ability to send a newline. Every argument
+// is spliced as tmux's own "\n" escape, so it reaches tmux intact rather than
+// ending the command — which is what lets a [FormatSpec.Arg] template down
+// this pipe, and what removed [ControlClient.Do]'s newline check as a
+// guarantee that nothing a caller sends can become a second protocol line.
+// DoArgs cannot restore that centrally: it cannot tell a newline that is a
+// substitution pattern, which is safe and necessary, from one in a value tmux
+// will store and write back into a notification, which is not. So the
+// guarantee now belongs to whichever call hands tmux such a value, and
+// [ControlClient.Subscribe] is the one this package offers — see
+// [checkSubscribeName] for the shape a new one should copy.
 func (cc *ControlClient) DoArgs(ctx context.Context, args ...string) (Reply, error) {
 	if len(args) == 0 {
 		return Reply{}, errors.New("gotmucks: no command given")

@@ -113,8 +113,12 @@ func octalByte(s string, i int) (byte, bool) {
 // hold — nothing can observe the stored form except through the decoder.
 //
 // A NUL is encoded rather than passed through, which lets new-session -n carry
-// one where rename-window cannot: an argument vector ends at a NUL, so
-// rename-window truncates the name there instead.
+// one — verified through the package on 3.2a, where a window named "a\x00b"
+// reads back as "a\x00b". No other call can: Go refuses to build an argument
+// vector containing a NUL, so rename-window never starts tmux at all and fails
+// with "invalid argument" from fork/exec rather than truncating the name. That
+// error arrives wrapped in an [ExitError] whose Code is -1 and whose Stderr is
+// empty, since there was no process to write one.
 func visEncode(s string) string {
 	i := 0
 	for ; i < len(s); i++ {

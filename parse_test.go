@@ -400,8 +400,8 @@ func TestVisRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEscapeFormat pins the escape for the four name arguments tmux expands as
-// a format before it stores them.
+// TestEscapeFormat pins the escape for the five arguments tmux expands as a
+// format before it uses them: the four names, and new-session's -c.
 func TestEscapeFormat(t *testing.T) {
 	tests := []struct {
 		in, want string

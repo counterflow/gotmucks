@@ -12,7 +12,7 @@
 # "linked-window-close", which tmux has never emitted, got into the table at
 # all.
 #
-# Three questions, answered against the binary rather than the documentation:
+# Five questions, answered against the binary rather than the documentation:
 #
 #   1. Which "%name" format strings does this tmux binary contain? That is the
 #      complete set it can possibly write, including names none of the
@@ -22,11 +22,19 @@
 #      and another? The second session is what distinguishes the linked forms
 #      from the unlinked ones.
 #   3. Where do those two answers and the library's table disagree?
+#   4. What does a notification carry for a *name*? The reader decodes one,
+#      because tmux writes the stored, vis(3)-escaped form into the line — the
+#      same claim probe-roundtrip.sh makes about a format row, asked of the
+#      other pipe. The two halves of the package must agree or a caller holds
+#      one object under two names.
+#   5. What does a raw newline in the last field of a notification do? It ends
+#      the line, and the remainder is dispatched as something tmux said.
 #
-# Unlike the other probes this one has an exit status worth reading: a name
-# tmux can write that the table does not have is a lost event, so either of the
-# last two diffs being non-empty exits 1. The rest of the output is still just
-# printed.
+# Unlike most of the other probes this one has an exit status worth reading: a
+# name tmux can write that the table does not have is a lost event, so either
+# of the two diffs being non-empty exits 1, as does a name that stops being
+# escaped or a substitution that stops taking a newline out of a subscription
+# value. The rest of the output is still just printed.
 #
 #   ./scripts/probe-notify.sh [tmux-binary]
 
@@ -180,5 +188,87 @@ must_be_empty "emitted by the live server, absent from the table" "$WORK/missing
 echo
 echo "--- window notifications as they arrived, verbatim ---"
 grep -E '^%[a-z-]*window[a-z-]*' "$WORK/raw" | sed 's/^/  /'
+
+# --- 4. what a notification carries for a name ----------------------------
+# The reader decodes every name it delivers, because tmux writes the *stored*
+# form into the notification and a name is stored escaped with vis(3). That is
+# the same claim probe-roundtrip.sh makes about "#{window_name}" in a format
+# row, asked of the other pipe: the two must agree, or a caller that lists once
+# and then follows the events holds the same object under two names.
+#
+# Both lines below are assertions. If a tmux stopped escaping here, the decode
+# would corrupt every name containing a backslash instead of restoring it.
+"${T[@]}" kill-server 2>/dev/null
+sleep 0.3
+SID=$("${T[@]}" new-session -d -P -F "#{session_id}" -s names -x 80 -y 24 -- sleep 300 2>/dev/null)
+sleep 0.4
+{
+	sleep 0.8
+	printf 'rename-window -t %s:0 -- %s\n' "$SID" "'a"$'\t'"b'" ; sleep 0.4
+	printf 'rename-session -t %s -- %s\n' "$SID" "'r\$HOMEs'"   ; sleep 0.6
+} | "${T[@]}" -C attach-session -t "$SID" >"$WORK/names" 2>&1
+
+echo
+echo "--- a name as a notification carries it ---"
+grep -aE '^%(unlinked-)?(window-renamed|session-renamed)' "$WORK/names" | sed 's/^/  /'
+
+name_escaped() {
+	local what="$1" pattern="$2"
+	if grep -aqE "$pattern" "$WORK/names"; then
+		printf '  ok: %s\n' "$what"
+	else
+		printf '  ASSERTION FAILED: %s\n' "$what" >&2
+		status=1
+	fi
+}
+# A literal backslash-t and backslash-dollar, which is vis(3)'s C style — not
+# a raw tab and not a bare '$'.
+name_escaped "a tab in a window name arrives as backslash-t" \
+	'^%(unlinked-)?window-renamed @[0-9]+ a\\tb$'
+name_escaped "a dollar in a session name arrives as backslash-dollar" \
+	'^%session-renamed (\$[0-9]+ )?r\\\$HOMEs$'
+
+# --- 5. a raw newline in the last field of a notification -----------------
+# tmux ends a notification at the newline and delimits nothing, so any value it
+# writes into one that can contain a raw newline becomes a second protocol
+# line — outside any block, with nothing on it to say it is not tmux speaking.
+# Two of those values are reachable through this package's Subscribe: the name,
+# which is the caller's and is therefore checked (see checkSubscribeName), and
+# the expanded value, which is tmux's and cannot be.
+#
+# The remedy documented on Subscribe is the substitution FormatSpec.Arg uses on
+# a row, so the last check here is an assertion: if it stopped taking a newline
+# out of a subscription value, that documentation would be wrong.
+"${T[@]}" set-option -t "$SID" -- @nlprobe "v1"$'\n'"%exit forged-by-a-value"
+sub() {
+	{
+		sleep 0.8
+		printf 'refresh-client -B %s\n' "$1"
+		sleep 1.6
+	} | "${T[@]}" -C attach-session -t "$SID" 2>&1
+}
+
+echo
+echo "--- a newline in a subscription name, unchecked ---"
+# 'sN'"\n"'%exit ...' — tmux's own escape for a newline, spliced between
+# single-quoted runs exactly as quoteArg splices one.
+sub "'nl'\"\\n\"'%exit forged-by-a-name'::'#{session_id}'" |
+	grep -aA1 '^%subscription-changed' | sed 's/^/  /'
+
+echo
+echo "--- and in the value, which the name check cannot reach ---"
+sub "'v1::#{@nlprobe}'" | grep -aA1 '^%subscription-changed' | sed 's/^/  /'
+
+echo
+echo "--- the same value with the newline substituted out (must be one line) ---"
+sub "'v2::#{s/'\"\\n\"'/ /:@nlprobe}'" >"$WORK/subfix" 2>&1
+grep -aA1 '^%subscription-changed' "$WORK/subfix" | sed 's/^/  /'
+if grep -aq '^%subscription-changed v2 .* : v1 %exit forged-by-a-value$' "$WORK/subfix"; then
+	echo "  ok: the substitution kept the value on one line"
+else
+	echo "  ASSERTION FAILED: a substitution no longer takes a newline out of a" >&2
+	echo "  subscription value, which is the remedy Subscribe's documentation gives" >&2
+	status=1
+fi
 
 exit "$status"

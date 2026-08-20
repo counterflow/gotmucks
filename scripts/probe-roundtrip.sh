@@ -16,7 +16,9 @@
 #   4. a raw newline in a value ends the -F line, which no column ordering can
 #      recover from — only a substitution can.
 #   5. the name argument of rename-window, rename-session, new-session -s and
-#      new-session -n is expanded as a format before it is stored.
+#      new-session -n is expanded as a format before it is stored — and so is
+#      new-session -c, which is a path rather than a name and fails as a wrong
+#      directory instead of a wrong name.
 #
 # Five things below are assertions rather than reports, and the script exits
 # non-zero if any of them stops holding, because each one is a way this package
@@ -24,9 +26,11 @@
 #
 #   A1  every byte show-options alters is one the decoder undoes; a new escape
 #       is a value returned wrong.
-#   A2  the four name arguments really are format-expanded, and "##" really
-#       does stop it — if a tmux stopped expanding, doubling would corrupt
-#       every name containing a '#' instead of protecting it.
+#   A2  the five expanded arguments really are format-expanded, and "##"
+#       really does stop it — if a tmux stopped expanding, doubling would
+#       corrupt every name containing a '#' instead of protecting it. The
+#       command vector is asserted from the other side: it must stay
+#       unexpanded, since expansion there is a shell running caller data.
 #   A3  rename-window escapes a name, so that decoding it is right.
 #   A4  new-session -n does not, so that escaping it here is right rather than
 #       double.
@@ -248,6 +252,24 @@ expands "new-session -s 'n#{host}'" "$(fmt "$NS" '#{session_name}')" 'n#{host}'
 expands "new-session -n 'w#{host}'" "$(fmt "$NS" '#{window_name}')" 'w#{host}'
 "${T[@]}" kill-session -t "$NS"
 
+# The fifth argument, and the one round nine found missing: new-session -c is
+# expanded too. A path is not a name, so the failure is not a wrong name but a
+# wrong directory — tmux expands, finds no such place, falls back to the home
+# directory and exits 0 with nothing on stderr.
+mkdir -p "$WORK/dir#Hhere" "$WORK/dir##Hhere"
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' -c "$WORK/dir#Hhere" -x 80 -y 24 -- sleep 600)
+sleep 0.3
+expands "new-session -c '...#Hhere'" "$(fmt "$NS" '#{pane_current_path}')" "$WORK/dir#Hhere"
+"${T[@]}" kill-session -t "$NS"
+
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' -c "$WORK/dir##Hhere" -x 80 -y 24 -- sleep 600)
+sleep 0.3
+got=$(fmt "$NS" '#{pane_current_path}')
+printf '     %-34s -> [%s]\n' "new-session -c doubled" "$(vis "$got")"
+[ "$got" = "$WORK/dir#Hhere" ] ||
+	fail A2 "new-session -c with '##H' gave '$got', want '$WORK/dir#Hhere'"
+"${T[@]}" kill-session -t "$NS"
+
 echo
 echo "  and doubling the '#' stops it, on every form:"
 for pair in 'v##{host}:v#{host}' 'a##Hb:a#Hb' 'a#b:a#b' 'plain:plain'; do
@@ -260,7 +282,13 @@ for pair in 'v##{host}:v#{host}' 'a##Hb:a#Hb' 'a#b:a#b' 'plain:plain'; do
 done
 
 echo
-echo "  the #() form, which hands the argument to a shell:"
+echo "  the #() form, which hands the argument to a shell. Whether the job"
+echo "  runs is a fact about the client rather than about the argument: a job"
+echo "  belongs to the client that asked for the expansion, and a one-shot"
+echo "  tmux can exit before its own job runs. So the one-shot answer says"
+echo "  nothing about the control-mode one, and it is the control-mode one"
+echo "  that matters — a control client stays alive. Round nine found this"
+echo "  section testing only the case where the job does not run."
 rm -f "$WORK/ran"
 "${T[@]}" rename-window -t "$WIN" -- "#(touch $WORK/ran; echo RAN)"
 for _ in 1 2 3 4 5; do
@@ -268,22 +296,70 @@ for _ in 1 2 3 4 5; do
 	sleep 0.4
 done
 printf '     window_name = [%s]\n' "$(vis "$(fmt "$WIN" '#{window_name}')")"
-if [ -e "$WORK/ran" ]; then
-	echo "     THE JOB RAN: the file exists"
-else
-	echo "     the job did not run on this tmux, but the name reached the job"
-	echo "     machinery rather than being refused by it"
-fi
+ranmark() {
+	if [ -e "$WORK/$1" ]; then
+		printf '  ** %-30s THE JOB RAN\n' "$2:"
+	else
+		printf '     %-30s the job did not run\n' "$2:"
+	fi
+}
+ranmark ran "one-shot rename-window"
 "${T[@]}" rename-window -t "$WIN" -- keeper
+
+# One-shot new-session -s, which on 3.2a does run it where rename-window does
+# not — so "the job does not run one-shot" is not a property of the path.
+rm -f "$WORK/ran-s"
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' \
+	-s "#(touch $WORK/ran-s; echo RAN)" -x 80 -y 24 -- sleep 600 2>/dev/null)
+sleep 1.5
+ranmark ran-s "one-shot new-session -s"
+[ -n "$NS" ] && "${T[@]}" kill-session -t "$NS" 2>/dev/null
+
+# The same three down a control connection, which is the client that stays
+# alive. This is where an unescaped '#' in caller data is arbitrary command
+# execution rather than a wrong name.
+rm -f "$WORK/ran-ctl" "$WORK/ran-ctl-c" "$WORK/ran-ctl-s"
+{
+	sleep 0.6
+	printf "rename-window -t %s -- '#(touch %s/ran-ctl; echo RAN)'\n" "$WIN" "$WORK"
+	sleep 1.0
+	printf "new-session -d -c '#(touch %s/ran-ctl-c; echo %s)' -x 80 -y 24 -- sleep 600\n" "$WORK" "$WORK"
+	sleep 1.0
+	printf "new-session -d -s '#(touch %s/ran-ctl-s; echo RAN)' -x 80 -y 24 -- sleep 600\n" "$WORK"
+	sleep 2.0
+} | "${T[@]}" -C attach-session -t "$SESS" >"$WORK/ctl-job.out" 2>&1
+ranmark ran-ctl "control rename-window"
+ranmark ran-ctl-c "control new-session -c"
+ranmark ran-ctl-s "control new-session -s"
+"${T[@]}" rename-window -t "$WIN" -- keeper
+# The sessions those two new-session lines made are named after a job. Kill
+# everything but the keeper rather than trying to name them.
+for s in $("${T[@]}" list-sessions -F '#{session_id}' 2>/dev/null); do
+	[ "$s" = "$SESS" ] || "${T[@]}" kill-session -t "$s" 2>/dev/null
+done
 
 echo
 echo "  arguments that are NOT expanded, which is what bounds the escape to"
-echo "  those four:"
+echo "  those five:"
 "${T[@]}" set-option -t "$SESS" -- @noexpand 'v#{host}'
 printf '     set-option value  -> [%s]\n' "$("${T[@]}" show-options -t "$SESS" -v -- @noexpand)"
 "${T[@]}" set-hook -t "$SESS" -- alert-bell "display-message 'v#{host}'"
 printf '     set-hook command  -> [%s]\n' "$("${T[@]}" show-hooks -t "$SESS" | head -1)"
 "${T[@]}" set-hook -u -t "$SESS" -- alert-bell
+
+# The other two arguments new-session takes from a caller. Neither is expanded
+# on 3.2a, and the command vector is an assertion because it is the one where
+# expansion would be a shell running a caller's data.
+rm -f "$WORK/argv"
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' -e 'PROBE=v#{host}' -x 80 -y 24 -- \
+	sh -c 'printf "%s" "$1" >"$0"; sleep 600' "$WORK/argv" 'v#{host}')
+sleep 0.6
+printf '     new-session -e    -> [%s]\n' \
+	"$(vis "$("${T[@]}" show-environment -t "$NS" PROBE 2>/dev/null)")"
+printf '     the -- vector     -> [%s]\n' "$(vis "$(cat "$WORK/argv" 2>/dev/null)")"
+[ "$(cat "$WORK/argv" 2>/dev/null)" = 'v#{host}' ] ||
+	fail A2 "new-session's command vector is expanded on this tmux; it was not on 3.2a"
+"${T[@]}" kill-session -t "$NS"
 
 echo
 if [ "$FAIL" -ne 0 ]; then

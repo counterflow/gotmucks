@@ -39,18 +39,83 @@ func SubscribeWindow(id WindowID) string { return string(id) }
 // Subscriptions are how a caller tracks tmux state without polling
 // list-sessions. Re-subscribing under an existing name replaces it; use
 // [ControlClient.Unsubscribe] to remove one.
+//
+// The name is checked, because tmux does not check it and writes it back into
+// every %subscription-changed line verbatim — see [checkSubscribeName].
+//
+// The value is the other half of that line and cannot be checked here, because
+// it is tmux's rather than the caller's. tmux writes it last with nothing to
+// delimit it, so a format expanding to a value with a raw newline in it splits
+// the notification. Measured on 3.2a, a subscription on an option holding
+// "v1\n%exit forged" arrived as
+//
+//	%subscription-changed sv $0 - - - : v1
+//	%exit forged
+//
+// and the second line is outside any block, so the reader acts on it as tmux's.
+//
+// The format is where that is fixed, by the same substitution [FormatSpec.Arg]
+// uses on a row: on the same tmux "#{s/<newline>/ /:@opt}" kept "v1 %exit
+// forged" on one line, and so did the nested "#{s/<newline>/ /:#{@opt}}". A
+// format whose value can carry a newline — a path, a title, a user option —
+// wants one of those. A raw newline in format itself is not the hazard: it is
+// sent as tmux's own "\n" escape, which is what makes the substitution
+// expressible here at all. scripts/probe-notify.sh asserts both.
 func (cc *ControlClient) Subscribe(ctx context.Context, name, target, format string) error {
-	if name == "" {
-		return errors.New("gotmucks: empty subscription name")
-	}
-	if strings.ContainsAny(name, ": \t") {
-		return fmt.Errorf("gotmucks: subscription name %q may not contain a colon or whitespace", name)
+	if err := checkSubscribeName(name); err != nil {
+		return err
 	}
 	if err := checkSubscribeTarget(target); err != nil {
 		return err
 	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-B", name+":"+target+":"+format)
 	return err
+}
+
+// checkSubscribeName insists that a subscription name is a single printable
+// token with no colon in it.
+//
+// The colon is tmux's own field separator in a -B argument. The rest of the
+// set is about the notification rather than the command: tmux stores the name
+// unvalidated and writes it back into "%subscription-changed <name> ...", so
+// whatever is in it lands on the wire between a space and the rest of the
+// line.
+//
+// A raw newline there is the one that matters, and it became reachable when
+// quoteArg learned to carry one — before that Do refused the command outright,
+// and the newline check on a whole command line was the package's single
+// guarantee that a caller's string could not become a second protocol line.
+// Measured on 3.2a, subscribing under the name "s1\n%exit forged" produced
+//
+//	%subscription-changed s1
+//	%exit forged $0 - - - : $0
+//
+// The second line is outside any block, with nothing on it to say it is not
+// tmux speaking, so the reader ends the connection on it. And because %exit is
+// how tmux says goodbye rather than how it reports a fault, that is a *clean*
+// exit: [Exited.Reason] carries the caller's own string, Err is nil, and
+// [ControlClient.Wait] returns nil. A caller distinguishing "tmux went away"
+// from "tmux crashed" is told the wrong one.
+//
+// So the check is by what is allowed rather than by what is known to hurt: a
+// byte at or below space, DEL and the colon are refused, and everything else —
+// including a byte above 0x7f, which cannot be a separator on this wire —
+// is a name. The old check named three bytes and let the one that ends a line
+// through.
+func checkSubscribeName(name string) error {
+	if name == "" {
+		return errors.New("gotmucks: empty subscription name")
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c <= ' ' || c == 0x7f || c == ':' {
+			return fmt.Errorf(
+				"gotmucks: subscription name %q has %q at byte %d: a name may not contain a colon, "+
+					"whitespace or a control byte, since tmux writes it back into every "+
+					"%%subscription-changed line as given",
+				name, string(c), i)
+		}
+	}
+	return nil
 }
 
 // checkSubscribeTarget accepts the three wildcards tmux defines for the middle
@@ -73,9 +138,13 @@ func checkSubscribeTarget(target string) error {
 
 // Unsubscribe removes a subscription. tmux reads a -B argument with no colons
 // as a removal.
+//
+// The name is checked exactly as [ControlClient.Subscribe] checks it, so that
+// the two agree about what a name is: a name this refused but that one
+// accepted could not be removed.
 func (cc *ControlClient) Unsubscribe(ctx context.Context, name string) error {
-	if name == "" {
-		return errors.New("gotmucks: empty subscription name")
+	if err := checkSubscribeName(name); err != nil {
+		return err
 	}
 	_, err := cc.DoArgs(ctx, "refresh-client", "-B", name)
 	return err

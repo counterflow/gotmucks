@@ -3,6 +3,7 @@ package gotmucks
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 )
 
@@ -70,6 +71,14 @@ type ExitError struct {
 	Err error
 }
 
+// Error renders the exit status, then whichever of Stderr and Err has anything
+// to say.
+//
+// Err is included because a process that never started has neither a real exit
+// status nor a stderr to explain itself: a missing binary, a permissions
+// failure, or an argument Go will not put in an argv — a NUL in a name is the
+// reachable one — all report "exit status -1" with an empty Stderr, and
+// without this the only route to the reason was errors.Unwrap.
 func (e *ExitError) Error() string {
 	var b strings.Builder
 	b.WriteString("gotmucks: tmux ")
@@ -79,7 +88,21 @@ func (e *ExitError) Error() string {
 		b.WriteString(": ")
 		b.WriteString(e.Stderr)
 	}
+	// Only when it adds something. A tmux that ran and exited non-zero has an
+	// *exec.ExitError here saying "exit status 1" again, which the line
+	// already carries.
+	if e.Err != nil && !isPlainExitStatus(e.Err) {
+		b.WriteString(": ")
+		b.WriteString(e.Err.Error())
+	}
 	return b.String()
+}
+
+// isPlainExitStatus reports whether err is the os/exec error that says nothing
+// the exit status did not.
+func isPlainExitStatus(err error) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee)
 }
 
 // Unwrap exposes the os/exec error, if the failure came from process

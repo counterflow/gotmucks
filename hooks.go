@@ -75,6 +75,15 @@ func (c *Client) UnsetGlobalHook(ctx context.Context, name string) error {
 // explicit index produce that; this package's [Client.SetHook] always writes
 // element zero.
 //
+// Which is also what the index costs when a name has only one element: it is
+// taken off without being recorded, so a hook set elsewhere as
+// "alert-bell[3]" is reported under "alert-bell" and cannot be told from one
+// at element zero. Handing that entry back to [Client.SetHook] relocates it
+// there. Nothing is lost or duplicated — tmux clears the array on a set
+// without -a, so the hook still fires and the map still holds one entry,
+// verified on 3.2a — but the hook has moved. Only set-hook -a and an explicit
+// index can reach this.
+//
 // The command is the tmux command line as tmux printed it, which is what
 // [Client.SetHook] takes: tmux re-serialises the parsed command list, quoting
 // what needs it, so what comes back can be handed straight back. It is not an

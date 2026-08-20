@@ -126,21 +126,37 @@ func rowSafeVar(f string, dropTab bool) string {
 // escapeFormat protects a caller's string from tmux's format expansion by
 // doubling every '#', which is tmux's own escape for one.
 //
-// tmux runs the name argument of rename-window, rename-session, new-session -s
-// and new-session -n through format_expand before storing it, so a name
-// containing "#{" is not a name: verified on 3.2a, where renaming a window to
-// "v#{host}" leaves it called "vianf-laptop", and where "#(...)" reaches
-// tmux's job machinery and leaves the placeholder "<'...' not ready>" behind
-// as the name. This is the command expanding its own argument rather than the
+// tmux runs five caller-data arguments through format_expand before using
+// them: the name argument of rename-window, rename-session, new-session -s and
+// new-session -n, and new-session's -c. A name containing "#{" is therefore
+// not a name — verified on 3.2a, where renaming a window to "v#{host}" leaves
+// it called "vianf-laptop" — and a directory containing one is not that
+// directory: "-c /tmp/a#Hb" put the pane in the home directory, because tmux
+// expanded the path, found no such place and fell back, exiting 0 with nothing
+// on stderr. This is the command expanding its own argument rather than the
 // control-mode lexer, so it happens through [ControlClient.DoArgs] too and
 // quoteArg neither causes it nor prevents it.
 //
+// The "#(...)" form reaches tmux's job machinery, which leaves the placeholder
+// "<'...' not ready>" behind as a name. Whether the job also runs depends on
+// the argument and on the client, so the placeholder says nothing either way.
+// Measured on 3.2a: one-shot, "new-session -s" ran the job and both
+// "new-session -c" and "rename-window" did not; down a control connection — a
+// client that stays alive — every one of the three ran. Anything that reaches
+// a job is arbitrary command execution on some path, which is why the escape
+// is not conditional on which one.
+//
 // Doubling covers the single-character forms as well as "#{": "a##Hb" gives
-// "a#Hb" where "a#Hb" gives the hostname. It is correct for a name with no
+// "a#Hb" where "a#Hb" gives the hostname. It is correct for a value with no
 // format in it, since "a#b" has no format sequence today and "a##b" expands
 // back to "a#b" — but it is a deliberate behaviour change for a caller that
-// was passing a format on purpose, which is why the four calls that do it say
-// so.
+// was passing a format on purpose, which is why the five call sites that do it
+// say so.
+//
+// The boundary is measured rather than assumed, and holds at five: on 3.2a a
+// new-session -e environment value, the "--" command vector and send-keys -l
+// are all stored or delivered verbatim. scripts/probe-roundtrip.sh asserts
+// both halves of that.
 func escapeFormat(s string) string {
 	if !strings.Contains(s, "#") {
 		return s

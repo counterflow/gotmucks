@@ -69,11 +69,24 @@
 // [Window.Name], [Session.Name], [Client.ShowOption] and [Client.ShowOptions]
 // decode what they read, so what was set is what comes back.
 //
+// tmux hands the same stored name back a second way, in a notification, and
+// the control half decodes it in the same place: [WindowRenamed],
+// [SessionRenamed], [SessionChanged] and [ClientSessionChanged] carry the name
+// that was set, so a caller that lists once and then follows the events holds
+// one name for an object rather than two. [SubscriptionChanged] is not one of
+// these — its value is the caller's own format, expanded, and there is nothing
+// to undo.
+//
+// The expansion is not confined to names. [NewSessionOptions.StartDir] is
+// expanded too and is escaped for the same reason: an unescaped "#H" in a path
+// put the pane in the home directory, silently and with a nil error.
+//
 // The cost is that a caller who wants tmux to expand a format into a name
 // cannot get one through these calls — a '#' is a '#' — and should send
 // rename-window itself. The other edge is a window named by another program
 // through "new-window -n", which is the one path tmux stores unescaped: a
-// plain name is unaffected, but a backslash or a tab in one is not.
+// plain name is unaffected, but a backslash or a tab in one is not. It applies
+// to the events as well as to the rows, since both read what tmux stored.
 //
 // [Row] is the raw view and decodes nothing: it is what tmux wrote.
 //

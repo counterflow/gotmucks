@@ -444,6 +444,32 @@ func TestRenameSeparatesOptionsFromTheName(t *testing.T) {
 	f.wantArgv(1, "rename-session", "-t", "$0", "--", "-tother")
 }
 
+// TestStartDirIsEscapedAgainstFormatExpansion is the fifth argument tmux
+// expands, and the one that is not a name.
+//
+// A wrong name is visible; a wrong directory is not. tmux expands "-c", finds
+// no such place, falls back to the home directory, exits 0 and says nothing on
+// stderr — verified on 3.2a, where "-c /tmp/probe/a#Hb" put the pane in
+// /home/ianf and NewSession returned a session with a nil error. A working
+// directory is also the kind of value a program takes from a config file or a
+// checkout path, so it is reachable by data rather than only by a caller
+// writing a format on purpose.
+func TestStartDirIsEscapedAgainstFormatExpansion(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"new-session":   {Stdout: "$7\n"},
+			"list-sessions": {Stdout: tabbed([]string{"$7", "s", "1", "1", "1", "0"})},
+		},
+	})
+
+	if _, err := f.client().NewSession(context.Background(), NewSessionOptions{
+		StartDir: "/src/a#Hb",
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	f.wantArgv(0, "new-session", "-d", "-P", "-F", "#{session_id}", "-c", "/src/a##Hb")
+}
+
 // TestNameArgumentsAreEscapedAgainstFormatExpansion pins the second thing that
 // stands between a caller's name and tmux, on all four calls that pass one.
 //
@@ -1052,6 +1078,56 @@ func TestExitErrorMessage(t *testing.T) {
 		if strings.HasPrefix(a, "-test.") {
 			t.Errorf("harness argument %q leaked into ExitError.Args: %q", a, xerr.Args)
 		}
+	}
+}
+
+// TestExitErrorRendersAProcessThatNeverStarted: a tmux that never ran has no
+// exit status worth printing and no stderr at all, so before Err was rendered
+// the message was "exit status -1" and nothing else, and the reason was
+// reachable only through errors.Unwrap.
+//
+// The reachable cause is a NUL in a name: Go refuses to build an argument
+// vector containing one, so fork/exec fails with "invalid argument" and tmux
+// is never started. A missing binary and a permissions failure arrive the same
+// way.
+func TestExitErrorRendersAProcessThatNeverStarted(t *testing.T) {
+	f := newFake(t, faketmux.Script{})
+
+	err := f.client().RenameWindow(context.Background(), "@0", "a\x00b")
+	if err == nil {
+		t.Fatal("RenameWindow with a NUL in the name: expected an error")
+	}
+
+	var xerr *ExitError
+	if !errors.As(err, &xerr) {
+		t.Fatalf("got %T, want *ExitError", err)
+	}
+	if xerr.Err == nil {
+		t.Fatal("ExitError.Err is nil, so there is nothing to say why")
+	}
+	if xerr.Stderr != "" {
+		t.Errorf("Stderr = %q, want empty: no process ran to write one", xerr.Stderr)
+	}
+	if !strings.Contains(err.Error(), xerr.Err.Error()) {
+		t.Errorf("Error() = %q, which does not carry the reason %q", err, xerr.Err)
+	}
+}
+
+// TestExitErrorDoesNotRepeatTheExitStatus is the other side of it. A tmux that
+// ran and exited non-zero leaves an *exec.ExitError here whose whole message
+// is "exit status 1", which the line already carries.
+func TestExitErrorDoesNotRepeatTheExitStatus(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"rename-session": {Stderr: "duplicate session: build\n", Exit: 1},
+		},
+	})
+	err := f.client().RenameSession(context.Background(), "$0", "build")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := strings.Count(err.Error(), "exit status"); got != 1 {
+		t.Errorf("Error() says %q, with %d mentions of the exit status, want 1", err, got)
 	}
 }
 

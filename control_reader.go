@@ -380,6 +380,22 @@ func (cc *ControlClient) dataLine(line string) {
 // WindowID would be the one place in this package where an identifier is not
 // an identifier. No tmux in the matrix sends anything else; a release that did
 // would say so here rather than quietly through every later call.
+//
+// Every name is decoded with [visDecode], for the same reason [Window.Name]
+// and [Session.Name] are: a name is stored escaped with vis(3) and tmux writes
+// the stored form into the notification, byte for byte. Measured on 3.2a,
+// renaming a window to a tab produced "%window-renamed @0 a\tb" and renaming a
+// session to "r$HOMEs" produced "%session-renamed $0 r\$HOMEs". Decoding here
+// is what keeps the two halves of the package agreeing: before it, a caller
+// that listed once and then followed the notifications — which is what control
+// mode is for — wrote the decoded name on the first pass and the escaped name
+// on every rename after it, and held the same window under two names. It
+// inherits the one documented edge the row path has, a window another program
+// named through "new-window -n", which tmux stores unescaped.
+//
+// SubscriptionChanged.Value is deliberately not in that set. It is the
+// caller's own format, expanded — not a name tmux stored — so there is nothing
+// there to undo.
 func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 	switch cl.Name {
 	case "output":
@@ -435,7 +451,7 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		cc.mu.Lock()
 		cc.attached = SessionID(id)
 		cc.mu.Unlock()
-		cc.emit(SessionChanged{Session: SessionID(id), Name: name})
+		cc.emit(SessionChanged{Session: SessionID(id), Name: visDecode(name)})
 
 	case "session-renamed":
 		// The exception to the rule above, and why it is one: tmux sends only
@@ -446,10 +462,13 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		// it arrived.
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
 		if !ok || !SessionID(id).Valid() {
-			cc.emit(SessionRenamed{Session: cc.AttachedSession(), Name: strings.TrimSpace(cl.Args)})
+			cc.emit(SessionRenamed{
+				Session: cc.AttachedSession(),
+				Name:    visDecode(strings.TrimSpace(cl.Args)),
+			})
 			break
 		}
-		cc.emit(SessionRenamed{Session: SessionID(id), Name: name})
+		cc.emit(SessionRenamed{Session: SessionID(id), Name: visDecode(name)})
 
 	case "session-window-changed":
 		a, b, ok := ctlparse.ParseTwoIDs(cl.Args)
@@ -495,7 +514,7 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 			cc.malformed(cl)
 			break
 		}
-		cc.emit(WindowRenamed{Window: WindowID(id), Name: name})
+		cc.emit(WindowRenamed{Window: WindowID(id), Name: visDecode(name)})
 
 	case "window-pane-changed":
 		a, b, ok := ctlparse.ParseTwoIDs(cl.Args)
@@ -543,7 +562,7 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		}
 		ev := ClientSessionChanged{Client: fields[0], Session: SessionID(fields[1])}
 		if len(fields) > 2 {
-			ev.Name = fields[2]
+			ev.Name = visDecode(fields[2])
 		}
 		cc.emit(ev)
 

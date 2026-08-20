@@ -86,6 +86,17 @@ type NewSessionOptions struct {
 	Name string
 
 	// StartDir is the working directory for the session's first window.
+	//
+	// tmux expands it as a format too — the fifth argument that does, beside
+	// the four names — so a '#' in it is doubled here as well, see
+	// [escapeFormat]. Without that a path containing "#H" silently became a
+	// different path: verified on 3.2a, where tmux expands it, finds no such
+	// directory, falls back to the home directory, exits 0 and says nothing on
+	// stderr. The session is created and the pane is somewhere else.
+	//
+	// A working directory is the kind of value a program takes from a config
+	// file, a checkout path or a request, which is what makes this reachable
+	// by data rather than only by a caller writing a format on purpose.
 	StartDir string
 
 	// Env is set in the session environment, tmux's new-session -e. It
@@ -135,7 +146,7 @@ func (o NewSessionOptions) args() []string {
 		args = append(args, "-n", escapeFormat(visEncode(o.WindowName)))
 	}
 	if o.StartDir != "" {
-		args = append(args, "-c", o.StartDir)
+		args = append(args, "-c", escapeFormat(o.StartDir))
 	}
 	if o.Width > 0 {
 		args = append(args, "-x", fmt.Sprint(o.Width))

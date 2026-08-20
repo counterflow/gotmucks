@@ -891,6 +891,89 @@ func TestNotificationMapping(t *testing.T) {
 	}
 }
 
+// TestNotificationNamesAreDecoded: a name is stored escaped with vis(3) and
+// tmux writes the stored form into the notification, so the control half has
+// to undo it exactly where the command half does.
+//
+// These lines are tmux's, not the test's — scripts/probe-notify.sh asserts
+// that a window renamed to a tab really does arrive as "a\tb" and a session
+// renamed to "r$HOMEs" as "r\$HOMEs" on 3.2a, which is what stops this table
+// being asserted against itself. Before the decode the two halves disagreed,
+// which is worse than both being wrong: a caller that listed once and then
+// followed the events held the same window under two names.
+func TestNotificationNamesAreDecoded(t *testing.T) {
+	c := newCtl(t)
+
+	tests := []struct {
+		line string
+		want string // the name that was set, which is what the event must carry
+		get  func(Event) (string, bool)
+	}{
+		{`%window-renamed @7 a\tb`, "a\tb", func(ev Event) (string, bool) {
+			e, ok := ev.(WindowRenamed)
+			return e.Name, ok
+		}},
+		{`%unlinked-window-renamed @7 x\$HOMEy`, "x$HOMEy", func(ev Event) (string, bool) {
+			e, ok := ev.(WindowRenamed)
+			return e.Name, ok
+		}},
+		{`%window-renamed @7 a\\b`, `a\b`, func(ev Event) (string, bool) {
+			e, ok := ev.(WindowRenamed)
+			return e.Name, ok
+		}},
+		{`%session-renamed $2 r\$HOMEs`, "r$HOMEs", func(ev Event) (string, bool) {
+			e, ok := ev.(SessionRenamed)
+			return e.Name, ok
+		}},
+		// The older spelling, which carries only the name.
+		{`%session-renamed r\ts`, "r\ts", func(ev Event) (string, bool) {
+			e, ok := ev.(SessionRenamed)
+			return e.Name, ok
+		}},
+		{`%session-changed $2 n\tm`, "n\tm", func(ev Event) (string, bool) {
+			e, ok := ev.(SessionChanged)
+			return e.Name, ok
+		}},
+		{`%client-session-changed /dev/pts/3 $2 c\$HOMEd`, "c$HOMEd", func(ev Event) (string, bool) {
+			e, ok := ev.(ClientSessionChanged)
+			return e.Name, ok
+		}},
+		// A plain name is untouched, which is the case that must not regress.
+		{`%window-renamed @7 plain name`, "plain name", func(ev Event) (string, bool) {
+			e, ok := ev.(WindowRenamed)
+			return e.Name, ok
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			c.send(tt.line)
+			ev := c.nextEvent()
+			got, ok := tt.get(ev)
+			if !ok {
+				t.Fatalf("got %T, want the event the line names: %+v", ev, ev)
+			}
+			if got != tt.want {
+				t.Errorf("name = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSubscriptionValueIsNotDecoded is the exception, and it is not an
+// oversight. A subscription value is the caller's own format, expanded — not a
+// name tmux stored escaped — so there is nothing to undo, and undoing it
+// anyway would corrupt any value with a backslash in it.
+func TestSubscriptionValueIsNotDecoded(t *testing.T) {
+	c := newCtl(t)
+	c.send(`%subscription-changed title $0 @1 1 %2 : a\tb\$HOME`)
+
+	ev := nextEventOfType[SubscriptionChanged](c)
+	if want := `a\tb\$HOME`; ev.Value != want {
+		t.Errorf("Value = %q, want %q — the value is not a stored name", ev.Value, want)
+	}
+}
+
 func TestSessionChangedRecordsAttachedSession(t *testing.T) {
 	c := newCtl(t)
 	c.send("%session-changed $4 work")
@@ -2021,11 +2104,75 @@ func TestControlCommandArgv(t *testing.T) {
 	}
 }
 
+// TestSubscribeRejectsBadNames: tmux does not validate a subscription name and
+// writes it back into every %subscription-changed line verbatim, so a name is
+// the caller's string on the wire between a space and the rest of a
+// notification.
+//
+// The newline is the one that matters and is the one the old check let
+// through. It was harmless only while quoteArg could not carry a newline —
+// Do refused the whole command — and the commit that taught quoteArg tmux's
+// "\n" escape removed that without the check noticing. Measured on 3.2a, the
+// name "s1\n%exit forged" arrived as two lines and the second ended the
+// connection, reporting a clean exit with a reason the caller chose.
 func TestSubscribeRejectsBadNames(t *testing.T) {
 	c := newCtl(t)
-	for _, name := range []string{"", "has:colon", "has space"} {
-		if err := c.cc.Subscribe(context.Background(), name, SubscribeSession, "#{x}"); err == nil {
-			t.Errorf("Subscribe accepted the name %q", name)
+	names := []string{
+		"",
+		"has:colon",
+		"has space",
+		"has\ttab",
+		// %exit takes no argument, so a forged one needs no space — which is
+		// how the old check, which named a colon, a space and a tab, missed
+		// the only byte on the list that ends a line.
+		"forges\n%exit",
+		"carriage\rreturn",
+		"a\x00nul",
+		"a\x01byte",
+		"del\x7f",
+	}
+	// The context is cancelled so that a name which slipped past the check
+	// fails as a context error rather than blocking on a reply the harness
+	// will never send — and the assertion is that the error is the check's,
+	// not the transport's. Without it a name that reached the wire looked the
+	// same as one that was refused.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	refused := func(what string, err error, name string) {
+		t.Helper()
+		switch {
+		case err == nil:
+			t.Errorf("%s accepted the name %q", what, name)
+		case errors.Is(err, context.Canceled):
+			t.Errorf("%s(%q) reached tmux and failed in transit (%v); the name was not checked",
+				what, name, err)
+		}
+	}
+
+	for _, name := range names {
+		refused("Subscribe", c.cc.Subscribe(ctx, name, SubscribeSession, "#{x}"), name)
+		// Unsubscribe has to agree, or a name one accepted and the other
+		// refused could be created and never removed.
+		refused("Unsubscribe", c.cc.Unsubscribe(ctx, name), name)
+	}
+
+	// Nothing reached the wire.
+	select {
+	case line := <-c.sent.lines:
+		t.Errorf("a refused subscription still wrote %q", line)
+	default:
+	}
+}
+
+// TestSubscribeAcceptsOrdinaryNames is the other half: the check is by what is
+// allowed, and it has to allow what a caller would reasonably write. A byte
+// above 0x7f is among them — it cannot be a separator on this wire, and
+// refusing it would make a UTF-8 name impossible for no protocol reason.
+func TestSubscribeAcceptsOrdinaryNames(t *testing.T) {
+	for _, name := range []string{"title", "pane_title", "a-b.c/d", "sub@1", "héllo", "#{}"} {
+		if err := checkSubscribeName(name); err != nil {
+			t.Errorf("checkSubscribeName(%q) = %v, want nil", name, err)
 		}
 	}
 }

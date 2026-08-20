@@ -57,13 +57,16 @@ type SessionsChanged struct{}
 // SessionChanged reports that the control client's attached session changed.
 type SessionChanged struct {
 	Session SessionID
-	Name    string
+	// Name is the session name as it was set, decoded from the form tmux
+	// stores — see the Names section of the package documentation.
+	Name string
 }
 
 // SessionRenamed reports that the attached session was renamed.
 type SessionRenamed struct {
 	Session SessionID
-	Name    string
+	// Name is the new name as it was set, decoded from the form tmux stores.
+	Name string
 }
 
 // SessionWindowChanged reports that a session's current window changed.
@@ -81,7 +84,10 @@ type WindowClosed struct{ Window WindowID }
 // WindowRenamed reports a window's new name.
 type WindowRenamed struct {
 	Window WindowID
-	Name   string
+	// Name is the new name as it was set, decoded from the form tmux stores.
+	// It agrees with [Window.Name] for the same window, which is what lets a
+	// caller list once and then follow these events.
+	Name string
 }
 
 // WindowPaneChanged reports that a window's active pane changed.
@@ -118,7 +124,13 @@ type SubscriptionChanged struct {
 	// WindowIndex is the window index tmux includes for window
 	// subscriptions, or -1 when absent.
 	WindowIndex int
-	// Value is the expanded format.
+	// Value is the expanded format, exactly as tmux wrote it. Unlike the
+	// names on the other events it is not decoded: it is the caller's own
+	// format, expanded, rather than something tmux stored escaped.
+	//
+	// tmux writes it as the last field of the notification with nothing to
+	// delimit it, so a format whose value can contain a raw newline splits the
+	// line — see [ControlClient.Subscribe], which says how to take one out.
 	Value string
 }
 
@@ -126,7 +138,9 @@ type SubscriptionChanged struct {
 type ClientSessionChanged struct {
 	Client  string
 	Session SessionID
-	Name    string
+	// Name is the session name as it was set, decoded from the form tmux
+	// stores.
+	Name string
 }
 
 // ClientDetached reports that a client detached from the server.

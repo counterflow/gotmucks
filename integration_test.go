@@ -2514,3 +2514,201 @@ func TestIntegrationShowHooksKeepsTheIndexWhenAHookHasSeveral(t *testing.T) {
 		t.Errorf("alert-bell is keyed without an index as well, which loses one of the two: %v", hooks)
 	}
 }
+
+// TestIntegrationNotificationNameMatchesTheRow is R3 against real tmux, and it
+// is the one shape a unit test cannot reach: it asks both halves of the
+// package about the same window at the same moment.
+//
+// tmux stores a name escaped with vis(3) and writes the stored form into the
+// notification as well as into a format row. The command half decoded it and
+// the control half did not, so the two disagreed — which is harder to notice
+// than both being wrong. A caller that lists once and then follows the events,
+// which is what control mode is for, wrote the decoded name on the first pass
+// and the escaped name on every rename after it.
+func TestIntegrationNotificationNameMatchesTheRow(t *testing.T) {
+	cc, c := testControl(t)
+	ctx := testCtx(t)
+
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	go func() {
+		for ev := range cc.Events() {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}
+	}()
+	renamedTo := func(w WindowID) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		for i := len(events) - 1; i >= 0; i-- {
+			if e, ok := events[i].(WindowRenamed); ok && e.Window == w {
+				return e.Name, true
+			}
+		}
+		return "", false
+	}
+
+	reply, err := cc.DoArgs(ctx, "new-window", "-d", "-P", "-F", "#{window_id}")
+	if err != nil || len(reply.Output) != 1 {
+		t.Fatalf("new-window = (%q, %v)", reply.Output, err)
+	}
+	w := WindowID(strings.TrimSpace(reply.Output[0]))
+	if !w.Valid() {
+		t.Fatalf("new-window printed %q, which is not a window id", reply.Output[0])
+	}
+
+	// The names that pick up an escape. A plain one is in the table because it
+	// is the case a decode must not disturb.
+	for _, name := range []string{"a\tb", "x$HOMEy", `a\b`, "plain"} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			if err := c.RenameWindow(ctx, w, name); err != nil {
+				t.Fatalf("RenameWindow(%q): %v", name, err)
+			}
+
+			// The row half, which round eight fixed.
+			got, err := c.Window(ctx, w)
+			if err != nil {
+				t.Fatalf("Window: %v", err)
+			}
+			if got.Name != name {
+				t.Errorf("Window().Name = %q, want %q", got.Name, name)
+			}
+
+			// The event half, which is the same claim down the other pipe.
+			var event string
+			eventually(t, "a WindowRenamed carrying "+strconv.Quote(name), 15*time.Second,
+				func() bool {
+					e, ok := renamedTo(w)
+					event = e
+					return ok && e == name
+				})
+			if event != name {
+				t.Errorf("WindowRenamed.Name = %q, want %q — the two halves disagree",
+					event, name)
+			}
+		})
+	}
+}
+
+// TestIntegrationStartDirIsNotExpanded is R2 against real tmux.
+//
+// tmux expands new-session's -c as a format. A path containing "#H" is
+// therefore not that path: tmux expands it, finds no such directory, falls
+// back to the home directory, exits 0 and says nothing — so the session is
+// created, NewSession returns it with a nil error, and the pane is somewhere
+// else entirely.
+func TestIntegrationStartDirIsNotExpanded(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	dir := filepath.Join(t.TempDir(), "a#Hb")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("making a directory with a '#' in its name: %v", err)
+	}
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "startdir", Width: 80, Height: 24, StartDir: dir, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	panes, err := c.ListSessionPanes(ctx, s.ID)
+	if err != nil || len(panes) != 1 {
+		t.Fatalf("ListSessionPanes: %v (%d panes)", err, len(panes))
+	}
+	// tmux resolves symlinks in a pane's working directory (/tmp is one on
+	// macOS), so compare the last element rather than the whole path.
+	if filepath.Base(panes[0].CurrentPath) != "a#Hb" {
+		t.Errorf("pane started in %q, want a directory named %q — an expanded '#H' "+
+			"sends it to the home directory instead", panes[0].CurrentPath, "a#Hb")
+	}
+}
+
+// TestIntegrationSubscribeRefusesAForgedNotification is R1 against real tmux.
+//
+// tmux does not validate a subscription name and writes it back into every
+// %subscription-changed line verbatim, so a newline in one is a second
+// protocol line — outside any block, with nothing on it to say it is not tmux
+// speaking. Measured on 3.2a before the check was widened: the connection
+// ended, cc.Err() was nil and Wait returned nil, so it reported a clean exit
+// with a reason the caller chose.
+//
+// The test is that the name never reaches tmux. The connection staying usable
+// afterwards is the half that would have failed.
+func TestIntegrationSubscribeRefusesAForgedNotification(t *testing.T) {
+	cc, _ := testControl(t)
+	ctx := testCtx(t)
+
+	// %exit takes no argument, so this needs no space — which is what the old
+	// check, naming a colon, a space and a tab, did not cover.
+	forged := "sub\n%exit"
+	if err := cc.Subscribe(ctx, forged, SubscribeSession, "#{session_id}"); err == nil {
+		t.Fatal("Subscribe accepted a name containing a newline")
+	}
+	if err := cc.Unsubscribe(ctx, forged); err == nil {
+		t.Fatal("Unsubscribe accepted a name containing a newline")
+	}
+
+	// Nothing was sent, so the connection is untouched and an ordinary
+	// subscription still works.
+	if err := cc.Subscribe(ctx, "ordinary", SubscribeSession, "#{session_id}"); err != nil {
+		t.Fatalf("Subscribe after a refused name: %v", err)
+	}
+	if _, err := cc.DoArgs(ctx, "display-message", "-p", "ok"); err != nil {
+		t.Fatalf("the connection did not survive: %v", err)
+	}
+}
+
+// TestIntegrationHookAtANonZeroIndexLosesItsIndex is R6 against real tmux: the
+// documented edge, pinned so that it is a decision rather than a surprise.
+//
+// ShowHooks takes the array index off a name with one element, because tmux
+// prints one on every hook and the name printed would otherwise never be the
+// name that was set. A hook set elsewhere at "alert-bell[3]" also has one
+// element, so it is reported as "alert-bell" and cannot be told from one at
+// element zero — and handing that entry back to SetHook relocates it there.
+// Nothing is lost or duplicated, since tmux clears the array on a set without
+// -a, but the hook has moved.
+func TestIntegrationHookAtANonZeroIndexLosesItsIndex(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "hookidx", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rawTmux(t, opts, "set-hook", "-t", string(s.ID), "--", "alert-bell[3]", "display-message three")
+
+	hooks, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if got, ok := hooks["alert-bell"]; !ok || got != "display-message three" {
+		t.Fatalf("hooks = %v, want the hook under the bare name", hooks)
+	}
+	if _, ok := hooks["alert-bell[3]"]; ok {
+		t.Errorf("the index survived in %v, which the documentation says it does not", hooks)
+	}
+
+	// Writing it back puts it at element zero. tmux clears the array on a set
+	// without -a, so the count stays at one rather than becoming two.
+	if err := c.SetHook(ctx, s.ID, "alert-bell", hooks["alert-bell"]); err != nil {
+		t.Fatalf("SetHook: %v", err)
+	}
+	again, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if len(again) != len(hooks) {
+		t.Errorf("writing the hook back left %v, want the one entry that was read", again)
+	}
+	if raw := rawTmux(t, opts, "show-hooks", "-t", string(s.ID)); !strings.Contains(raw, "alert-bell[0]") {
+		t.Errorf("show-hooks says %q, want the hook relocated to element zero", raw)
+	}
+}
