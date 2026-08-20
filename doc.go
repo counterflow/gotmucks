@@ -64,7 +64,11 @@
 // A control connection has one goroutine reading the pipe, and it never
 // blocks on a consumer. If a caller stops reading [ControlClient.Events], the
 // events are dropped and the loss is reported through [EventsDropped] —
-// stalling the reader would stall command replies and every other pane too.
+// stalling the reader would stall command replies and every other pane too. A
+// per-pane tap from [ControlClient.Output] has a buffer of its own and so a
+// loss of its own: reported as [OutputDropped], and counted by
+// [ControlClient.DroppedOutput] for a pane that fell quiet before any report
+// could be attached to it.
 //
 // Separately, tmux itself offers flow control:
 // [ControlClient.PauseAfter] makes tmux pause a pane whose output is not

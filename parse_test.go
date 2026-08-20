@@ -333,3 +333,36 @@ func TestCleanExitCode(t *testing.T) {
 		})
 	}
 }
+
+// TestParseRowsKeepsAnEmptyOneColumnRow is F3. tmux prints one line per
+// object, so for a single-column spec the empty line is a row whose one value
+// is empty — an untitled pane, an option nobody set — and skipping it handed
+// back fewer rows than there were objects with nothing to say which went
+// missing.
+func TestParseRowsKeepsAnEmptyOneColumnRow(t *testing.T) {
+	rows, err := ParseRows(FormatSpec{"pane_title"}, []string{"a", "", "b"})
+	if err != nil {
+		t.Fatalf("ParseRows: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	if v, ok := rows[1].Lookup("pane_title"); !ok || v != "" {
+		t.Errorf("row 1 = (%q, %v), want the empty value and ok", v, ok)
+	}
+
+	// With a second column an empty line cannot be a row at all: a row of
+	// nothing but empty values still carries its separator.
+	rows, err = ParseRows(
+		FormatSpec{"pane_id", "pane_title"},
+		[]string{"%0\tx", "", "%1\t"})
+	if err != nil {
+		t.Fatalf("ParseRows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2: the blank line is not a row here", len(rows))
+	}
+	if v, _ := rows[1].Lookup("pane_title"); v != "" {
+		t.Errorf("row 1 title = %q, want empty", v)
+	}
+}

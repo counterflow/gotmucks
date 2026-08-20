@@ -257,8 +257,17 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 		cc.emit(SessionsChanged{})
 
 	case "session-changed":
+		// The identifier is checked before it is stored, because this is the
+		// one notification whose payload becomes state a caller can read back
+		// through [ControlClient.AttachedSession] and hand to a call that
+		// builds a -t. ParseIDAndName is satisfied by any non-empty first
+		// field and says nothing about sigils, so on its own it would let a
+		// name into the one place this package promises there is never one.
+		// No tmux in the matrix sends anything else; a release that did would
+		// say so as a protocol error rather than quietly through every later
+		// call.
 		id, name, ok := ctlparse.ParseIDAndName(cl.Args)
-		if !ok {
+		if !ok || !SessionID(id).Valid() {
 			cc.malformed(cl)
 			break
 		}
@@ -511,11 +520,17 @@ func (cc *ControlClient) finishReader(readErr error) {
 		cc.current = nil
 	}
 
-	taps := make([]*tap, 0, len(cc.taps))
-	for _, t := range cc.taps {
+	// The pane is carried alongside the tap because the drops still owed to
+	// it are reported below, and an [OutputDropped] says which pane lost.
+	type closing struct {
+		pane PaneID
+		t    *tap
+	}
+	taps := make([]closing, 0, len(cc.taps))
+	for pane, t := range cc.taps {
 		if !t.closed {
 			t.closed = true
-			taps = append(taps, t)
+			taps = append(taps, closing{pane, t})
 		}
 	}
 
@@ -528,10 +543,22 @@ func (cc *ControlClient) finishReader(readErr error) {
 		}
 	}
 
+	// Say what each tap lost and never got the chance to report. A drop is
+	// otherwise only reported when delivery to that pane next succeeds, so a
+	// pane that overflowed in the burst that ended the connection would have
+	// gone silently short. This is the tap's half of what emit's flushDrops
+	// does for the event stream, and for the same reason: being told matters
+	// most when nothing further is coming.
+	for _, c := range taps {
+		if n := c.t.drops.Swap(0); n > 0 {
+			cc.emit(OutputDropped{Pane: c.pane, Count: n})
+		}
+	}
+
 	cc.emitReserved(Exited{Reason: exitMsg, Err: exitErr})
 
-	for _, t := range taps {
-		close(t.ch)
+	for _, c := range taps {
+		close(c.t.ch)
 	}
 	close(cc.events)
 

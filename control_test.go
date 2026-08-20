@@ -100,6 +100,19 @@ func (c *ctl) tap(pane PaneID) <-chan []byte {
 	return ch
 }
 
+// barrier waits until the reader has processed everything sent so far.
+//
+// An event is not enough on its own: deliverOutput publishes to the event
+// stream before it touches the pane's tap, so a test that has seen the last
+// PaneOutput may still be ahead of the tap send that followed it. A later
+// notification with nothing else to do cannot be reordered past that, because
+// the reader handles one line at a time.
+func (c *ctl) barrier() {
+	c.t.Helper()
+	c.send("%sessions-changed")
+	nextEventOfType[SessionsChanged](c)
+}
+
 // sendRaw writes bytes with no newline handling, for prelude and terminator
 // tests.
 func (c *ctl) sendRaw(s string) {
@@ -509,6 +522,100 @@ func TestTapDoesNotAliasFirehoseBuffer(t *testing.T) {
 	fromTap[0] = 'z'
 	if string(ev.Data) != "abc" {
 		t.Errorf("mutating the tap's slice changed the event's: %q", ev.Data)
+	}
+}
+
+// TestTapDropsAreReportedOnNextDelivery covers the reporting path that always
+// worked: a tap that overflowed and then received again is told what it lost,
+// and the lifetime count answers the same question without an event.
+func TestTapDropsAreReportedOnNextDelivery(t *testing.T) {
+	c := newCtl(t, WithOutputBuffer(1))
+	tap := c.tap("%0")
+
+	// The first fills the buffer; the other three have nowhere to go.
+	for _, s := range []string{"a", "b", "c", "d"} {
+		c.send("%output %0 " + s)
+	}
+	c.barrier()
+
+	if got := c.cc.DroppedOutput("%0"); got != 3 {
+		t.Fatalf("DroppedOutput = %d, want 3", got)
+	}
+	// A pane with no tap, and something that is not a pane id, are zero
+	// rather than a question the caller has to handle.
+	if got := c.cc.DroppedOutput("%9"); got != 0 {
+		t.Errorf("DroppedOutput for an untapped pane = %d, want 0", got)
+	}
+	if got := c.cc.DroppedOutput("bash"); got != 0 {
+		t.Errorf("DroppedOutput for a name = %d, want 0", got)
+	}
+
+	// Make room, and the report comes with the next delivery.
+	<-tap
+	c.send("%output %0 e")
+
+	ev := nextEventOfType[OutputDropped](c)
+	if ev.Pane != "%0" || ev.Count != 3 {
+		t.Errorf("OutputDropped = %+v, want pane %%0 and count 3", ev)
+	}
+
+	// Reporting is not what the lifetime count measures, and the event
+	// stream's own losses are a different number again.
+	if got := c.cc.DroppedOutput("%0"); got != 3 {
+		t.Errorf("DroppedOutput after the report = %d, want 3", got)
+	}
+	if got := c.cc.Dropped(); got != 0 {
+		t.Errorf("Dropped = %d, want 0: the event channel itself lost nothing", got)
+	}
+}
+
+// TestTapDropsAreReportedAtTeardown is F2. A pane that overflowed and then
+// fell quiet said nothing at all: the report was waiting on a delivery that
+// never came, and the connection ending is when the waiting has to stop.
+func TestTapDropsAreReportedAtTeardown(t *testing.T) {
+	c := newCtl(t, WithOutputBuffer(1))
+	c.tap("%0")
+
+	for _, s := range []string{"a", "b", "c", "d"} {
+		c.send("%output %0 " + s)
+	}
+	c.barrier()
+
+	c.send("%exit")
+
+	// Looking for the drop report first also asserts it arrives before the
+	// terminal event: the other order would consume Exited here and leave a
+	// closed channel, which nextEventOfType fails on.
+	ev := nextEventOfType[OutputDropped](c)
+	if ev.Pane != "%0" || ev.Count != 3 {
+		t.Errorf("OutputDropped = %+v, want pane %%0 and count 3", ev)
+	}
+	nextEventOfType[Exited](c)
+
+	// The count outlives the connection, which is what makes it answerable at
+	// all for output lost in the burst that ended it.
+	if got := c.cc.DroppedOutput("%0"); got != 3 {
+		t.Errorf("DroppedOutput after the connection ended = %d, want 3", got)
+	}
+}
+
+// TestSessionChangedRefusesAName is F4. %session-changed is the one
+// notification whose payload becomes state a caller reads back, so a first
+// field that is not an identifier is refused where it arrives rather than
+// stored for AttachedSession to hand out and every -t built from it to reject.
+func TestSessionChangedRefusesAName(t *testing.T) {
+	c := newCtl(t)
+	c.send("%session-changed $4 work")
+	nextEventOfType[SessionChanged](c)
+
+	c.send("%session-changed work other")
+
+	ev := nextEventOfType[*ProtocolError](c)
+	if !strings.Contains(ev.Line, "session-changed work other") {
+		t.Errorf("ProtocolError.Line = %q, want the line that caused it", ev.Line)
+	}
+	if got := c.cc.AttachedSession(); got != "$4" {
+		t.Errorf("AttachedSession = %q, want it left at $4", got)
 	}
 }
 

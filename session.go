@@ -243,7 +243,15 @@ func validateCommand(cmd []string) error {
 // an argument in it is already two things.
 const shellMetacharacters = " \t;&|<>()$`\"'\\*?[]{}~#!\n\r"
 
-// ListSessions returns every session on the server, ordered by identifier.
+// ListSessions returns every session on the server, in no promised order.
+//
+// tmux prints them ordered by name, which is not the order of their
+// identifiers and not the order they were created in — verified on 3.2a,
+// where sessions created as zulu, mike, alpha come back as $2, $1, $0. That
+// is tmux's business rather than a promise made here, so sort the result if
+// an order matters. Sort on [SessionID.Ordinal] rather than on the identifier
+// as a string: the number is the part tmux never reuses or renumbers, and
+// "$10" sorts before "$9" as text.
 //
 // No server running is not an error: the result is an empty slice.
 func (c *Client) ListSessions(ctx context.Context) ([]Session, error) {

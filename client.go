@@ -121,13 +121,19 @@ func exitCode(err error) int {
 // splitLines splits tmux output on newlines, tolerating CRLF and ignoring a
 // trailing newline. Interior blank lines are preserved: capture-pane output
 // legitimately contains them.
+//
+// No output at all is no lines, and a single newline is one empty line. The
+// difference survives only until the trailing newline is taken off, which is
+// why the emptiness test comes first: a one-column format query over a single
+// object whose value is empty prints exactly one newline, and collapsing that
+// to nothing lost the row instead of reporting an empty one.
 func splitLines(b []byte) []string {
 	s := string(b)
-	s = strings.TrimSuffix(s, "\n")
-	s = strings.TrimSuffix(s, "\r")
 	if s == "" {
 		return nil
 	}
+	s = strings.TrimSuffix(s, "\n")
+	s = strings.TrimSuffix(s, "\r")
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
 		lines[i] = strings.TrimSuffix(l, "\r")

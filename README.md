@@ -93,7 +93,10 @@ read that is an answer: `ListSessions` returns an empty slice, `HasSession` and
 **The reader never blocks.** A control connection has one goroutine on the
 pipe. If a consumer stops reading `Events()`, events are dropped and the loss
 is reported as an `EventsDropped` event and through `Dropped()` — stalling the
-reader would stall command replies and every other pane too.
+reader would stall command replies and every other pane too. A per-pane tap
+from `Output()` has its own buffer and its own losses: `OutputDropped` on the
+event stream, and `DroppedOutput(pane)` for a pane that fell quiet before a
+report could be attached to it.
 
 **Backpressure is tmux's job, not yours.** `PauseAfter` enables tmux's own flow
 control: tmux pauses a pane whose output is not being consumed and says so with

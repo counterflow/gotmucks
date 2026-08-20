@@ -663,6 +663,104 @@ func pathsOf(panes []Pane) []string {
 	return out
 }
 
+// TestIntegrationSessionOrderIsTmuxsOwn is F1. ListSessions promised an order
+// by identifier and imposed none; what tmux prints is ordered by name, which
+// for sessions created in any order but alphabetical is a different sequence
+// entirely. The doc now promises nothing and records this, so this is what
+// says the record is still true of the tmux under test.
+func TestIntegrationSessionOrderIsTmuxsOwn(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	// Created newest-first alphabetically, so name order and identifier order
+	// are exact opposites and neither can be mistaken for the other.
+	for _, name := range []string{"zulu", "mike", "alpha"} {
+		if _, err := c.NewSession(ctx, NewSessionOptions{Name: name}); err != nil {
+			t.Fatalf("NewSession %s: %v", name, err)
+		}
+	}
+
+	sessions, err := c.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("got %d sessions, want 3", len(sessions))
+	}
+
+	var names, ids []string
+	for _, s := range sessions {
+		names = append(names, s.Name)
+		ids = append(ids, string(s.ID))
+	}
+	if want := []string{"alpha", "mike", "zulu"}; strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("names came back %v, want %v: tmux orders sessions by name", names, want)
+	}
+	if want := []string{"$2", "$1", "$0"}; strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("identifiers came back %v, want %v", ids, want)
+	}
+}
+
+// TestIntegrationEmptyColumnRowsSurvive is F3 against real tmux. A one-column
+// row whose value is empty is a line with nothing on it, and tmux prints one
+// per object like any other: a listing that dropped them returned fewer rows
+// than there were sessions, with no error and nothing to say which was gone.
+func TestIntegrationEmptyColumnRowsSurvive(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	// A user option nobody has set expands to the empty string, which is a
+	// value no release can change out from under this test the way a default
+	// could.
+	spec := FormatSpec{"@gotmucks_absent"}
+
+	first, err := c.NewSession(ctx, NewSessionOptions{Name: "one"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	rows, err := c.Query(ctx, "list-sessions", spec)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows for one session, want 1", len(rows))
+	}
+	if v, ok := rows[0].Lookup("@gotmucks_absent"); !ok || v != "" {
+		t.Errorf("row 0 = (%q, %v), want the empty value", v, ok)
+	}
+
+	second, err := c.NewSession(ctx, NewSessionOptions{Name: "two"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if rows, err = c.Query(ctx, "list-sessions", spec); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows for two sessions, want 2", len(rows))
+	}
+
+	// And the column is being read rather than the lines merely counted.
+	if err := c.SetOption(ctx, first.ID, "@gotmucks_absent", "one"); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	if err := c.SetOption(ctx, second.ID, "@gotmucks_absent", "two"); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	if rows, err = c.Query(ctx, "list-sessions", spec); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	var values []string
+	for _, r := range rows {
+		v, _ := r.Lookup("@gotmucks_absent")
+		values = append(values, v)
+	}
+	// tmux orders sessions by name, so "one" comes before "two".
+	if want := []string{"one", "two"}; strings.Join(values, ",") != strings.Join(want, ",") {
+		t.Errorf("values = %v, want %v", values, want)
+	}
+}
+
 // TestIntegrationRawTabsDoNotShiftColumns is N2 against real tmux.
 //
 // Folding an overflowing field into the last column recovers the value when

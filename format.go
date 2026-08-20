@@ -244,6 +244,16 @@ func (r Row) PaneID(name string) (PaneID, error) {
 //
 // An empty spec is a caller error rather than an unusual line: there is
 // nothing for a row to be aligned against.
+//
+// A blank line is skipped for a spec of two columns or more, where it cannot
+// be a row: any real row carries its separators, so a row of nothing but
+// empty values is a line of tabs rather than an empty line. For a single-column spec the same line
+// is a row whose one value is empty — a pane with no title is an ordinary
+// thing — and skipping it would hand back fewer rows than there are objects
+// with no way to tell which one went missing, which is the count callers
+// align everything else against. The cost is that a trailing blank line
+// becomes a row for a one-column spec; tmux does not write one, and
+// splitLines drops the trailing newline that would otherwise look like one.
 func ParseRows(spec FormatSpec, lines []string) ([]Row, error) {
 	if len(spec) == 0 {
 		return nil, errEmptySpec
@@ -253,7 +263,7 @@ func ParseRows(spec FormatSpec, lines []string) ([]Row, error) {
 	}
 	rows := make([]Row, 0, len(lines))
 	for i, line := range lines {
-		if line == "" {
+		if line == "" && len(spec) > 1 {
 			continue
 		}
 		vals := strings.Split(line, fieldSep)

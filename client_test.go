@@ -995,3 +995,79 @@ func TestGlobalTargetIsAlwaysAddressable(t *testing.T) {
 	}
 	f.wantArgv(0, "set-option", "-g", "--", "status", "off")
 }
+
+// TestSplitLinesCountsAnEmptyLine is the other half of F3: the row for an
+// object whose only column is empty is a line with nothing on it, and tmux
+// writes that as a single newline. Testing emptiness after the trailing
+// newline was taken off made that indistinguishable from no output at all.
+func TestSplitLinesCountsAnEmptyLine(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"no output at all", "", nil},
+		{"one empty line", "\n", []string{""}},
+		{"one empty line, CRLF", "\r\n", []string{""}},
+		{"two empty lines", "\n\n", []string{"", ""}},
+		{"one value", "a\n", []string{"a"}},
+		{"a value then an empty line", "a\n\n", []string{"a", ""}},
+		{"an empty line between values", "a\n\nb\n", []string{"a", "", "b"}},
+		{"no trailing newline", "a\nb", []string{"a", "b"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitLines([]byte(tt.in))
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %q (%d lines), want %q (%d)", got, len(got), tt.want, len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("line %d = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestQueryKeepsRowsWithAnEmptyColumn drives the same thing through the path a
+// caller takes. The row count is what a caller aligns against everything else
+// it knows about the server, so a missing one is worse than an empty value.
+func TestQueryKeepsRowsWithAnEmptyColumn(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout string
+		want   []string
+	}{
+		{"no sessions", "", nil},
+		{"one session, empty value", "\n", []string{""}},
+		{"two sessions, both empty", "\n\n", []string{"", ""}},
+		{"an empty value among others", "a\n\nb\n", []string{"a", "", "b"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{
+				Responses: map[string]faketmux.Response{
+					"list-sessions": {Stdout: tt.stdout},
+				},
+			})
+			// An unset user option expands to the empty string on every
+			// supported tmux, which is why the integration test uses one too.
+			rows, err := f.client().Query(
+				context.Background(), "list-sessions", FormatSpec{"@gotmucks_absent"})
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if len(rows) != len(tt.want) {
+				t.Fatalf("got %d rows, want %d", len(rows), len(tt.want))
+			}
+			for i := range rows {
+				if v, ok := rows[i].Lookup("@gotmucks_absent"); !ok || v != tt.want[i] {
+					t.Errorf("row %d = (%q, %v), want %q", i, v, ok, tt.want[i])
+				}
+			}
+		})
+	}
+}

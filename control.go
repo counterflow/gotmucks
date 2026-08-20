@@ -124,8 +124,14 @@ func (p *pending) finish() { p.once.Do(func() { close(p.done) }) }
 
 // tap is a per-pane output channel registered by [ControlClient.Output].
 type tap struct {
-	ch     chan []byte
-	drops  atomic.Uint64
+	ch chan []byte
+	// drops are the losses not yet reported as an [OutputDropped]. They are
+	// cleared by the next successful delivery, which reports them, and by the
+	// teardown, which reports whatever the pane never got to.
+	drops atomic.Uint64
+	// total is every loss this tap has ever had, reported by
+	// [ControlClient.DroppedOutput]. It is never cleared: a caller that asks
+	// after the connection ended still gets an answer.
 	total  atomic.Uint64
 	closed bool
 }
@@ -404,14 +410,48 @@ func (cc *ControlClient) Events() <-chan Event {
 
 // Dropped reports how many events have been discarded because the event
 // channel was full.
+//
+// It counts the event stream only. A tap registered by [ControlClient.Output]
+// has a buffer of its own and overflows on its own terms, which is a separate
+// number: [ControlClient.DroppedOutput].
 func (cc *ControlClient) Dropped() uint64 { return cc.totalDrops.Load() }
+
+// DroppedOutput reports how many of one pane's output messages have been
+// discarded because that pane's tap channel was full.
+//
+// This is the number to ask for rather than watching for [OutputDropped]. A
+// drop is reported as that event when delivery to the pane next succeeds, and
+// at teardown for anything still owed, but both are events on a stream that
+// is itself lossy, and a pane that overflows and then falls quiet has nothing
+// to attach a report to until the connection ends. The count is a lifetime
+// total for the tap and outlives the connection.
+//
+// A pane with no tap reports zero, as does an identifier that is not one,
+// since [ControlClient.Output] refuses to register a tap under one.
+// [ControlClient.Untap] forgets the tap, and the count with it.
+func (cc *ControlClient) DroppedOutput(pane PaneID) uint64 {
+	cc.ensure()
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	if t, ok := cc.taps[pane]; ok {
+		return t.total.Load()
+	}
+	return 0
+}
 
 // Output returns a channel carrying one pane's unescaped output bytes.
 //
 // The first call for a pane registers the tap; later calls for the same pane
 // return the same channel. The channel is closed when the connection ends.
-// Like [ControlClient.Events] it is buffered and lossy rather than blocking;
-// drops are reported as [OutputDropped] on the event stream.
+// Like [ControlClient.Events] it is buffered and lossy rather than blocking.
+//
+// A drop is reported as [OutputDropped] on the event stream when delivery to
+// this pane next succeeds, and at teardown for anything still owed then. That
+// leaves no silent loss, but it does leave a report a caller has to be
+// listening for, on a stream that is itself lossy, and possibly not until the
+// connection ends. [ControlClient.DroppedOutput] answers the same question
+// directly at any time.
 //
 // Bytes are delivered as tmux framed them, which is not line-oriented: one
 // receive is one %output notification, not one line.
