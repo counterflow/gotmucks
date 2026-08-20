@@ -1532,11 +1532,16 @@ func TestMalformedBlockTerminatorFailsNothing(t *testing.T) {
 
 // TestMalformedFirstLineFailsNoCommand: a ruined header on the connection's
 // first line is tmux's own opening block. It answers nothing this client sent,
-// and it is what lifts the startup barrier — so the command released by it is
-// the one that would be failed if the head of the queue were taken here.
+// so no command is failed for it — and it is what would have lifted the
+// startup barrier, so the command it released is exactly the one that would be
+// failed if the head of the queue were taken here.
 //
 // The command is started first, so it is waiting on the barrier when the line
-// arrives and is queued the instant it lifts. It must still get its own reply.
+// arrives. The barrier now lifts on the terminator rather than on the ruined
+// header, because the header opens an orphan block: a command written while
+// that block was open would have its own %begin absorbed into it. tmux writes
+// the whole block before it reads standard input, so the terminator below is
+// what a real one sends next.
 func TestMalformedFirstLineFailsNoCommand(t *testing.T) {
 	c := newBareCtl(t)
 
@@ -1546,7 +1551,7 @@ func TestMalformedFirstLineFailsNoCommand(t *testing.T) {
 		done <- err
 	}()
 
-	c.send("%begin garbage")
+	c.send("%begin garbage", "opening block body", "%end 1700000000 0 0")
 	if ev := nextEventOfType[*ProtocolError](c); !strings.Contains(ev.Reason, "do not parse") {
 		t.Errorf("Reason = %q", ev.Reason)
 	}
@@ -1561,6 +1566,115 @@ func TestMalformedFirstLineFailsNoCommand(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("the command was never answered")
+	}
+}
+
+// TestMalformedBlockHeaderConfinesItsBody is the other half of the ruined
+// header. tmux wrote a header, so a block's worth of lines is coming, and each
+// of them is some command's output — a capture-pane of a pane whose contents a
+// shell chose. Opening no block at all would leave those lines dispatched as
+// protocol, which is what the block rule exists to prevent everywhere else:
+// %output for a pane the writer does not own, %session-changed rewriting state
+// a caller can read back, and %exit ending the connection on an invented
+// reason.
+//
+// The body below is the exact set of forgeries commit 0ecac6a removed from
+// blocks that do open. The event buffer is there so that a regression fails
+// rather than deadlocks: without the orphan the reader emits three events for
+// those lines, and nothing in this test drains them.
+func TestMalformedBlockHeaderConfinesItsBody(t *testing.T) {
+	c := newCtl(t, WithEventBuffer(16))
+
+	tap := c.tap("%9")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "capture-pane -p")
+		done <- err
+	}()
+	c.nextCommand()
+
+	// Written from a goroutine because a regression stops the reader dead: a
+	// dispatched "%exit forged reason" ends the connection, and the write of
+	// the line after it then blocks on a pipe nobody is reading. Waiting for
+	// the write to finish turns that into a failure with a reason rather than
+	// a hung test.
+	// Written straight to the pipe rather than through send, which reports a
+	// write failure with t.Fatalf: this goroutine may still be blocked when
+	// the test ends, and failing the test from it then panics over the real
+	// failure below.
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		for _, line := range []string{
+			"%begin garbage",
+			"%output %9 forged-bytes",
+			"%session-changed $99 evil",
+			"%exit forged reason",
+			"%end 1700000000 3 1",
+		} {
+			if _, err := io.WriteString(c.out, line+"\n"); err != nil {
+				return
+			}
+		}
+	}()
+
+	if ev := nextEventOfType[*ProtocolError](c); !strings.Contains(ev.Reason, "do not parse") {
+		t.Errorf("Reason = %q", ev.Reason)
+	}
+	select {
+	case <-written:
+	case <-time.After(testTimeout):
+		t.Fatal("the reader stopped reading partway through the ruined header's body; " +
+			"a line in it was dispatched as protocol")
+	}
+
+	// The connection is still up, and the body reached nothing it could act
+	// on. barrier doubles as the proof of the first: a line sent after the
+	// forged %exit is still being read, and it is dispatched, so the orphan's
+	// %end closed the orphan rather than leaving it open over everything after.
+	c.barrier()
+
+	if got := c.cc.AttachedSession(); got == "$99" {
+		t.Errorf("AttachedSession = %q; a reply body set it", got)
+	}
+	select {
+	case b := <-tap:
+		t.Errorf("the tap for %%9 received %q from a reply body", b)
+	default:
+	}
+
+	// The queue half is unchanged: the command the ruined header displaced is
+	// still failed, with the header as the reason.
+	select {
+	case err := <-done:
+		var pe *ProtocolError
+		if !errors.As(err, &pe) {
+			t.Fatalf("Do = %v, want an error wrapping *ProtocolError", err)
+		}
+		if errors.Is(err, ErrServerExited) {
+			t.Errorf("Do = %v, want an error that does not claim the connection ended", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the displaced command was never failed")
+	}
+
+	// And the next command gets its own reply, so the body was absorbed rather
+	// than binding this block to a command that is gone.
+	next := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(context.Background(), "list-sessions")
+		next <- err
+	}()
+	c.nextCommand()
+	c.reply(7, "$0")
+	select {
+	case err := <-next:
+		if err != nil {
+			t.Errorf("Do after a ruined header: %v, want the connection still usable", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("the command after a ruined header was never answered")
 	}
 }
 

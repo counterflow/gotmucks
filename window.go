@@ -135,9 +135,16 @@ func (c *Client) Window(ctx context.Context, id WindowID) (*Window, error) {
 }
 
 // RenameWindow gives a window a new name.
+//
+// The name is positional, so it goes after "--": tmux's option parser reaches
+// it otherwise, and a name beginning with a dash is then read as a flag rather
+// than a name. Verified on 3.2a: without the separator, "-a" is refused as an
+// unknown option, "-tother" is consumed as a second -t and leaves the command
+// with no name at all, and "--" is eaten as the separator; with it, all three
+// become the window's name.
 func (c *Client) RenameWindow(ctx context.Context, id WindowID, name string) error {
 	if err := id.check(); err != nil {
 		return err
 	}
-	return c.runOK(ctx, "rename-window", "-t", string(id), name)
+	return c.runOK(ctx, "rename-window", "-t", string(id), "--", name)
 }

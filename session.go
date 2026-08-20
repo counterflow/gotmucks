@@ -337,9 +337,13 @@ func (c *Client) KillSession(ctx context.Context, id SessionID) error {
 // RenameSession gives a session a new name. The session's identifier is
 // unchanged, which is why identifiers rather than names are the addressing
 // scheme here.
+//
+// The name goes after "--" for the reason [Client.RenameWindow] gives: it is
+// positional, so without the separator a name beginning with a dash is read as
+// a flag and the session keeps its old name.
 func (c *Client) RenameSession(ctx context.Context, id SessionID, name string) error {
 	if err := id.check(); err != nil {
 		return err
 	}
-	return c.runOK(ctx, "rename-session", "-t", string(id), name)
+	return c.runOK(ctx, "rename-session", "-t", string(id), "--", name)
 }

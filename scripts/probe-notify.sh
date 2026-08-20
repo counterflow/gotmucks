@@ -23,6 +23,11 @@
 #      from the unlinked ones.
 #   3. Where do those two answers and the library's table disagree?
 #
+# Unlike the other probes this one has an exit status worth reading: a name
+# tmux can write that the table does not have is a lost event, so either of the
+# last two diffs being non-empty exits 1. The rest of the output is still just
+# printed.
+#
 #   ./scripts/probe-notify.sh [tmux-binary]
 
 set -uo pipefail
@@ -121,9 +126,12 @@ sed -n '/^var notifications = map\[string\]bool{/,/^}/p' \
 	"$REPO/internal/ctlparse/ctlparse.go" |
 	grep -oE '"[a-z-]+"' | tr -d '"' | sort -u >"$WORK/in-table"
 
+status=0
+
 if [ ! -s "$WORK/in-table" ]; then
 	echo
 	echo "  (could not read the notification table out of the source; the diffs below are meaningless)" >&2
+	status=1
 fi
 
 # begin, end and error are block framing rather than notifications. tmux
@@ -140,14 +148,37 @@ echo
 echo "--- in the library's table, absent from the binary (informational) ---"
 comm -23 "$WORK/in-table" "$WORK/in-binary" | comm -23 - "$WORK/framing" | sed 's/^/  /'
 
-echo
-echo "--- in the binary, absent from the library's table (must be empty) ---"
-comm -13 "$WORK/in-table" "$WORK/in-binary" | sed 's/^/  /'
+# The two below are assertions, which makes this script different in kind from
+# its neighbours: the rest print what a release does and leave the reading to a
+# person, and CI runs them with "|| true" for that reason. A name here is a lost
+# event, so this one is run for its exit status as well as its output. Deleting
+# three real names from the table made it print exactly the right thing and
+# still exit 0, which is how that was noticed.
+#
+# The binary half can in principle raise a false alarm: it is a regex over every
+# string in the executable, and something that is not a notification could match
+# it. That looks like a name in the first list that the live server never emits
+# and that no tmux changelog mentions, and the answer then is to narrow the
+# regex rather than to add the name to the table.
+must_be_empty() {
+	local heading="$1" file="$2"
+	echo
+	echo "--- $heading (must be empty) ---"
+	sed 's/^/  /' "$file"
+	if [ -s "$file" ]; then
+		echo "  ^^ tmux has notification names the library's table does not; each one is an event lost" >&2
+		status=1
+	fi
+}
 
-echo
-echo "--- emitted by the live server, absent from the table (must be empty) ---"
-comm -13 "$WORK/in-table" "$WORK/emitted" | sed 's/^/  /'
+comm -13 "$WORK/in-table" "$WORK/in-binary" >"$WORK/missing-from-binary"
+must_be_empty "in the binary, absent from the library's table" "$WORK/missing-from-binary"
+
+comm -13 "$WORK/in-table" "$WORK/emitted" >"$WORK/missing-from-emitted"
+must_be_empty "emitted by the live server, absent from the table" "$WORK/missing-from-emitted"
 
 echo
 echo "--- window notifications as they arrived, verbatim ---"
 grep -E '^%[a-z-]*window[a-z-]*' "$WORK/raw" | sed 's/^/  /'
+
+exit "$status"

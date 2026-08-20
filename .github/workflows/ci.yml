@@ -99,8 +99,9 @@ jobs:
           "$HOME/tmux-install/bin/tmux" -V
 
       - name: Probe tmux behaviour
-        # Not an assertion: this prints how this release actually behaves, so
-        # that a matrix failure comes with the evidence next to it.
+        # Not assertions: these print how this release actually behaves, so
+        # that a matrix failure comes with the evidence next to it. The one
+        # exception is run in the step below.
         run: |
           bash ./scripts/probe-tmux.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-control.sh "$HOME/tmux-install/bin/tmux" || true
@@ -110,7 +111,16 @@ jobs:
           bash ./scripts/probe-blocks.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-tabs.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-interleave.sh "$HOME/tmux-install/bin/tmux" || true
-          bash ./scripts/probe-notify.sh "$HOME/tmux-install/bin/tmux" || true
+
+      - name: Check the notification table against this tmux
+        # This one is an assertion, and is run for its exit status. A
+        # notification name this release can write that the reader's table does
+        # not have is an event the library silently loses, and no test can
+        # catch it: the unit suite feeds the reader lines it spells itself, so
+        # the table is only ever asserted against itself there. The probe scans
+        # the binary's format strings and collects what a live server emits,
+        # and exits non-zero if either set has a name the table lacks.
+        run: bash ./scripts/probe-notify.sh "$HOME/tmux-install/bin/tmux"
 
       - name: Integration tests
         run: |

@@ -162,14 +162,15 @@ func WithoutParentEnv() Option {
 // would have built: given both, this one wins and the attach is not made.
 //
 // These arguments are passed to tmux as written. That includes a -t, which
-// makes this the one place in the package where an object may be addressed by
-// name: WithAttach("work") is refused with [ErrInvalidID], while
+// makes this the one Option through which an object may be addressed by name:
+// WithAttach("work") is refused with [ErrInvalidID], while
 // WithControlArgs("attach-session", "-t", "work") attaches to whichever
-// session that name reached. It is allowed for the same reason
-// [ControlClient.Do] is — a command line assembled by the caller is the
-// caller's own, and parsing it here to disagree with it would be guesswork —
-// but the addressing scheme is not enforced through it. Prefer [WithAttach],
-// or build the -t from an identifier.
+// session that name reached. It is allowed for the same reason the three
+// calls that take a command line are — [ControlClient.Do],
+// [ControlClient.DoArgs] and [Client.QueryArgs] — a command line assembled by
+// the caller is the caller's own, and parsing it here to disagree with it
+// would be guesswork; but the addressing scheme is not enforced through it.
+// Prefer [WithAttach], or build the -t from an identifier.
 //
 // Control-mode only.
 func WithControlArgs(args ...string) Option {

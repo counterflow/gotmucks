@@ -88,13 +88,13 @@ func (cc *ControlClient) handleLine(line string) bool {
 	firstLine := !cc.sawFirstLine
 	if firstLine {
 		cc.sawFirstLine = true
-		if cl.Kind != ctlparse.KindBegin || cl.Malformed {
+		if cl.Kind != ctlparse.KindBegin {
 			cc.releaseStartup()
 		}
 	}
 
-	if number, open := cc.openBlock(); open {
-		if closesBlock(cl, number) {
+	if number, numbered, open := cc.openBlock(); open {
+		if closesBlock(cl, number, numbered) {
 			cc.endBlock(cl, cl.Kind == ctlparse.KindError)
 		} else {
 			cc.dataLine(line)
@@ -103,34 +103,54 @@ func (cc *ControlClient) handleLine(line string) bool {
 	}
 
 	// Malformed is only ever set for a block header, and a header whose
-	// arguments did not parse has no command number to bind by, so no block
-	// is opened for it: doing that on a guessed number would attach a command
-	// to a body that is not its own.
+	// arguments did not parse has no command number to bind by, so no command
+	// is bound to it: doing that on a guessed number would attach a command to
+	// a body that is not its own.
 	//
-	// Reporting the line is not on its own enough. A %begin that opens no
-	// block leaves the command it would have answered at the front of the
-	// queue, so the next %begin binds that command to the next command's
-	// block, and from there every reply is delivered to the caller before the
-	// one it belongs to — with a nil error, since each block still ends in a
-	// perfectly good %end. That is the failure awaitStartup exists to remove,
-	// arriving by a different door, and it outlives the line that caused it.
-	// So the command at the head of the queue is failed along with the
-	// report, which confines the damage to the one command.
+	// Reporting the line is not on its own enough, and neither is refusing the
+	// binding. Two separate things follow a ruined %begin.
 	//
-	// Only a header does that, and only one that was not the connection's
-	// first line. The first line is tmux's own opening block, which answers
-	// nothing this client sent; failing a command for it would be failing one
-	// that has only just been let past the startup barrier this line lifted.
-	// A terminator arriving with no block open binds nothing and consumes no
-	// command either, so it is reported and nothing else.
+	// The first is the queue. A %begin that consumes no command leaves the
+	// command it would have answered at the front, so the next %begin binds
+	// that command to the next command's block, and from there every reply is
+	// delivered to the caller before the one it belongs to — with a nil error,
+	// since each block still ends in a perfectly good %end. That is the
+	// failure awaitStartup exists to remove, arriving by a different door, and
+	// it outlives the line that caused it. So the command at the head of the
+	// queue is failed along with the report. See failHead for what that trade
+	// actually costs.
+	//
+	// The second is the body. tmux wrote a header, so a block's worth of lines
+	// is coming, and every one of them is some command's output: leaving no
+	// block open would dispatch the lot as protocol, which is the whole of
+	// what the block rule above exists to prevent — "%output %9 x" delivered
+	// to whoever tapped %9 and "%exit forged" ending the connection on a
+	// reason a shell chose. So a block is opened after all, but an orphan one
+	// with no number: nobody waits on it, its lines go nowhere, and the first
+	// terminator to arrive closes it. That swallows one terminator that might
+	// have been worth reporting, which is the same trade beginBlock already
+	// makes for every block tmux opens for itself.
+	//
+	// Only a header does either, and the first line is the one header that
+	// fails no command. The first line is tmux's own opening block, which
+	// answers nothing this client sent; failing a command for it would be
+	// failing one that had only just been let past the startup barrier. It
+	// still opens the orphan, and holding the barrier until that orphan closes
+	// is what keeps a command's own block from being written into it — with
+	// the grace timer in start as the backstop for a tmux that opened no block
+	// at all. A terminator arriving with no block open binds nothing and
+	// consumes no command either, so it is reported and nothing else.
 	if cl.Malformed {
 		pe := &ProtocolError{
 			Line:   cl.Raw,
 			Reason: "block " + cl.Kind.String() + " with arguments that do not parse",
 		}
 		cc.emit(pe)
-		if cl.Kind == ctlparse.KindBegin && !firstLine {
-			cc.failHead(pe)
+		if cl.Kind == ctlparse.KindBegin {
+			if !firstLine {
+				cc.failHead(pe)
+			}
+			cc.beginUnnumberedBlock()
 		}
 		return true
 	}
@@ -150,31 +170,42 @@ func (cc *ControlClient) handleLine(line string) bool {
 	return true
 }
 
-// closesBlock reports whether cl terminates the open block numbered number.
+// closesBlock reports whether cl terminates the open block. numbered says
+// whether number is a real one to match against.
 //
-// A terminator whose arguments did not parse carries no number, so it closes
-// nothing. Neither does one carrying a different number: inside an open block
-// that is not a stray terminator to complain about but a line of output that
-// looks like one, and nothing on the wire tells the two apart.
-func closesBlock(cl ctlparse.Line, number int) bool {
-	if cl.Malformed || cl.Number != number {
+// While a numbered block is open, a terminator whose arguments did not parse
+// carries no number and closes nothing, and neither does one carrying a
+// different number: inside an open block that is not a stray terminator to
+// complain about but a line of output that looks like one, and nothing on the
+// wire tells the two apart.
+//
+// The unnumbered block is the orphan opened for a ruined header, which had no
+// number to take. There is nothing to match, so the first terminator to arrive
+// closes it — including a ruined one, which is no less likely to be that
+// block's own than a well-formed one is.
+func closesBlock(cl ctlparse.Line, number int, numbered bool) bool {
+	if cl.Kind != ctlparse.KindEnd && cl.Kind != ctlparse.KindError {
 		return false
 	}
-	return cl.Kind == ctlparse.KindEnd || cl.Kind == ctlparse.KindError
+	if !numbered {
+		return true
+	}
+	return !cl.Malformed && cl.Number == number
 }
 
-// openBlock reports the number of the block being read, if there is one.
+// openBlock reports the block being read, if there is one: its number, and
+// whether that number means anything.
 //
 // cc.current is written only by beginBlock, endBlock and the teardown, all of
 // which run on the reader goroutine, so the answer cannot go stale between
 // here and the call it decides.
-func (cc *ControlClient) openBlock() (int, bool) {
+func (cc *ControlClient) openBlock() (number int, numbered, open bool) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if cc.current == nil {
-		return 0, false
+		return 0, false, false
 	}
-	return cc.current.number, true
+	return cc.current.number, !cc.current.unnumbered, true
 }
 
 // beginBlock binds the next written-but-unanswered command to the command
@@ -224,6 +255,20 @@ func (cc *ControlClient) beginBlock(cl ctlparse.Line) {
 // not send, by the flags word of its header. See beginBlock.
 func unsolicitedBlock(cl ctlparse.Line) bool { return cl.HasFlags && cl.Flags == 0 }
 
+// beginUnnumberedBlock opens a block for a header whose arguments did not
+// parse, so that the body tmux is about to write is absorbed rather than read
+// as tmux speaking. See handleLine.
+//
+// It is always an orphan: whichever command the ruined header answered has
+// already been failed, or was never in the queue, so nothing is waiting on
+// these lines. It is reached only with no block open, for the same reason
+// beginBlock is — a header arriving inside a block is body.
+func (cc *ControlClient) beginUnnumberedBlock() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.current = &pending{orphan: true, unnumbered: true, done: make(chan struct{})}
+}
+
 // failHead fails the command at the front of the queue, for a line that
 // destroyed the binding between commands and blocks rather than one that
 // answered anything.
@@ -231,11 +276,30 @@ func unsolicitedBlock(cl ctlparse.Line) bool { return cl.HasFlags && cl.Flags ==
 // It is a guess, and deliberately the loud one. The queue is bound by order,
 // so the front is the command the ruined block header would have answered —
 // unless tmux had opened that block for itself, which its flags word would
-// have said had the header parsed. Failing the wrong command reports an error
-// to a caller whose command tmux may yet answer; not failing any hands the
-// next caller another command's output with no error at all, and the one
-// after that the same, for the life of the connection. The first is a bounded
-// lie about one command and the second is an unbounded one about all of them.
+// have said had the header parsed.
+//
+// Failing the head does not only report an error: it takes the command off
+// the queue, which is what keeps the queue aligned when the guess is right.
+// The block the ruined header opened will never be bound to anything, so the
+// command it would have answered has to leave with it, and every later reply
+// then goes to the caller that earned it. That case costs exactly one command.
+//
+// When the guess is wrong the cost is not bounded, which is worth stating
+// plainly because taking the head off the queue reads like the cautious half
+// of the trade and is not. If tmux had opened that block for itself, the
+// command taken off the queue is one tmux will still answer, so its block
+// binds to the command behind it and every reply from then on is delivered
+// one command early, with a nil error — plus the spurious failure. That is
+// the same unbounded shape as not failing anything at all.
+//
+// So the choice is not bounded against unbounded. It is: one command lost
+// whenever the ruined header was a reply, against a permanent shift whenever
+// it was not — and against a permanent shift in every case if nothing is
+// failed, since a header that was a reply and consumes no command shifts the
+// queue by itself. The guess is right whenever the ruined header was a reply,
+// which is the overwhelming case while commands are outstanding, and the only
+// field on the line that would have said otherwise is the one that failed to
+// parse.
 //
 // The startup block is the one unsolicited block that certainly arrives, and
 // handleLine keeps it out of here by hand: a ruined header on the connection's
@@ -397,10 +461,20 @@ func (cc *ControlClient) handleNotification(cl ctlparse.Line) bool {
 
 	// Each of the three window notifications has two spellings, and which one
 	// arrives says nothing about the window — only whether this client's own
-	// session has a link to it. A caller watching for windows wants both, so
-	// both produce the same event. The names are tmux's own, taken from
-	// scripts/probe-notify.sh rather than from the manual; there is no
-	// "linked-" spelling of any of them.
+	// session had a link to it when tmux wrote the line. A caller watching for
+	// windows wants both, so both produce the same event. The names are tmux's
+	// own, taken from scripts/probe-notify.sh rather than from the manual;
+	// there is no "linked-" spelling of any of them.
+	//
+	// "when tmux wrote the line" is load-bearing for the close pair and not
+	// for the other two. Closing a window unlinks it first, so by the time the
+	// notification fires no client has a link to it: on 3.2a, killing a window
+	// in the session this client is attached to still produced
+	// %unlinked-window-close, and %window-close was not emitted once during
+	// the whole probe even though the format string is in the binary. Both
+	// arms produce WindowClosed, so a spelling that turns out to be
+	// unreachable costs nothing — which is the only reason it is safe to say
+	// so without knowing whether some other operation reaches it.
 	case "window-add", "unlinked-window-add":
 		if w, ok := windowArg(cl.Args); ok {
 			cc.emit(WindowAdded{Window: w})

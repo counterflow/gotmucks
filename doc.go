@@ -51,10 +51,12 @@
 // Identifiers come back from tmux — [Session.ID], [Row.PaneID] — or from
 // [ParseSessionID] and its siblings; a name is not an address.
 //
-// The exceptions are the three calls that take a tmux command line rather than
-// an identifier — [ControlClient.Do], [Client.QueryArgs] and [WithControlArgs].
-// A command line is passed to tmux as written, -t included, so a name in one
-// resolves as a name.
+// The exceptions are the four calls that take a tmux command line rather than
+// an identifier — [ControlClient.Do], [ControlClient.DoArgs],
+// [Client.QueryArgs] and [WithControlArgs]. A command line is passed to tmux
+// as written, -t included, so a name in one resolves as a name. DoArgs quotes
+// each argument, which is about how tmux splits the line and not about what it
+// addresses: a quoted -t still takes a name.
 //
 // # No server running
 //

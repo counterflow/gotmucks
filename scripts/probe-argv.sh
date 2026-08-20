@@ -75,15 +75,23 @@ fi
 
 echo
 echo "--- two elements with metacharacters in the second ---"
+# The metacharacters have to stay inside one path component. Written as
+# "$WORK/p; touch $WORK/q" the execvp answer is a filename whose directory
+# component is "$WORK/p; touch $WORK", which does not exist, so touch fails
+# with ENOENT and neither branch below can match — this check printed
+# "unclear" on every run it was ever made. Keeping the second file name
+# relative puts the whole string in one component: under execvp it is a single
+# file in $WORK, and under a shell it is "touch $WORK/p" followed by "touch q"
+# in tmux's working directory.
 start_server
-rm -f "$WORK/p" "$WORK/q"
-"${T[@]}" new-session -d -s two -x 80 -y 24 -- touch "$WORK/p; touch $WORK/q"
+rm -f "$WORK/p" "$WORK/p; touch q"
+"${T[@]}" new-session -d -s two -x 80 -y 24 -c "$WORK" -- touch "$WORK/p; touch q"
 sleep 0.5
-if [ -e "$WORK/q" ]; then
-	echo "result: SHELL -- a two-element vector is still interpreted"
-elif [ -e "$WORK/p; touch $WORK/q" ]; then
+if [ -e "$WORK/p; touch q" ]; then
 	echo "result: EXECVP -- the whole string became one filename, as intended"
+elif [ -e "$WORK/p" ]; then
+	echo "result: SHELL -- a two-element vector is still interpreted"
 else
-	echo "result: unclear"
+	echo "result: unclear -- neither file appeared"
 fi
 ls -a "$WORK" | sed 's/^/  /'

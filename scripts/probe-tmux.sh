@@ -23,36 +23,20 @@ say() { printf '%-38s %s\n' "$1" "$2"; }
 echo "=== $("$TMUX_BIN" -V) ==="
 echo
 
-# --- multi-argument command after -- ------------------------------------
-# If tmux execs the vector directly, printf prints the semicolon literally.
-# If it hands the line to a shell, the shell splits on ';' and fails.
-"${T[@]}" kill-server 2>/dev/null
-# remain-on-exit has to be set before the pane starts: the command exits
-# immediately and the pane would be gone before the option was applied.
-"${T[@]}" start-server 2>/dev/null
-"${T[@]}" set-option -g -w remain-on-exit on 2>/dev/null
-"${T[@]}" new-session -d -s multi -x 80 -y 24 -- printf 'one;two three' 2>/dev/null
-sleep 0.4
-out=$("${T[@]}" capture-pane -p -t multi 2>/dev/null | head -1)
-if [ "$out" = "one;two three" ]; then
-	say "multi-arg command after --" "execvp (metacharacters inert)"
-else
-	say "multi-arg command after --" "NOT execvp: got [$out]"
-fi
-
-# --- single-argument command --------------------------------------------
-# tmux is documented to hand a lone argument to the shell.
-"${T[@]}" kill-server 2>/dev/null
-"${T[@]}" start-server 2>/dev/null
-"${T[@]}" set-option -g -w remain-on-exit on 2>/dev/null
-"${T[@]}" new-session -d -s single -x 80 -y 24 -- 'printf single-via-shell' 2>/dev/null
-sleep 0.4
-out=$("${T[@]}" capture-pane -p -t single 2>/dev/null | head -1)
-if [ "$out" = "single-via-shell" ]; then
-	say "single-arg command after --" "shell (as documented)"
-else
-	say "single-arg command after --" "not shell: got [$out]"
-fi
+# --- execvp versus the shell: see probe-argv.sh ---------------------------
+# Whether a command vector after "--" is exec'd or handed to a shell is asked
+# by scripts/probe-argv.sh, not here. It was asked here too, and answered
+# wrongly on every run: the two checks did start-server, set remain-on-exit,
+# then ran a pane command that exits at once, and screen-scraped the pane. A
+# server with no sessions exits immediately (exit-empty defaults to on), so the
+# option never landed and the server was gone again before capture-pane ran;
+# capture-pane's "no server running" went to /dev/null and the empty capture
+# was reported as "NOT execvp" and "not shell" — the opposite of the truth, and
+# the opposite of what probe-argv.sh printed five lines later in the same CI
+# log. probe-argv.sh holds the server open with a keeper session and observes
+# through the filesystem rather than the screen, which is what a pane whose
+# command exits at once requires.
+say "execvp vs shell after --" "asked by scripts/probe-argv.sh"
 
 # --- send-keys -- ---------------------------------------------------------
 "${T[@]}" kill-server 2>/dev/null
@@ -131,34 +115,13 @@ for cmd in "source-file /gotmucks-absent-$$.conf" \
 	say "${cmd%% *} on a live server" "[$msg]"
 done
 
-# --- control mode ---------------------------------------------------------
-"${T[@]}" kill-server 2>/dev/null
-"${T[@]}" new-session -d -s ctl -x 80 -y 24 2>/dev/null
-ctl_out=$(mktemp)
-{
-	# Give tmux a moment between commands so replies are not batched.
-	printf 'refresh-client -C 132x43\n'
-	sleep 0.3
-	printf 'refresh-client -B probe:%%*:#{pane_title}\n'
-	sleep 0.3
-	printf 'refresh-client -f pause-after=1\n'
-	sleep 0.3
-	printf 'list-panes -F #{pane_id}\n'
-	sleep 0.5
-	printf '\n'
-} | "${T[@]}" -CC attach-session -t ctl >"$ctl_out" 2>&1
-sleep 0.2
-
-if grep -q '%error' "$ctl_out"; then
-	say "control mode errors" "SOME COMMAND FAILED"
-	grep -n -A2 '%begin\|%error' "$ctl_out" | head -30
-else
-	say "control mode errors" "none"
-fi
-
-say "refresh-client -C WxH" "$(grep -c '%error' "$ctl_out" | sed 's/^0$/ok/')"
-echo
-echo "--- control transcript (escaped) ---"
-cat -v "$ctl_out" | head -40
-echo "--- end transcript ---"
-rm -f "$ctl_out"
+# --- control mode: see probe-control.sh -----------------------------------
+# Control mode is asked by scripts/probe-control.sh, which runs -C and -CC
+# against both attach-session and new-session and prints each transcript. It
+# was asked here too, with -CC, and -CC fails outright with piped stdio —
+# "tcgetattr failed: Inappropriate ioctl for device" and nothing else. The two
+# lines this section printed were counts of "%error" in that transcript, so a
+# session that never started reported "control mode errors: none" and
+# "refresh-client -C WxH: ok". Failing to run is not the same answer as running
+# without error, and only one of the two probes was in a position to tell.
+say "control mode" "asked by scripts/probe-control.sh"

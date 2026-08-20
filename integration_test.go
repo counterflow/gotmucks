@@ -410,6 +410,58 @@ func TestIntegrationWindowsAndPanes(t *testing.T) {
 	}
 }
 
+// TestIntegrationRenameWithDashNames drives the one thing the argv assertions
+// cannot: that tmux itself accepts these names. RenameWindow and RenameSession
+// pass the caller's name as a positional argument, so without a "--" ahead of
+// it tmux's option parser reaches it and four of the five names below never
+// land — "-a" is refused as an unknown option, "-tother" is swallowed as a
+// second -t leaving no name argument at all, "--" is eaten as the separator,
+// and only a lone "-" gets through because it is not an option.
+//
+// The window and the session are renamed together because they are the same
+// mistake in two files.
+func TestIntegrationRenameWithDashNames(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{Name: "dashes", Command: []string{"sleep", "600"}})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	windows, err := c.ListWindows(ctx)
+	if err != nil {
+		t.Fatalf("ListWindows: %v", err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("got %d windows, want 1", len(windows))
+	}
+	w := windows[0]
+
+	for _, name := range []string{"-a", "-tother", "--", "-", "plain"} {
+		if err := c.RenameWindow(ctx, w.ID, name); err != nil {
+			t.Fatalf("RenameWindow(%q): %v", name, err)
+		}
+		got, err := c.Window(ctx, w.ID)
+		if err != nil {
+			t.Fatalf("Window after RenameWindow(%q): %v", name, err)
+		}
+		if got.Name != name {
+			t.Errorf("after RenameWindow(%q), window_name = %q", name, got.Name)
+		}
+
+		if err := c.RenameSession(ctx, s.ID, name); err != nil {
+			t.Fatalf("RenameSession(%q): %v", name, err)
+		}
+		gotSession, err := c.Session(ctx, s.ID)
+		if err != nil {
+			t.Fatalf("Session after RenameSession(%q): %v", name, err)
+		}
+		if gotSession.Name != name {
+			t.Errorf("after RenameSession(%q), session_name = %q", name, gotSession.Name)
+		}
+	}
+}
+
 func TestIntegrationSendKeysAndCapture(t *testing.T) {
 	c, _ := testClient(t)
 	ctx := testCtx(t)

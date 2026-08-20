@@ -419,7 +419,28 @@ func TestRenameSession(t *testing.T) {
 	if err := f.client().RenameSession(context.Background(), "$0", "renamed"); err != nil {
 		t.Fatalf("RenameSession: %v", err)
 	}
-	f.wantArgv(0, "rename-session", "-t", "$0", "renamed")
+	f.wantArgv(0, "rename-session", "-t", "$0", "--", "renamed")
+}
+
+// TestRenameSeparatesOptionsFromTheName pins the "--" on the two calls that
+// pass a caller's name as a positional argument. Without it tmux's option
+// parser reaches the name: on 3.2a "-a" is refused as an unknown option and
+// "-tother" is consumed as a second -t, leaving the command with no name at
+// all, so both of these would silently rename nothing. Which names tmux
+// actually accepts once the separator is there is
+// TestIntegrationRenameWithDashNames, since only tmux can answer that.
+func TestRenameSeparatesOptionsFromTheName(t *testing.T) {
+	f := newFake(t, faketmux.Script{})
+	c := f.client()
+
+	if err := c.RenameWindow(context.Background(), "@1", "-a"); err != nil {
+		t.Fatalf("RenameWindow: %v", err)
+	}
+	if err := c.RenameSession(context.Background(), "$0", "-tother"); err != nil {
+		t.Fatalf("RenameSession: %v", err)
+	}
+	f.wantArgv(0, "rename-window", "-t", "@1", "--", "-a")
+	f.wantArgv(1, "rename-session", "-t", "$0", "--", "-tother")
 }
 
 func TestListPanes(t *testing.T) {

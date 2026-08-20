@@ -112,6 +112,10 @@ type pending struct {
 	// orphan marks a block tmux opened for a command this client did not
 	// send. Its body is absorbed and nobody is waiting on it.
 	orphan bool
+	// unnumbered marks the orphan opened for a block header whose arguments
+	// did not parse. number is meaningless on it, so it is closed by the next
+	// terminator whatever number that carries. See handleLine.
+	unnumbered bool
 	// err is why this command will never be answered, for the one case where
 	// that is neither a reply nor the end of the connection: a line arrived
 	// that destroyed the binding between commands and blocks. See failHead.
@@ -710,6 +714,15 @@ func commandBreakErr(b byte, i int) error {
 
 // DoArgs sends a command built from separate arguments, each quoted for
 // tmux's parser. This is the safer form when any argument is caller data.
+//
+// Safer is about splitting, not about addressing. Quoting stops an argument
+// containing a space, a ";" or a "{" from becoming a second command whose
+// reply block would be delivered to whatever this connection sends next; it
+// does nothing about what the command addresses. A quoted -t is still a -t,
+// so DoArgs("kill-session", "-t", "work") kills whichever session answered to
+// that name — this is one of the four exceptions to the identifier rule
+// described in the package documentation, not an escape from it. Build the -t
+// from a [SessionID], [WindowID] or [PaneID] that came from tmux.
 func (cc *ControlClient) DoArgs(ctx context.Context, args ...string) (Reply, error) {
 	if len(args) == 0 {
 		return Reply{}, errors.New("gotmucks: no command given")
