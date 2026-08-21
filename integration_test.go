@@ -604,35 +604,59 @@ func TestIntegrationOptionsAndHooks(t *testing.T) {
 		t.Fatalf("SetRemainOnExit on a window: %v", err)
 	}
 
-	// Global hooks round-trip through show-hooks.
-	if err := c.SetGlobalHook(ctx, "session-created", "display-message made"); err != nil {
-		t.Fatalf("SetGlobalHook: %v", err)
+	// Global hooks round-trip through show-hooks, from both the tables tmux
+	// files them in: session-created is a session hook and pane-exited is a
+	// window one, and "show-hooks -g" alone sees only the first.
+	globalHooks := map[string]string{
+		"session-created": "display-message made",
+		"pane-exited":     "display-message gone",
+	}
+	for name, command := range globalHooks {
+		if err := c.SetGlobalHook(ctx, name, command); err != nil {
+			t.Fatalf("SetGlobalHook(%q): %v", name, err)
+		}
 	}
 	globals, err := c.ShowGlobalHooks(ctx)
 	if err != nil {
 		t.Fatalf("ShowGlobalHooks: %v", err)
 	}
-	found := false
-	for name := range globals {
-		if strings.HasPrefix(name, "session-created") {
-			found = true
+	for name, command := range globalHooks {
+		if globals[name] != command {
+			t.Errorf("global hook %q = %q, want %q (map: %#v)", name, globals[name], command, globals)
 		}
 	}
-	if !found {
-		t.Errorf("session-created hook missing from the global hooks")
+
+	// And only those. tmux prints every hook name it knows at global scope,
+	// with no command against the ones nobody set, so the map used to hold
+	// sixty-odd entries of which two were real — every one of them a name a
+	// caller could ask about and be told a hook existed.
+	if len(globals) != len(globalHooks) {
+		t.Errorf("ShowGlobalHooks reported %d hooks for %d set: %#v",
+			len(globals), len(globalHooks), globals)
 	}
 
-	if err := c.UnsetGlobalHook(ctx, "session-created"); err != nil {
-		t.Fatalf("UnsetGlobalHook: %v", err)
+	for name := range globalHooks {
+		if err := c.UnsetGlobalHook(ctx, name); err != nil {
+			t.Fatalf("UnsetGlobalHook(%q): %v", name, err)
+		}
+	}
+	if globals, err = c.ShowGlobalHooks(ctx); err != nil {
+		t.Fatalf("ShowGlobalHooks after unsetting: %v", err)
+	}
+	if len(globals) != 0 {
+		t.Errorf("ShowGlobalHooks reports %#v with no global hook set", globals)
 	}
 }
 
-// TestIntegrationHookFires checks a per-target hook by the only means that
-// actually proves it: making it fire.
+// TestIntegrationHookFires checks a per-target hook by the means that proves
+// most: making it fire.
 //
-// show-hooks -t reports nothing on tmux 3.2a even for a hook that was set
-// successfully, so asserting on introspection would test tmux's reporting
-// rather than this package's set-hook.
+// The comment here used to say that "show-hooks -t reports nothing on tmux
+// 3.2a even for a hook that was set successfully", generalised from the one
+// name this test uses. It is not tmux's reporting that was broken but this
+// package's reading of it: pane-exited is a *window* hook, so it was set in a
+// table ShowHooks never asked. Both halves are asserted now — the hook fires,
+// and the call that lists hooks finds it.
 func TestIntegrationHookFires(t *testing.T) {
 	c, _ := testClient(t)
 	ctx := testCtx(t)
@@ -647,6 +671,17 @@ func TestIntegrationHookFires(t *testing.T) {
 
 	if err := c.SetHook(ctx, s.ID, "pane-exited", "run-shell 'touch "+marker+"'"); err != nil {
 		t.Fatalf("SetHook: %v", err)
+	}
+
+	// The hook is set; the call that lists hooks has to find it. It did not,
+	// for every hook name tmux files in the window table, which is every
+	// pane-* and window-* name there is.
+	hooks, err := c.ShowHooks(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if got := hooks["pane-exited"]; !strings.Contains(got, marker) {
+		t.Errorf("ShowHooks does not report the hook that is about to fire: %#v", hooks)
 	}
 
 	// Give the session a second window whose command exits at once.
@@ -1053,6 +1088,91 @@ func TestIntegrationShowHooksReportsPerTargetHooks(t *testing.T) {
 	}
 }
 
+// TestIntegrationShowHooksReadsEveryOptionTable is F2 of round eleven against
+// real tmux, and the reason the test above passed while the call was broken:
+// alert-bell is a session hook, and it is the only kind plain "show-hooks -t"
+// can see.
+//
+// tmux files a hook by its name rather than by the target it was given, so
+// SetHook has no say in the matter. On 3.2a every pane-* and window-* name
+// goes to the window table, where the reader never looked — SetHook returned
+// nil, the hook fired, and ShowHooks reported nothing for any target.
+func TestIntegrationShowHooksReadsEveryOptionTable(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "hooktables", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	panes, err := c.ListSessionPanes(ctx, s.ID)
+	if err != nil || len(panes) == 0 {
+		t.Fatalf("ListSessionPanes: %v (%d panes)", err, len(panes))
+	}
+
+	// One name from each table tmux actually uses, set through every kind of
+	// target: which table a hook lands in must not depend on what it was
+	// addressed to, or the merge would be reporting the wrong object's hooks.
+	names := []string{"alert-bell", "pane-exited", "window-renamed", "pane-focus-in"}
+	targets := []Target{s.ID, panes[0].Window, panes[0].ID}
+	for _, target := range targets {
+		for _, name := range names {
+			command := "display-message " + name
+			if err := c.SetHook(ctx, target, name, command); err != nil {
+				t.Fatalf("SetHook(%v, %q): %v", target, name, err)
+			}
+			hooks, err := c.ShowHooks(ctx, target)
+			if err != nil {
+				t.Fatalf("ShowHooks(%v): %v", target, err)
+			}
+			if hooks[name] != command {
+				t.Errorf("SetHook(%v, %q) then ShowHooks = %#v", target, name, hooks)
+			}
+			if err := c.UnsetHook(ctx, target, name); err != nil {
+				t.Fatalf("UnsetHook(%v, %q): %v", target, name, err)
+			}
+			if hooks, err = c.ShowHooks(ctx, target); err != nil {
+				t.Fatalf("ShowHooks after UnsetHook: %v", err)
+			}
+			if _, still := hooks[name]; still {
+				t.Errorf("UnsetHook(%v, %q) left the hook behind: %#v", target, name, hooks)
+			}
+		}
+	}
+
+	// And the fact the merge rests on, asked of tmux rather than assumed: a
+	// hook name belongs to exactly one option table, so nothing can collide.
+	// If a tmux ever files one name in two tables this fails here rather than
+	// silently letting one table's value win.
+	for _, name := range names {
+		if err := c.SetHook(ctx, s.ID, name, "display-message "+name); err != nil {
+			t.Fatalf("SetHook(%q): %v", name, err)
+		}
+	}
+	seen := map[string]string{}
+	for _, scope := range []string{"", "-w", "-p"} {
+		args := []string{"show-hooks"}
+		if scope != "" {
+			args = append(args, scope)
+		}
+		args = append(args, "-t", string(s.ID))
+		for _, line := range strings.Split(strings.TrimSuffix(rawTmux(t, opts, args...), "\n"), "\n") {
+			name, _, ok := strings.Cut(line, " ")
+			if !ok {
+				continue
+			}
+			name, _ = splitArrayElement(name)
+			if where, dup := seen[name]; dup {
+				t.Errorf("hook %q is in two option tables, %q and %q; the merge is ambiguous",
+					name, where, scope)
+			}
+			seen[name] = scope
+		}
+	}
+}
+
 // TestIntegrationHookRoundTrip is the hook half of the round trip: a hook set
 // through this package has to be findable under the name it was set with, and
 // the command it comes back as has to be one that can be set again.
@@ -1084,6 +1204,12 @@ func TestIntegrationHookRoundTrip(t *testing.T) {
 		// case that shows why the command must not be decoded as an option
 		// value: doing so put the raw tab back and split the argument.
 		"client-detached": "display-message \"a\tb\"",
+		// Two window-table names beside the five session ones. Every hook in
+		// this table used to be a session hook because every hook the test
+		// happened to name was, and a table of one table's names cannot see a
+		// reader that only reads that table.
+		"pane-exited":    "display-message gone",
+		"window-renamed": `display-message "renamed it"`,
 	}
 	for name, command := range commands {
 		if err := c.SetHook(ctx, s.ID, name, command); err != nil {
@@ -1563,6 +1689,69 @@ func TestIntegrationControlSpecArg(t *testing.T) {
 	if p.CurrentCommand == "" || p.Width == 0 || p.Height == 0 {
 		t.Errorf("command=%q size=%dx%d from %q; a column expanded to nothing",
 			p.CurrentCommand, p.Width, p.Height, reply.Output[0])
+	}
+}
+
+// TestIntegrationControlCarriesACarriageReturn is F3 of round eleven.
+//
+// Do refused '\r' along with the newline and the NUL, saying the command
+// "cannot be sent as written". tmux carries it: one command, one %end, three
+// bytes stored — so the control half was refusing a value the one-shot half
+// sends and reads back, on a reason that was true of the other two bytes and
+// not of this one.
+//
+// What is true of it is narrower and is about the way back: the reader strips
+// one trailing '\r' from every line as CRLF tolerance, so a '\r' that ends a
+// line is lost. Both halves are asserted here, in the four positions round ten
+// established are not interchangeable.
+func TestIntegrationControlCarriesACarriageReturn(t *testing.T) {
+	cc, c := testControl(t)
+	ctx := testCtx(t)
+
+	sessions, err := c.ListSessions(ctx)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("ListSessions: %v (%d sessions)", err, len(sessions))
+	}
+	s := sessions[0].ID
+
+	for _, want := range []string{"a\rb", "\rab", "ab\r", "\r"} {
+		t.Run(fmt.Sprintf("%q", want), func(t *testing.T) {
+			if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", want); err != nil {
+				t.Fatalf("DoArgs with a carriage return: %v", err)
+			}
+			// Read back through the one-shot half, where show-options escapes
+			// the byte on the way out and nothing strips it.
+			got, ok, err := c.ShowOption(ctx, s, ScopeSession, "@cr")
+			if err != nil || !ok {
+				t.Fatalf("ShowOption = (%q, %v, %v)", got, ok, err)
+			}
+			if got != want {
+				t.Errorf("DoArgs set %q, tmux holds %q", want, got)
+			}
+		})
+	}
+
+	// And the cost, stated as an assertion so that a tmux or a reader that
+	// stopped behaving this way is caught rather than assumed: a raw reply
+	// body line loses a trailing '\r' and keeps an interior one.
+	if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", "a\rb"); err != nil {
+		t.Fatalf("DoArgs: %v", err)
+	}
+	reply, err := cc.DoArgs(ctx, "show-options", "-t", string(s), "-v", "--", "@cr")
+	if err != nil {
+		t.Fatalf("DoArgs show-options -v: %v", err)
+	}
+	if len(reply.Output) != 1 || reply.Output[0] != "a\rb" {
+		t.Errorf("an interior carriage return did not survive the reader: %q", reply.Output)
+	}
+	if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", "ab\r"); err != nil {
+		t.Fatalf("DoArgs: %v", err)
+	}
+	if reply, err = cc.DoArgs(ctx, "show-options", "-t", string(s), "-v", "--", "@cr"); err != nil {
+		t.Fatalf("DoArgs show-options -v: %v", err)
+	}
+	if len(reply.Output) != 1 || reply.Output[0] != "ab" {
+		t.Errorf("the reader's CRLF tolerance no longer takes a trailing '\\r' off: %q", reply.Output)
 	}
 }
 
@@ -2591,6 +2780,96 @@ func TestIntegrationOptionValueRoundTrip(t *testing.T) {
 				t.Errorf("SetOption(%q) then ShowOptions = %q", want, all["@probe"])
 			}
 		})
+	}
+}
+
+// TestIntegrationOptionNameRoundTrip is F5 of round eleven: the same
+// four-position sweep, asked of a *name* rather than of a value.
+//
+// Round ten established that tmux's answer to "what do you do to this byte"
+// depends on where in the value it sits, and the sweep it added found nothing
+// left to find. Every fault the round after it turned up was in a name — and
+// no name in this package but a session name was ever swept, because the
+// question nobody had asked of one is different: not what tmux does to the
+// byte, which for a name is nothing at all, but what happens to the
+// *delimiter* the reply is parsed by when the name contains it.
+//
+// So the assertion is not that every name round-trips. It is that each one
+// either round-trips or is refused, which is the property a caller can rely
+// on: no name may be accepted and then answered with somebody else's value.
+// The shapes carry the '@' a user option needs, so they are "@a<X>b" rather
+// than the four nameRoundTripBytes produces.
+func TestIntegrationOptionNameRoundTrip(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "optnames", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// A second option that must survive whatever the swept name does to the
+	// table. The failure this catches is not only "my name came back wrong":
+	// a name carrying a space truncated to one that already existed, so an
+	// unrelated option was reported holding a value that was never set on it.
+	const bystander, bystanderValue = "@bystander", "untouched"
+	if err := c.SetOption(ctx, s.ID, bystander, bystanderValue); err != nil {
+		t.Fatalf("SetOption(%q): %v", bystander, err)
+	}
+
+	for _, b := range nameRoundTripBytes {
+		for _, shape := range []string{"@a%sb", "@%sab", "@ab%s", "@%s"} {
+			name := fmt.Sprintf(shape, b.name)
+			t.Run(fmt.Sprintf("%s %s", b.label, shape), func(t *testing.T) {
+				const value = "V"
+				err := c.SetOption(ctx, s.ID, name, value)
+				if err != nil {
+					// Refused, by this package or by tmux. Either is an
+					// answer; what is not an answer is a nil error and a
+					// value that is not the one that went in.
+					if _, _, err := c.ShowOption(ctx, s.ID, ScopeSession, name); err == nil {
+						t.Errorf("SetOption(%q) was refused but ShowOption answers for it", name)
+					}
+					return
+				}
+				t.Cleanup(func() {
+					_ = c.UnsetOption(context.Background(), s.ID, ScopeSession, name)
+				})
+
+				got, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, name)
+				if err != nil || !ok {
+					t.Fatalf("SetOption(%q) succeeded but ShowOption = (%q, %v, %v)", name, got, ok, err)
+				}
+				if got != value {
+					t.Errorf("SetOption(%q, %q) then ShowOption = %q", name, value, got)
+				}
+
+				all, err := c.ShowOptions(ctx, s.ID, ScopeSession)
+				if err != nil {
+					t.Fatalf("ShowOptions: %v", err)
+				}
+				if all[name] != value {
+					t.Errorf("SetOption(%q, %q) then ShowOptions[%q] = %q", name, value, name, all[name])
+				}
+				if all[bystander] != bystanderValue {
+					t.Errorf("setting %q changed what ShowOptions reports for %q: %q",
+						name, bystander, all[bystander])
+				}
+
+				// tmux is the arbiter of what was really stored. A name this
+				// package accepted has to be the name tmux holds, not a
+				// prefix of it. rawTmux starts its own process and so does
+				// not get the escape Client.run applies, which a name ending
+				// in ';' needs as much as any other argument does.
+				raw := rawTmux(t, opts, escapeTrailingSemicolon(
+					[]string{"show-options", "-t", string(s.ID), "-v", "--", name})...)
+				if raw != value {
+					t.Errorf("tmux holds %q for option %q, want %q", raw, name, value)
+				}
+			})
+		}
 	}
 }
 

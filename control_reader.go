@@ -35,6 +35,14 @@ func (cc *ControlClient) readLoop() {
 
 		if raw != "" {
 			line := strings.TrimSuffix(raw, "\n")
+			// CRLF tolerance, and the one place a byte is lost on the way in.
+			// tmux writes bare newlines, so this only ever fires on a '\r'
+			// that is part of a value — a reply body line, or the last field
+			// of a notification, both of which end in nothing else. A caller
+			// that needs one at the end of a value cannot have it here, and
+			// cannot have it through [splitLines] on the one-shot path
+			// either, which is why [ControlClient.Do] no longer pretends the
+			// byte cannot be sent.
 			line = strings.TrimSuffix(line, "\r")
 			if first {
 				line = strings.TrimPrefix(line, dcsEnter)

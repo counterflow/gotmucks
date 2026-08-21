@@ -17,7 +17,11 @@
 #      new-session -n is the one that does not, so the package escapes that one
 #      itself and the two paths agree.
 #   3. show-hooks prints an array index on every hook, not only on one set at
-#      an index, so the name printed is never the name that was set.
+#      an index, so the name printed is never the name that was set. And it
+#      reads one option table per invocation while set-hook writes to whichever
+#      table the hook's *name* belongs to, so "show-hooks -t" alone cannot see
+#      a hook it just watched being set: on 3.2a every pane-* and window-* name
+#      goes to the window table.
 #   4. a raw newline in a value ends the -F line, which no column ordering can
 #      recover from — only a substitution can.
 #   5. the name argument of rename-window, rename-session, new-session -s and
@@ -35,7 +39,16 @@
 # ends the command there, so an argument vector is a boundary everywhere except
 # at the last byte of an element.
 #
-# Seven things below are assertions rather than reports, and the script exits
+# And one thing that is not about a value either but about the *name* of one.
+# A reply from show-options or show-hooks is "name value" separated by a space,
+# and the name is the single field on those lines that tmux does not escape —
+# so a name containing the separator is read as a shorter name and a longer
+# value, and one containing a newline arrives as two lines of which the second
+# is an option that does not exist. That is why the package refuses those bytes
+# in a name rather than decoding them, and A9 is what says the refusal is still
+# the right shape.
+#
+# Nine things below are assertions rather than reports, and the script exits
 # non-zero if any of them stops holding, because each one is a way this package
 # would hand back a value that is not the one that went in:
 #
@@ -59,6 +72,14 @@
 #   A7  "\;" is the exact escape for a trailing ';', for every value including
 #       one that already ends in backslashes. The package applies it to every
 #       argument of every one-shot command.
+#   A8  every hook name this tmux knows is reported by exactly one of the three
+#       show-hooks scopes after being set. Exactly one, both ways: none is
+#       what ShowHooks reading a single table did to every window hook, and
+#       more than one would make merging the three ambiguous.
+#   A9  an option name comes back as itself. Every printable byte in the four
+#       positions, and the only ones that break the "name value" split are the
+#       ones checkOptionName refuses — so a tmux that started escaping a name,
+#       or one that stopped, is caught here rather than in a caller's map.
 #
 #   ./scripts/probe-roundtrip.sh [tmux-binary]
 
@@ -283,6 +304,82 @@ printf '    set [display-message "a<TAB>b"] -> [%s]\n' \
 	"$(vis "$("${T[@]}" show-hooks -t "$SESS" | head -1)")"
 "${T[@]}" set-hook -u -t "$SESS" -- alert-bell
 "${T[@]}" set-hook -gu -- session-created
+
+echo
+echo "  being a command line rather than a value is also why the trailing-';'"
+echo "  escape does not reach a hook body: the byte arrives intact and"
+echo "  set-hook's own parser then reads it as the command separator. And the"
+echo "  body is lexed when the hook is SET, so a '~' in double quotes is"
+echo "  expanded then rather than when it fires."
+for body in 'display-message hi;' 'display-message hi ;' 'display-message "~/bin"' "display-message '~/bin'"; do
+	"${T[@]}" set-hook -t "$SESS" -- alert-bell "$(argesc "$body")"
+	printf '    set [%-28s] -> [%s]\n' "$(vis "$body")" \
+		"$(vis "$("${T[@]}" show-hooks -t "$SESS" | head -1)")"
+done
+"${T[@]}" set-hook -u -t "$SESS" -- alert-bell
+
+echo
+echo "  which option table does each hook name land in? (A8)"
+echo "  set-hook writes to the table the NAME belongs to, whatever target it"
+echo "  is given, and show-hooks reads one table per invocation — so reading"
+echo "  only the session table reported nothing for every window hook, however"
+echo "  successfully it had been set. The names come from tmux itself: the"
+echo "  global tables print every hook this binary knows."
+hook_names() {
+	{
+		"${T[@]}" show-hooks -g 2>/dev/null
+		"${T[@]}" show-hooks -g -w 2>/dev/null
+		"${T[@]}" show-hooks -g -p 2>/dev/null
+	} | sed 's/ .*//; s/\[[0-9]*\]$//' | sort -u
+}
+NAMES=$(hook_names)
+printf '  %d hook names, in tables:\n' "$(printf '%s\n' "$NAMES" | wc -l)"
+SESSION_HOOKS=0
+WINDOW_HOOKS=0
+PANE_HOOKS=0
+for h in $NAMES; do
+	[ -n "$h" ] || continue
+	if ! "${T[@]}" set-hook -t "$SESS" -- "$h" 'display-message probe' 2>/dev/null; then
+		fail A8 "set-hook refused [$h], which this tmux printed as a hook name"
+		continue
+	fi
+	where=""
+	count=0
+	for scope in "" "-w" "-p"; do
+		# shellcheck disable=SC2086
+		if "${T[@]}" show-hooks $scope -t "$SESS" 2>/dev/null | grep -q "^$h\["; then
+			where="$where ${scope:--t}"
+			count=$((count + 1))
+		fi
+	done
+	case "$count" in
+	0) fail A8 "hook [$h] was set and no show-hooks scope reports it; ShowHooks would lose it" ;;
+	1) : ;;
+	*) fail A8 "hook [$h] is reported by more than one scope ($where); merging the three is ambiguous" ;;
+	esac
+	case "$where" in
+	*' -t'*) SESSION_HOOKS=$((SESSION_HOOKS + 1)) ;;
+	*' -w'*) WINDOW_HOOKS=$((WINDOW_HOOKS + 1)) ;;
+	*' -p'*) PANE_HOOKS=$((PANE_HOOKS + 1)) ;;
+	esac
+	"${T[@]}" set-hook -u -t "$SESS" -- "$h" 2>/dev/null
+done
+printf '    session table %d   window table %d   pane table %d\n' \
+	"$SESSION_HOOKS" "$WINDOW_HOOKS" "$PANE_HOOKS"
+[ "$WINDOW_HOOKS" -gt 0 ] ||
+	echo "    (no window hooks on this tmux; the -w scope costs a process and finds nothing)"
+
+echo
+echo "  a hook set to an empty command is printed exactly as an unset one is,"
+echo "  which is why the package refuses one — a bare name can then only mean"
+echo "  'not set', and that is what makes the global tables readable at all:"
+"${T[@]}" set-hook -t "$SESS" -- alert-bell '' 2>/dev/null
+printf '    set-hook alert-bell ""  -> [%s]\n' "$("${T[@]}" show-hooks -t "$SESS" | head -1)"
+"${T[@]}" set-hook -u -t "$SESS" -- alert-bell 2>/dev/null
+printf '    show-hooks -g   prints %s names, %s of them set\n' \
+	"$("${T[@]}" show-hooks -g | wc -l)" "$("${T[@]}" show-hooks -g | grep -c ' ')"
+printf '    show-hooks -g -w prints %s names, %s of them set\n' \
+	"$("${T[@]}" show-hooks -g -w | wc -l)" "$("${T[@]}" show-hooks -g -w | grep -c ' ')"
 
 # ---------------------------------------------------------------------------
 echo
@@ -552,6 +649,66 @@ printf '    DoArgs-style quoting -> [%s]\n' \
 [ "$("${T[@]}" show-options -t "$SESS" -v -- @ctl)" = 'a;' ] ||
 	fail A7 "a quoted ';' no longer survives the control-mode lexer; DoArgs would need the escape too"
 "${T[@]}" set-option -t "$SESS" -u -- @ctl
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 9. the same sweep asked of a NAME rather than a value (A9) ---"
+echo "  everything above asks what tmux does to a byte in a value. The twin"
+echo "  question is what happens to the DELIMITER a reply is parsed by when"
+echo "  the name contains it: show-options prints 'name value', escapes the"
+echo "  value and prints the name raw, and a user option's name is whatever"
+echo "  the caller passed. So the question is not what tmux stores but where"
+echo "  the first space in the printed line falls."
+
+NAMEBAD=()
+for code in $(seq 32 126); do
+	byte=$(printf "\\$(printf '%03o' "$code")")
+	for name in "@a${byte}b" "@${byte}ab" "@ab${byte}" "@${byte}"; do
+		"${T[@]}" set-option -t "$SESS" -- "$(argesc "$name")" V 2>/dev/null || continue
+		line=$("${T[@]}" show-options -t "$SESS" -- "$(argesc "$name")" 2>/dev/null)
+		"${T[@]}" set-option -t "$SESS" -u -- "$(argesc "$name")" 2>/dev/null
+		# The parse both readers do: everything up to the first space is the
+		# name. Anything else means the caller's name is not the map's key.
+		[ "${line%% *}" = "$name" ] && [ "${line#* }" = "V" ] && continue
+		printf '  byte %3d %-6s name [%s] printed [%s]\n' \
+			"$code" "$(vis "$byte")" "$(vis "$name")" "$(vis "$line")"
+		NAMEBAD+=("$name")
+	done
+done
+
+echo
+echo "  names the split cannot recover, which must be exactly the ones"
+echo "  checkOptionName refuses — a byte at or below space:"
+for n in "${NAMEBAD[@]-}"; do
+	[ -n "$n" ] || continue
+	printf '    [%s]\n' "$(vis "$n")"
+	case "$n" in
+	*' '*) : ;; # the space, which the package refuses
+	*) fail A9 "option name [$(vis "$n")] is not read back as itself and contains no byte checkOptionName refuses" ;;
+	esac
+done
+
+echo
+echo "  and the newline, which is not a split but a second line — the"
+echo "  remainder becomes a row of show-options output that was never an"
+echo "  option, keyed as the caller chose:"
+"${T[@]}" set-option -t "$SESS" -- "@nl${NL}injected value" V 2>/dev/null
+"${T[@]}" show-options -t "$SESS" | grep -n 'injected\|^@nl' | sed 's/^/    | /'
+lines=$("${T[@]}" show-options -t "$SESS" | grep -c 'injected')
+[ "$lines" -ge 1 ] ||
+	echo "    (this tmux no longer prints an option name raw; the refusal could be narrowed)"
+"${T[@]}" set-option -t "$SESS" -u -- "@nl${NL}injected value" 2>/dev/null
+
+echo
+echo "  a hook name is the same field on the same kind of line, and tmux"
+echo "  refuses most of them itself because the name has to be one it knows:"
+"${T[@]}" set-hook -t "$SESS" -- 'alert-bell x' 'display-message x' 2>&1 | sed 's/^/    /'
+echo "  the exception is a '@' name, which it files as a user option and never"
+echo "  fires — nothing reads it back as a hook:"
+"${T[@]}" set-hook -t "$SESS" -- '@nothook' 'display-message x' 2>/dev/null
+printf '    show-hooks   -> [%s]\n' "$("${T[@]}" show-hooks -t "$SESS" | tr '\n' '|')"
+printf '    show-options -> [%s]\n' "$("${T[@]}" show-options -t "$SESS" -- '@nothook')"
+"${T[@]}" set-option -t "$SESS" -u -- '@nothook' 2>/dev/null
 
 echo
 if [ "$FAIL" -ne 0 ]; then

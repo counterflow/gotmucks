@@ -580,7 +580,18 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 	// string, so the command runs truncated at the NUL and reports success —
 	// verified on 3.2a, where rename-session with a NUL in the new name
 	// renamed the session to the part before it.
-	if i := strings.IndexAny(cmd, "\n\r\x00"); i >= 0 {
+	//
+	// A carriage return is not in that set and used to be. It is carried
+	// intact: measured on 3.2a down a raw pipe, "set-option -- @cr 'a<CR>b'"
+	// is one command answered with %end and stores the three bytes, which is
+	// also what the one-shot half does with the same value. Refusing it here
+	// made the two halves disagree about what a value is, on a claim — that it
+	// could not be sent — that was not true of it. What is true is narrower and
+	// is about the way back rather than the way out: [ControlClient.readLoop]
+	// strips one trailing '\r' from every line as CRLF tolerance, exactly as
+	// [splitLines] does on the one-shot path, so a '\r' that ends a line coming
+	// back is lost on both.
+	if i := strings.IndexAny(cmd, "\n\x00"); i >= 0 {
 		return Reply{}, fmt.Errorf(
 			"gotmucks: control command contains %q at byte %d and cannot be sent as written",
 			cmd[i:i+1], i)

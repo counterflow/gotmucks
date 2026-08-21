@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1160,7 +1161,7 @@ func TestDoRejectsUnsendableCommands(t *testing.T) {
 	// command comes next. A brace block is that same defect in tmux's other
 	// quoting form — see scripts/probe-blocks.sh.
 	cmds := []string{
-		"", "   ", "a\nb", "a\rb", "a\x00b",
+		"", "   ", "a\nb", "a\x00b",
 		"list-sessions ; list-sessions",
 		`if-shell "true" { list-sessions }`,
 		`if-shell "true" {list-sessions}`,
@@ -1178,6 +1179,62 @@ func TestDoRejectsUnsendableCommands(t *testing.T) {
 	case line := <-c.sent.lines:
 		t.Errorf("a rejected command was written anyway: %q", line)
 	default:
+	}
+}
+
+// TestDoSendsACarriageReturn is the byte that used to be in the table above
+// and should not have been.
+//
+// The refusal claimed it "cannot be sent as written". It can: measured on
+// 3.2a down a raw pipe, "set-option -- @cr 'a<CR>b'" is one command answered
+// with %end, and the option holds the three bytes. Refusing it made
+// [ControlClient] disagree with [Client], which sends and reads the same value
+// back, over a claim that was not true of the byte.
+func TestDoSendsACarriageReturn(t *testing.T) {
+	c := newCtl(t)
+
+	const cmd = "set-option -- @cr 'a\rb'"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := c.cc.Do(context.Background(), cmd); err != nil {
+			t.Errorf("Do with a carriage return: %v", err)
+		}
+	}()
+
+	if got := c.serveOne(1); got != cmd {
+		t.Errorf("wrote %q, want %q — the byte must reach tmux unaltered", got, cmd)
+	}
+	<-done
+}
+
+// TestReaderStripsOneTrailingCarriageReturn pins what the relaxation above
+// costs, which is the narrower fact the refusal should have been stating.
+//
+// The reader takes one trailing '\r' off every line as CRLF tolerance, so a
+// '\r' at the end of a reply body line — or of a notification's last field,
+// which is delimited by nothing — does not come back. A '\r' anywhere else in
+// the line does. [splitLines] does exactly the same on the one-shot path, so
+// the two halves agree about this too.
+func TestReaderStripsOneTrailingCarriageReturn(t *testing.T) {
+	c := newCtl(t)
+
+	done := make(chan Reply)
+	go func() {
+		r, err := c.cc.Do(context.Background(), "capture-pane -p")
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		done <- r
+	}()
+
+	c.nextCommand()
+	c.reply(1, "a\rb", "trailing\r", "two\r\r")
+
+	r := <-done
+	want := []string{"a\rb", "trailing", "two\r"}
+	if !reflect.DeepEqual(r.Output, want) {
+		t.Errorf("reply body = %q, want %q", r.Output, want)
 	}
 }
 

@@ -79,6 +79,74 @@ func targetArgs(t Target) []string {
 	return []string{"-t", arg}
 }
 
+// checkOptionName refuses a name that show-options could not print back
+// unambiguously.
+//
+// show-options prints "name value" and both readers here split at the first
+// space, because a space is the only thing between the two fields. tmux
+// escapes the value — which is the whole reason [unquoteOptionValue],
+// [unprefixOptionValue] and [visDecode] exist — and prints the name exactly as
+// it was stored, raw. A user option's name is whatever the caller passed:
+// tmux validates only the leading '@', so a space or a newline in one reaches
+// the wire and comes back as a field boundary. Measured on 3.2a, with both
+// options set through this package:
+//
+//	SetOption(t, "@a", "first")     // tmux prints: @a first
+//	SetOption(t, "@a b", "second")  // tmux prints: @a b second
+//
+//	ShowOption("@a")   = ("first", true, nil)      // right by luck: @a is printed first
+//	ShowOption("@a b") = ("b second", true, nil)   // the tail of the name, glued to the value
+//	ShowOptions()      = {"@a": "b second"}        // @a's own value is gone
+//
+// The write half is correct throughout — the name travels in an argv element,
+// so set-option and set-option -u reach exactly the option asked for — which
+// is what makes the reader the place to stop it.
+//
+// A newline is the same fault with a second half, because the name ends the
+// line: "@a\nb" prints as two lines, so [Client.ShowOptions] reports a flag
+// option "@a" that is set to nothing and an option "b" that does not exist,
+// both keyed by whatever the caller chose. tmux prints user options before the
+// rest, so an invented line loses to the real one for any option that is set
+// in the same table and wins for every option that is not — which at session
+// scope is most of them, since most are inherited and never printed.
+//
+// So the check is on both halves rather than only on the writers. Refusing in
+// [Client.ShowOption] is not symmetry for its own sake: it cannot answer for
+// such a name and today it answers wrongly instead. The one thing it cannot
+// reach is a name another program set — "@a b V" is genuinely ambiguous on the
+// wire, and [Client.ShowOptions] says so rather than guessing.
+//
+// The set is every byte at or below space: the space that separates the two
+// fields and the newline that ends the line, plus the rest of the control
+// bytes, which tmux prints raw as well. A tab survives today, because the
+// split is on a space alone — but that is tmux's choice about how it prints a
+// line rather than a promise about what a name may hold, and it is the same
+// choice this whole check exists because of. Refusing the run is the cheaper
+// thing to be right about.
+//
+// A byte above space is safe, including the one that looks least so: '@a[1]'
+// is refused by tmux itself ("not an array"), so [splitArrayElement] cannot be
+// tricked from here. Measured across all ninety-five printable bytes in four
+// positions — assertion A9 in scripts/probe-roundtrip.sh, and
+// TestIntegrationOptionNameRoundTrip — where the space is the only one that
+// fails.
+func checkOptionName(name string) error {
+	if name == "" {
+		return errors.New("gotmucks: empty option name")
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c <= ' ' {
+			return fmt.Errorf(
+				"gotmucks: option name %q has %q at byte %d: show-options prints "+
+					"\"name value\" and escapes only the value, so a name containing a "+
+					"space or a control byte cannot be read back — the space would be "+
+					"taken for the separator and a newline would end the line",
+				name, string(c), i)
+		}
+	}
+	return nil
+}
+
 // SetOption sets a session option on a target.
 //
 // For options that live in another table — a window option such as
@@ -88,9 +156,13 @@ func (c *Client) SetOption(ctx context.Context, t Target, name, value string) er
 }
 
 // SetOptionScoped sets an option in a named scope.
+//
+// The name is checked by [checkOptionName]: tmux would store one containing a
+// space perfectly well, and neither reader here could tell it from a name and
+// a value.
 func (c *Client) SetOptionScoped(ctx context.Context, t Target, scope OptionScope, name, value string) error {
-	if name == "" {
-		return errors.New("gotmucks: empty option name")
+	if err := checkOptionName(name); err != nil {
+		return err
 	}
 	if err := checkTarget(t); err != nil {
 		return err
@@ -105,8 +177,8 @@ func (c *Client) SetOptionScoped(ctx context.Context, t Target, scope OptionScop
 // UnsetOption removes an option, restoring the inherited value. This is
 // tmux's set-option -u.
 func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, name string) error {
-	if name == "" {
-		return errors.New("gotmucks: empty option name")
+	if err := checkOptionName(name); err != nil {
+		return err
 	}
 	if err := checkTarget(t); err != nil {
 		return err
@@ -137,9 +209,14 @@ func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, n
 // an error here rather than a quiet answer of its first element. Read one with
 // [Client.ShowOptions], which reports every element under its own indexed
 // name.
+//
+// A name containing a space or a control byte is refused rather than answered:
+// tmux prints the name back unescaped and this splits at the first space, so
+// such a name is indistinguishable from a shorter name and a longer value. See
+// [checkOptionName].
 func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, name string) (string, bool, error) {
-	if name == "" {
-		return "", false, errors.New("gotmucks: empty option name")
+	if err := checkOptionName(name); err != nil {
+		return "", false, err
 	}
 	if err := checkTarget(t); err != nil {
 		return "", false, err
@@ -238,6 +315,14 @@ func isUnknownOptionStderr(stderr string) bool {
 // printed: "status-format[0]", "status-format[1]". That is what makes this the
 // call for reading one — [Client.ShowOption] refuses an array rather than
 // answering with its first element.
+//
+// The name is the one field on a line that tmux does not escape, and a space
+// is all that separates it from the value, so a user option another program
+// set with a space in its name is read wrong here and cannot be read any other
+// way: "@a b V" is a name of "@a b" and a value of "V", or a name of "@a" and
+// a value of "b V", and nothing on the wire says which. This package's own
+// writers cannot create one — [checkOptionName] refuses the byte — so the
+// ambiguity is reachable only from outside.
 func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (map[string]string, error) {
 	if err := checkTarget(t); err != nil {
 		return nil, err

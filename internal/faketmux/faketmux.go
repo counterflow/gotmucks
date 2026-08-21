@@ -24,6 +24,20 @@ type Response struct {
 	Exit   int    `json:"exit"`
 }
 
+// Match scripts a reply for an invocation by more than its subcommand.
+//
+// It exists because one subcommand can be asked several different questions in
+// one call: show-hooks reads a different option table for each of "-w" and
+// "-p", so a package call that merges the three cannot be tested by a fake
+// that answers the same bytes to all of them.
+type Match struct {
+	// Args must all appear as elements of the argument vector. Order and
+	// position do not matter, so extra global flags do not defeat a match.
+	Args []string `json:"args"`
+	// Response is what the fake writes when they do.
+	Response Response `json:"response"`
+}
+
 // Script configures the fake. Tests write one to a file and point the fake at
 // it with the FAKETMUX_SCRIPT environment variable.
 type Script struct {
@@ -33,6 +47,12 @@ type Script struct {
 	// NoServer makes every command fail the way tmux does when there is no
 	// server on the socket. It takes precedence over Responses.
 	NoServer bool `json:"no_server"`
+
+	// Matches are consulted before Responses. The entry with the most Args
+	// wins, so {"show-hooks"} and {"show-hooks", "-w"} can both be scripted
+	// and the more specific one answers the invocation that carries the flag.
+	// Ties go to the earlier entry.
+	Matches []Match `json:"matches"`
 
 	// Responses maps a tmux subcommand to its reply.
 	Responses map[string]Response `json:"responses"`
@@ -93,7 +113,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	resp, ok := script.Responses[sub]
+	resp, ok := bestMatch(script.Matches, args)
+	if !ok {
+		resp, ok = script.Responses[sub]
+	}
 	if !ok {
 		if script.Default == nil {
 			return 0
@@ -108,6 +131,36 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		io.WriteString(stderr, resp.Stderr)
 	}
 	return resp.Exit
+}
+
+// bestMatch picks the most specific [Match] for an invocation: the one
+// requiring the most arguments, all of which are present.
+func bestMatch(matches []Match, args []string) (Response, bool) {
+	present := make(map[string]bool, len(args))
+	for _, a := range args {
+		present[a] = true
+	}
+
+	best := -1
+	for i, m := range matches {
+		if best >= 0 && len(m.Args) <= len(matches[best].Args) {
+			continue
+		}
+		all := true
+		for _, want := range m.Args {
+			if !present[want] {
+				all = false
+				break
+			}
+		}
+		if all {
+			best = i
+		}
+	}
+	if best < 0 {
+		return Response{}, false
+	}
+	return matches[best].Response, true
 }
 
 func loadScript(path string) (Script, error) {

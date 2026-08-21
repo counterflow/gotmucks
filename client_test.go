@@ -644,21 +644,36 @@ func TestTrailingSemicolonIsEscapedOnTheArgv(t *testing.T) {
 	g.wantArgv(0, "-L", "sock;", "rename-window", "-t", "@1", "--", "plain")
 }
 
+// hookScopeScript scripts a show-hooks reply per option table.
+//
+// Which table a hook is in is not decoration: a fixture that puts every name
+// in one reply is asserting the parser against its own spelling rather than
+// against tmux. On 3.2a alert-bell and client-attached are session hooks and
+// pane-exited is a window hook, and no invocation ever sees all three.
+func hookScopeScript(session, window, pane string) faketmux.Script {
+	return faketmux.Script{
+		Matches: []faketmux.Match{
+			{Args: []string{"show-hooks", "-w"}, Response: faketmux.Response{Stdout: window}},
+			{Args: []string{"show-hooks", "-p"}, Response: faketmux.Response{Stdout: pane}},
+			{Args: []string{"show-hooks"}, Response: faketmux.Response{Stdout: session}},
+		},
+	}
+}
+
 // TestShowHooksStripsTheArrayIndex pins the key of the map ShowHooks returns.
 //
 // tmux 3.2a prints an index on every hook, not only on one set at an index, so
 // the name a hook was set under was never the name it could be found under and
 // the obvious use of the call — look up the hook you just set — returned the
 // zero value with no way to tell that from "no such hook". The lines here are
-// 3.2a's own output.
+// 3.2a's own output, each in the table 3.2a puts it in.
 func TestShowHooksStripsTheArrayIndex(t *testing.T) {
-	f := newFake(t, faketmux.Script{
-		Responses: map[string]faketmux.Response{
-			"show-hooks": {Stdout: "alert-bell[0] display-message hi\n" +
-				"pane-exited[0] run-shell \"echo gone\"\n" +
-				"client-attached[0] display-message \"a;b\"\n"},
-		},
-	})
+	f := newFake(t, hookScopeScript(
+		"alert-bell[0] display-message hi\n"+
+			"client-attached[0] display-message \"a;b\"\n",
+		"pane-exited[0] run-shell \"echo gone\"\n",
+		"",
+	))
 
 	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
 	if err != nil {
@@ -674,19 +689,71 @@ func TestShowHooksStripsTheArrayIndex(t *testing.T) {
 	}
 }
 
+// TestShowHooksReadsEveryOptionTable is F2 of round eleven at the argv layer.
+//
+// SetHook cannot choose the table a hook lands in — tmux picks by the name —
+// so a reader that asks only the session table cannot see a window hook,
+// however successfully it was set. On 3.2a that is every pane-* and window-*
+// name, which is most of the hooks a program installs, and the call reported
+// an empty map for them with a nil error.
+func TestShowHooksReadsEveryOptionTable(t *testing.T) {
+	f := newFake(t, hookScopeScript("", "window-renamed[0] display-message renamed\n", ""))
+
+	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
+	if err != nil {
+		t.Fatalf("ShowHooks: %v", err)
+	}
+	if hooks["window-renamed"] != "display-message renamed" {
+		t.Errorf("a window-table hook is missing from ShowHooks: %#v", hooks)
+	}
+	f.wantArgv(0, "show-hooks", "-t", "$0")
+	f.wantArgv(1, "show-hooks", "-w", "-t", "$0")
+	f.wantArgv(2, "show-hooks", "-p", "-t", "$0")
+}
+
+// TestShowGlobalHooksReadsEveryOptionTable is the same for the global tables,
+// and pins the other half: tmux prints every hook name it knows at global
+// scope, with no command against the ones nobody has set. Those are not hooks
+// and are not reported.
+func TestShowGlobalHooksReadsEveryOptionTable(t *testing.T) {
+	f := newFake(t, faketmux.Script{
+		Matches: []faketmux.Match{
+			{Args: []string{"show-hooks", "-g", "-w"}, Response: faketmux.Response{
+				Stdout: "pane-died\npane-exited[0] display-message gone\nwindow-renamed\n"}},
+			{Args: []string{"show-hooks", "-g", "-p"}, Response: faketmux.Response{}},
+			{Args: []string{"show-hooks", "-g"}, Response: faketmux.Response{
+				Stdout: "after-bind-key\nalert-bell[0] display-message bell\nsession-created\n"}},
+		},
+	})
+
+	hooks, err := f.client().ShowGlobalHooks(context.Background())
+	if err != nil {
+		t.Fatalf("ShowGlobalHooks: %v", err)
+	}
+	want := map[string]string{
+		"alert-bell":  "display-message bell",
+		"pane-exited": "display-message gone",
+	}
+	if !reflect.DeepEqual(hooks, want) {
+		t.Errorf("ShowGlobalHooks() = %#v, want %#v", hooks, want)
+	}
+	f.wantArgv(0, "show-hooks", "-g")
+	f.wantArgv(1, "show-hooks", "-g", "-w")
+	f.wantArgv(2, "show-hooks", "-g", "-p")
+}
+
 // TestShowHooksKeepsTheIndexWhenAHookHasSeveral is the other half: a map
 // cannot hold two commands under one name, so a hook with more than one
 // element keeps the bracketed names rather than losing all but one of them.
 // tmux's set-hook -a and an explicit index are what produce this; SetHook
 // always writes element zero.
 func TestShowHooksKeepsTheIndexWhenAHookHasSeveral(t *testing.T) {
-	f := newFake(t, faketmux.Script{
-		Responses: map[string]faketmux.Response{
-			"show-hooks": {Stdout: "alert-bell[0] display-message one\n" +
-				"alert-bell[1] display-message two\n" +
-				"pane-exited[0] display-message solo\n"},
-		},
-	})
+	f := newFake(t, hookScopeScript(
+		"alert-bell[0] display-message one\n"+
+			"alert-bell[1] display-message two\n",
+		"pane-exited[0] display-message solo\n",
+		"",
+	))
 
 	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
 	if err != nil {
@@ -711,11 +778,7 @@ func TestShowHooksKeepsTheIndexWhenAHookHasSeveral(t *testing.T) {
 // the command is set.
 func TestShowHooksDoesNotDecodeTheCommand(t *testing.T) {
 	const command = `display-message a\tb`
-	f := newFake(t, faketmux.Script{
-		Responses: map[string]faketmux.Response{
-			"show-hooks": {Stdout: "alert-bell[0] " + command + "\n"},
-		},
-	})
+	f := newFake(t, hookScopeScript("alert-bell[0] "+command+"\n", "", ""))
 
 	hooks, err := f.client().ShowHooks(context.Background(), SessionID("$0"))
 	if err != nil {
@@ -1013,6 +1076,109 @@ func TestShowOptions(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("option %q = %q, want %q", k, got[k], v)
 		}
+	}
+}
+
+// TestOptionNameWithASpaceIsRefused is F1 of round eleven at the unit layer.
+//
+// tmux stores an option name containing a space perfectly well and prints it
+// back unescaped, so "@a b second" is a name of "@a b" and a value of "second"
+// or a name of "@a" and a value of "b second", and both readers here took the
+// second reading. ShowOption returned the tail of the name glued to the value
+// and ShowOptions keyed the entry under a truncation, overwriting whatever
+// really was called "@a". Both with a nil error.
+//
+// A newline is the same fault with a second half: the name ends the line, so
+// the rest of it becomes a row of show-options output that was never an
+// option, keyed as the caller chose.
+func TestOptionNameWithASpaceIsRefused(t *testing.T) {
+	ctx := context.Background()
+	names := []string{"@a b", "@a\nb", "@a\tb", "@a\x00b", " @a", "@a ", " ", ""}
+
+	calls := []struct {
+		name string
+		run  func(*Client, string) error
+	}{
+		{"SetOption", func(c *Client, n string) error {
+			return c.SetOption(ctx, SessionID("$0"), n, "V")
+		}},
+		{"SetOptionScoped", func(c *Client, n string) error {
+			return c.SetOptionScoped(ctx, SessionID("$0"), ScopeWindow, n, "V")
+		}},
+		{"UnsetOption", func(c *Client, n string) error {
+			return c.UnsetOption(ctx, SessionID("$0"), ScopeSession, n)
+		}},
+		{"ShowOption", func(c *Client, n string) error {
+			_, _, err := c.ShowOption(ctx, SessionID("$0"), ScopeSession, n)
+			return err
+		}},
+	}
+
+	for _, call := range calls {
+		t.Run(call.name, func(t *testing.T) {
+			for _, n := range names {
+				f := newFake(t, faketmux.Script{})
+				if err := call.run(f.client(), n); err == nil {
+					t.Errorf("%s(%q) was accepted", call.name, n)
+					continue
+				}
+				// Refusing after the command has run would be no refusal at
+				// all: the option would be set and only the report withheld.
+				if argv := f.argv(); len(argv) != 0 {
+					t.Errorf("%s(%q) reached tmux anyway: %q", call.name, n, argv)
+				}
+			}
+		})
+	}
+
+	// The names that must still work, including the one byte the split does
+	// not care about but that a bracket could be confused with.
+	for _, n := range []string{"@a", "status-left", "@a[x]", "@a-b", "@a#b"} {
+		f := newFake(t, faketmux.Script{})
+		if err := f.client().SetOption(ctx, SessionID("$0"), n, "V"); err != nil {
+			t.Errorf("SetOption(%q) was refused: %v", n, err)
+		}
+	}
+}
+
+// TestHookNameAndCommandChecks is the hook half.
+//
+// tmux refuses most bad hook names itself, since the name has to be one it
+// knows, and accepts exactly one shape that nothing can read back: a '@' name,
+// which it files as a user option and never fires. An empty command is the
+// other unreadable case — tmux prints such a hook as the bare name, which is
+// byte for byte how it prints one that was never set.
+func TestHookNameAndCommandChecks(t *testing.T) {
+	ctx := context.Background()
+
+	for _, name := range []string{"", "alert-bell x", "alert-bell\nx", " "} {
+		f := newFake(t, faketmux.Script{})
+		if err := f.client().SetHook(ctx, SessionID("$0"), name, "display-message x"); err == nil {
+			t.Errorf("SetHook(%q) was accepted", name)
+		}
+		if err := f.client().SetGlobalHook(ctx, name, "display-message x"); err == nil {
+			t.Errorf("SetGlobalHook(%q) was accepted", name)
+		}
+		if err := f.client().UnsetHook(ctx, SessionID("$0"), name); err == nil {
+			t.Errorf("UnsetHook(%q) was accepted", name)
+		}
+		if err := f.client().UnsetGlobalHook(ctx, name); err == nil {
+			t.Errorf("UnsetGlobalHook(%q) was accepted", name)
+		}
+		if argv := f.argv(); len(argv) != 0 {
+			t.Errorf("a refused hook name reached tmux: %q", argv)
+		}
+	}
+
+	f := newFake(t, faketmux.Script{})
+	if err := f.client().SetHook(ctx, SessionID("$0"), "alert-bell", ""); err == nil {
+		t.Error("SetHook with an empty command was accepted")
+	}
+	if err := f.client().SetGlobalHook(ctx, "alert-bell", ""); err == nil {
+		t.Error("SetGlobalHook with an empty command was accepted")
+	}
+	if argv := f.argv(); len(argv) != 0 {
+		t.Errorf("a refused hook command reached tmux: %q", argv)
 	}
 }
 

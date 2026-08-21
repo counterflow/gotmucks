@@ -106,6 +106,32 @@
 // tmux stores the semicolon, so the vector really is a boundary. A control
 // connection quotes its arguments instead and never needed it.
 //
+// The boundary reaches as far as tmux's argv parser and no further. An
+// argument tmux parses a *second* time is a command line in its own right, and
+// the only one of those here is [Client.SetHook]'s command: the escape hands
+// set-hook the ';' intact and set-hook then reads it as the separator it is,
+// so a hook body still cannot end in one. That argument is also lexed when the
+// hook is set rather than when it fires, so a '~' or a '$HOME' in double
+// quotes is expanded at that moment.
+//
+// # Option and hook names
+//
+// A name on the way *out* is the other half. show-options and show-hooks print
+// "name value" separated by a space, escape the value and print the name
+// exactly as it was stored — and a user option's name is whatever the caller
+// passed, since tmux validates only the leading '@'. So a name containing a
+// space comes back indistinguishable from a shorter name and a longer value,
+// and one containing a newline arrives as two lines of which the second is an
+// option nobody set. [Client.SetOption], [Client.UnsetOption],
+// [Client.ShowOption] and the hook calls refuse those bytes rather than answer
+// wrongly; [Client.ShowOptions] can only report what another program left,
+// and says so.
+//
+// Which of tmux's option tables a hook lands in follows the hook's *name*, not
+// the target it is set on: on 3.2a every pane-* and window-* name is a window
+// hook wherever it is addressed. [Client.ShowHooks] reads all three tables for
+// that reason, since [Client.SetHook] has no say in which one is used.
+//
 // [Row] is the raw view and decodes nothing: it is what tmux wrote.
 //
 // # No server running
