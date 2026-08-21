@@ -40,7 +40,9 @@ func (c *Client) SocketArgs() []string { return c.cfg.globalArgs() }
 //
 // It is the only place in the package that starts a subprocess. Arguments are
 // passed as an argv, never through a shell, so no quoting or escaping of
-// caller-supplied values is required or performed.
+// caller-supplied values is required — with the single exception
+// [escapeTrailingSemicolon] covers, which is tmux's own argv parser rather
+// than a shell.
 //
 // A non-zero exit yields an [*ExitError]. Two exit conditions are classified
 // further and wrap a sentinel so callers can test them with errors.Is: a
@@ -48,7 +50,7 @@ func (c *Client) SocketArgs() []string { return c.cfg.globalArgs() }
 // [ErrNoSession], [ErrNoWindow] or [ErrNoPane] according to what tmux said it
 // could not find.
 func (c *Client) run(ctx context.Context, args ...string) (stdout, stderr []byte, err error) {
-	full, tmuxArgs := c.cfg.argv(args)
+	full, tmuxArgs := c.cfg.argv(escapeTrailingSemicolon(args))
 
 	cmd := exec.CommandContext(ctx, c.cfg.binary, full...)
 	cmd.Env = c.cfg.environ()
@@ -108,6 +110,62 @@ func (c *Client) runLines(ctx context.Context, args ...string) ([]string, error)
 		return nil, err
 	}
 	return splitLines(out), nil
+}
+
+// escapeTrailingSemicolon disarms the one byte that crosses out of an argv
+// element.
+//
+// "Commands are argument vectors, never a shell string" is true of this
+// package and not quite true of tmux: cmd_parse_from_arguments takes a
+// trailing ';' off an element and ends the command there. So an element that
+// is exactly ";" vanishes, and everything after it becomes a second command
+// whose name is the next whole element. Measured on 3.2a through this
+// package's own calls: RenameWindow("a;") named the window "a";
+// SetOption(status, ";") turned the option *on*, because tmux read a
+// set-option with no value at all as setting a flag; SendText(p, "echo one;")
+// typed "echo one"; and NewSession failed with "unknown command: -n", naming a
+// flag the caller never passed. Every one of the first three had a nil error.
+// Only a byte-final ';' does it — "a;b" and "a; " are untouched.
+//
+// tmux's own escape is "\;". Its parser strips the final ';' and then rewrites
+// a backslash that has become last as a literal one, so inserting a single
+// backslash is exact for every string, a run of backslashes included:
+// "a\;" goes out as "a\\;" and is stored as "a\;". Verified byte for byte on
+// 3.2a, which is the only way this could be got right — the rule reads as
+// though it should need the backslashes doubled, and it does not.
+//
+// It belongs here, at the one place a process is started, rather than at each
+// call site: it is a property of tmux's argv parser and not of any one
+// command, so it applies to a name, an option value, a hook body and a format
+// alike, and a guarantee spread across call sites is one that quietly stops
+// holding. It is applied to the command arguments only — the socket flags are
+// read by getopt before the command parser runs, so a socket named "a;" must
+// go through untouched.
+//
+// The control path must not have this. [quoteArg] does not list ';' as safe,
+// so [ControlClient.DoArgs] quotes the argument and tmux's control-mode lexer
+// takes the byte as data; escaping it as well would store the backslash. The
+// one argv this package builds that does not come through here is
+// [WithControlArgs], which starts its own process and is documented as passing
+// what it is given to tmux as written — a caller's own command line, where
+// writing "\;" is the caller's to do.
+func escapeTrailingSemicolon(args []string) []string {
+	var out []string
+	for i, a := range args {
+		if !strings.HasSuffix(a, ";") {
+			continue
+		}
+		if out == nil {
+			// Copied rather than edited in place: the caller's slice is its
+			// own, and most commands never reach this at all.
+			out = append(out, args...)
+		}
+		out[i] = a[:len(a)-1] + `\;`
+	}
+	if out == nil {
+		return args
+	}
+	return out
 }
 
 func exitCode(err error) int {

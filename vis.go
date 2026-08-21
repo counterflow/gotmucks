@@ -14,9 +14,18 @@ import "strings"
 // bare '$' is a variable. Below space it is vis(3)'s C style — "\a" "\b" "\t"
 // "\n" "\v" "\f" "\r" — and three octal digits for the rest.
 //
-// The probe's last "must be empty" diff is the assertion that keeps this
-// honest: a byte a tmux escapes that [visDecode] does not undo is a value the
-// package hands back wrong, and it exits non-zero when it finds one.
+// An option value gets one thing more, which is not vis and does not belong
+// here: tmux's args_escape puts a bare backslash in front of two shapes before
+// this encoding runs. It is undone in [unprefixOptionValue], because a name
+// never carries it and widening the decoder would change what a name decodes
+// to.
+//
+// The probe's "must be empty" diff is the assertion that keeps this honest: an
+// alteration the package undoes neither way is a value it hands back wrong,
+// and the probe exits non-zero when it finds one. The sweep behind that diff
+// asks each byte in four positions rather than one, since round ten found that
+// tmux's answer depends on where in the value the byte sits and every table in
+// this tree had put it in the middle.
 
 // visDecode undoes that escaping.
 //

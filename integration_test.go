@@ -2116,26 +2116,71 @@ func TestIntegrationControlRefusesCommandBlocks(t *testing.T) {
 // nameRoundTrip is the table the three name tests share. Everything in it is a
 // name a caller could plausibly want, and every entry below the first was
 // wrong through at least one of the four calls before this round.
-var nameRoundTrip = []struct {
-	label, name string
-}{
+type roundTripCase struct{ label, name string }
+
+var nameRoundTrip = append([]roundTripCase{
 	{"plain", "plain"},
 	{"two words", "two words"},
-	{"a dollar", `a$b`},
 	{"a variable", `$HOME`},
-	{"a backslash", `a\b`},
 	{"an escape that is not one", `a\tb`},
-	{"a real tab", "a\tb"},
-	{"a real newline", "a\nb"},
-	{"a control byte", "a\x01b"},
-	{"a hash", `a#b`},
 	{"a format", `v#{host}`},
 	{"a single-character format", `a#Hb`},
 	{"a job", `#(echo ran)`},
-	{"a double quote", `a"b`},
-	{"a single quote", `a'b`},
-	{"a backtick", "a`b"},
 	{"not ascii", "héllo→"},
+}, positionalCases(nameRoundTripBytes)...)
+
+// nameRoundTripBytes is the other half of that table, and the half round ten
+// added. Each of these is asked in four positions rather than one.
+//
+// Three defects survived a round-trip test and a round-trip probe aimed
+// squarely at them because every entry in every table put the interesting byte
+// in the middle — "a<X>b", or a whole string whose special byte was at the
+// front — and tmux's answer depends on where the byte sits in at least three
+// places: a leading '~' in an option value, a value that is one punctuation
+// character, and a trailing ';' in any argument. The suite asked "what does
+// tmux do to this byte" and never "what does tmux do to this byte *here*".
+var nameRoundTripBytes = []roundTripCase{
+	{"a dollar", `$`},
+	{"a backslash", `\`},
+	{"a real tab", "\t"},
+	{"a real newline", "\n"},
+	{"a control byte", "\x01"},
+	{"a hash", `#`},
+	{"a space", " "},
+	{"a double quote", `"`},
+	{"a single quote", `'`},
+	{"a backtick", "`"},
+	{"a semicolon", `;`},
+	{"a dash", `-`},
+	{"an open brace", `{`},
+	{"a close brace", `}`},
+	{"a tilde", `~`},
+	{"a percent", `%`},
+	{"not ascii", "é"},
+}
+
+// positionalCases turns each byte into the four shapes that together ask where
+// in a value it matters: in the middle, at the front, at the end, and alone.
+//
+// The cheap fix for what F4 of round ten called a method fault: four sweeps
+// over the same bytes instead of one, costing nothing to run, and every one of
+// that round's silently-wrong values falls out of it.
+func positionalCases(bytes []roundTripCase) []roundTripCase {
+	out := make([]roundTripCase, 0, 4*len(bytes))
+	for _, b := range bytes {
+		for _, shape := range []struct{ where, format string }{
+			{"in the middle", "a%sb"},
+			{"at the front", "%sab"},
+			{"at the end", "ab%s"},
+			{"alone", "%s"},
+		} {
+			out = append(out, roundTripCase{
+				label: b.label + " " + shape.where,
+				name:  fmt.Sprintf(shape.format, b.name),
+			})
+		}
+	}
+	return out
 }
 
 // TestIntegrationWindowNameRoundTrip is D2 and D5 against real tmux, through
@@ -2263,6 +2308,235 @@ func TestIntegrationNewSessionNamesRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIntegrationSessionNameSeparatorIsRefused is F1 against real tmux.
+//
+// tmux's session_check_name replaces ':' and '.' with '_' before a session
+// name is stored, because both are its own target separators — "-t
+// sess:win.pane". It exits 0 with an empty stderr, so a session named
+// "web.example.com" was called "web_example_com" and nothing said so. It is a
+// rewrite rather than an encoding: no decoding undoes it, which is what
+// separates this from the five escapes around it.
+//
+// It is a property of sessions alone, and that is why it hid for ten rounds:
+// the window and session round-trip tests are the same table over the same
+// names, so the window half passed whatever the session half did.
+func TestIntegrationSessionNameSeparatorIsRefused(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "seps", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(windows))
+	}
+	w := windows[0].ID
+
+	// The four positions, for the reason positionalCases gives.
+	for _, name := range []string{
+		"a:b", "a.b", ":ab", ".ab", "ab:", "ab.", ":", ".",
+		"web.example.com", "db:5432", "12:30", "v1.2",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := c.RenameSession(ctx, s.ID, name); err == nil {
+				t.Errorf("RenameSession(%q) was accepted", name)
+			}
+			ns, err := c.NewSession(ctx, NewSessionOptions{
+				Name: name, Width: 80, Height: 24, Command: []string{"cat"},
+			})
+			if err == nil {
+				_ = c.KillSession(context.Background(), ns.ID)
+				t.Errorf("NewSession(Name: %q) was accepted", name)
+			}
+
+			// A window name is not a session name. tmux leaves both bytes
+			// alone here, so refusing them would cost a caller a name it can
+			// have.
+			if err := c.RenameWindow(ctx, w, name); err != nil {
+				t.Fatalf("RenameWindow(%q): %v", name, err)
+			}
+			got, err := c.Window(ctx, w)
+			if err != nil {
+				t.Fatalf("Window: %v", err)
+			}
+			if got.Name != name {
+				t.Errorf("RenameWindow(%q) then Window().Name = %q", name, got.Name)
+			}
+		})
+	}
+
+	// The refusal is only right for as long as this tmux keeps rewriting, so
+	// ask it directly rather than assuming. A tmux that stopped would leave
+	// the package refusing a name it could perfectly well have set, and this
+	// is what would say so.
+	rawTmux(t, opts, "rename-session", "-t", string(s.ID), "--", "a:b.c")
+	if got := rawTmux(t, opts, "display-message", "-p", "-t", string(s.ID),
+		"#{session_name}"); got != "a_b_c" {
+		t.Errorf("tmux stored the session name %q for \"a:b.c\"; it no longer rewrites the "+
+			"separators, so checkSessionName is refusing a name it need not", got)
+	}
+
+	// And the consequence that is invisible from the rename itself: a name
+	// that collapses onto one already taken fails against a name the caller
+	// never used.
+	other, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "dup_x", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = c.KillSession(context.Background(), other.ID) })
+
+	cfg := newConfig(opts)
+	full, _ := cfg.argv([]string{"new-session", "-d", "-P", "-F", "#{session_id}", "-s", "dup:x",
+		"-x", "80", "-y", "24", "--", "cat"})
+	cmd := exec.Command(cfg.binary, full...)
+	cmd.Env = cfg.environ()
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("new-session -s dup:x succeeded (%s); it no longer collides with dup_x", out)
+	} else if !strings.Contains(string(out), "dup_x") {
+		t.Errorf("new-session -s dup:x failed with %q, which no longer names dup_x", out)
+	}
+}
+
+// TestIntegrationTrailingSemicolonSurvives is F3 against real tmux.
+//
+// The argument vector is this package's boundary — "never build a shell
+// string" — and tmux's own argv parser crosses it at one byte:
+// cmd_parse_from_arguments takes a trailing ';' off an element and ends the
+// command there. Every value below reached tmux short, or in the lone-';' case
+// not at all, with a nil error.
+func TestIntegrationTrailingSemicolonSurvives(t *testing.T) {
+	c, opts := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "semis", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	windows, err := c.ListSessionWindows(ctx, s.ID)
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(windows))
+	}
+	w := windows[0].ID
+
+	// The escape has to be exact for a value that already ends in
+	// backslashes, since tmux rewrites the one that becomes last rather than
+	// treating it as data.
+	for _, value := range []string{"a;", `a\;`, `a\\;`, "a;;", ";", ";;", "a;b", "a; ", `a\`} {
+		t.Run(value, func(t *testing.T) {
+			if err := c.RenameWindow(ctx, w, value); err != nil {
+				t.Fatalf("RenameWindow(%q): %v", value, err)
+			}
+			got, err := c.Window(ctx, w)
+			if err != nil {
+				t.Fatalf("Window: %v", err)
+			}
+			if got.Name != value {
+				t.Errorf("RenameWindow(%q) then Window().Name = %q", value, got.Name)
+			}
+
+			if err := c.SetOption(ctx, s.ID, "@semi", value); err != nil {
+				t.Fatalf("SetOption(%q): %v", value, err)
+			}
+			opt, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "@semi")
+			if err != nil || !ok {
+				t.Fatalf("ShowOption: (%q, %v, %v)", opt, ok, err)
+			}
+			if opt != value {
+				t.Errorf("SetOption(%q) then ShowOption = %q", value, opt)
+			}
+		})
+	}
+
+	// A vanishing element is worse than a truncated one, because it changes
+	// what the command means: tmux reads "set-option -- status" with no value
+	// as setting the flag on, so a caller asking for ";" got the opposite of
+	// "off". Shown from both sides on the same option.
+	if err := c.SetOption(ctx, s.ID, "status", "off"); err != nil {
+		t.Fatalf("SetOption(status, off): %v", err)
+	}
+	rawTmux(t, opts, "set-option", "-t", string(s.ID), "--", "status", ";")
+	if got := rawTmux(t, opts, "show-options", "-t", string(s.ID), "-v", "status"); got != "on" {
+		t.Errorf("unescaped, set-option status \";\" left status %q; tmux no longer drops the "+
+			"element, so this is not the failure it was", got)
+	}
+	if err := c.SetOption(ctx, s.ID, "status", "off"); err != nil {
+		t.Fatalf("SetOption(status, off): %v", err)
+	}
+	// Through the package the element arrives, so tmux judges the value it was
+	// actually given. Whether it takes ";" for a flag option is tmux's
+	// business; what matters is that "off" did not become "on" behind the
+	// caller's back.
+	_ = c.SetOption(ctx, s.ID, "status", ";")
+	if got := rawTmux(t, opts, "show-options", "-t", string(s.ID), "-v", "status"); got == "on" {
+		t.Error("SetOption(status, \";\") turned status on, which is the opposite of what was asked")
+	}
+
+	// The four new-session arguments that carry caller data. Before the
+	// escape these failed loudly rather than silently, because the truncation
+	// left the flags after it looking like a second command: the error named
+	// "-n" or "-x", flags the caller never passed, and against a socket with
+	// no server it was reported as ErrNoServer — a sentinel the read paths
+	// treat as an answer.
+	ns, err := c.NewSession(ctx, NewSessionOptions{
+		Name:       "ns;",
+		WindowName: "wn;",
+		Env:        map[string]string{"PROBE": "v;"},
+		Width:      80,
+		Height:     24,
+		Command:    []string{"sh", "-c", "cat;"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession with trailing semicolons: %v", err)
+	}
+	t.Cleanup(func() { _ = c.KillSession(context.Background(), ns.ID) })
+
+	if ns.Name != "ns;" {
+		t.Errorf("NewSession Name \"ns;\" read back as %q", ns.Name)
+	}
+	nsWindows, err := c.ListSessionWindows(ctx, ns.ID)
+	if err != nil || len(nsWindows) != 1 {
+		t.Fatalf("ListSessionWindows: %v (%d windows)", err, len(nsWindows))
+	}
+	if nsWindows[0].Name != "wn;" {
+		t.Errorf("NewSession WindowName \"wn;\" read back as %q", nsWindows[0].Name)
+	}
+	if got := rawTmux(t, opts, "show-environment", "-t", string(ns.ID), "PROBE"); got != "PROBE=v;" {
+		t.Errorf("NewSession Env value \"v;\" reads back as %q", got)
+	}
+
+	// And the pane, which is where a truncated line is a different command
+	// rather than a different name.
+	panes, err := c.ListSessionPanes(ctx, s.ID)
+	if err != nil || len(panes) != 1 {
+		t.Fatalf("ListSessionPanes: %v (%d panes)", err, len(panes))
+	}
+	eventually(t, "cat to start", 10*time.Second, func() bool {
+		p, err := c.Pane(ctx, panes[0].ID)
+		return err == nil && p.CurrentCommand == "cat"
+	})
+	const line = "gotmucks-echo-one;"
+	if err := c.SendLine(ctx, panes[0].ID, line); err != nil {
+		t.Fatalf("SendLine: %v", err)
+	}
+	var capture []byte
+	eventually(t, "the sent text to appear in the pane", 10*time.Second, func() bool {
+		capture, err = c.CapturePane(ctx, panes[0].ID, CaptureOptions{})
+		return err == nil && strings.Contains(string(capture), line)
+	})
+	if !strings.Contains(string(capture), line) {
+		t.Errorf("the pane received %q, which has lost the semicolon:\n%s", capture, capture)
+	}
+}
+
 // TestIntegrationOptionValueRoundTrip is D1 against real tmux.
 //
 // tmux escapes a '$' in an option value on its way out of show-options, so
@@ -2281,11 +2555,19 @@ func TestIntegrationOptionValueRoundTrip(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
+	// The whole strings first, then the same bytes in the four positions. The
+	// positions are what round ten added: tmux's args_escape quotes, prefixes
+	// and only then runs the vis a name goes through, so its answer depends on
+	// where in the value the byte sits. "~/bin" — which is what a path-valued
+	// option normally looks like — came back as "\~/bin", and five values were
+	// wrong in the two shapes the middle-byte sweep could not express.
 	values := []string{
-		"plain", "two words", `a$b`, `$HOME`, `PATH=$HOME/bin:$PATH`,
-		`a\b`, `a\tb`, "a\tb", "a\nb", "a\x01b", `a#b`, `v#{host}`,
-		`a"b`, `a'b`, "a`b", `a;b`, `a|b`, `a*b`, "héllo→",
-		`a\$b`, `\$`, `$`, `\`,
+		"plain", "two words", `$HOME`, `PATH=$HOME/bin:$PATH`,
+		`a\tb`, `v#{host}`, `a|b`, `a*b`, "héllo→",
+		`a\$b`, `\$`, `~/bin`, `~/a b`, `\~`, `\~x`,
+	}
+	for _, c := range positionalCases(nameRoundTripBytes) {
+		values = append(values, c.name)
 	}
 	for _, want := range values {
 		t.Run(want, func(t *testing.T) {

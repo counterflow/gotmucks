@@ -531,6 +531,119 @@ func TestNewSessionWindowNameIsVisEncoded(t *testing.T) {
 		"-n", `a\tb\\c\$d`)
 }
 
+// TestSessionNameRefusesATargetSeparator pins the sixth thing tmux does to a
+// value between setting it and reading it back, and the only one that is not
+// an encoding.
+//
+// session_check_name replaces ':' and '.' with '_' before the name is stored,
+// because both are tmux's own target separators. It exits 0 with an empty
+// stderr, so "web.example.com" became a session called "web_example_com" with
+// a nil error and nothing to read back. Windows keep both bytes, which is why
+// this hid: the window and session round-trip tests are the same table over
+// the same names, and the window half would pass whatever the session half
+// did.
+func TestSessionNameRefusesATargetSeparator(t *testing.T) {
+	ctx := context.Background()
+
+	for _, name := range []string{"a:b", "a.b", "web.example.com", "db:5432", "v1.2"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{})
+			c := f.client()
+
+			if err := c.RenameSession(ctx, "$0", name); err == nil {
+				t.Errorf("RenameSession(%q) was accepted", name)
+			}
+			if _, err := c.NewSession(ctx, NewSessionOptions{Name: name}); err == nil {
+				t.Errorf("NewSession(Name: %q) was accepted", name)
+			}
+			if got := f.argv(); len(got) != 0 {
+				t.Errorf("tmux ran anyway: %q", got)
+			}
+		})
+	}
+
+	// The error says what tmux would have called it, since that is the name a
+	// caller who meant it has to pass instead.
+	err := New().RenameSession(ctx, "$0", "web.example.com")
+	if err == nil || !strings.Contains(err.Error(), "web_example_com") {
+		t.Errorf("RenameSession error = %v, which does not name the session tmux would have made", err)
+	}
+
+	// A window name is not a session name. Both bytes go through untouched.
+	f := newFake(t, faketmux.Script{
+		Responses: map[string]faketmux.Response{
+			"new-session":   {Stdout: "$7\n"},
+			"list-sessions": {Stdout: tabbed([]string{"$7", "s", "1", "1", "1", "0"})},
+		},
+	})
+	c := f.client()
+	if err := c.RenameWindow(ctx, "@1", "a:b.c"); err != nil {
+		t.Fatalf("RenameWindow: %v", err)
+	}
+	if _, err := c.NewSession(ctx, NewSessionOptions{WindowName: "a:b.c"}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	f.wantArgv(0, "rename-window", "-t", "@1", "--", "a:b.c")
+	f.wantArgv(1, "new-session", "-d", "-P", "-F", "#{session_id}", "-n", "a:b.c")
+}
+
+// TestTrailingSemicolonIsEscapedOnTheArgv pins the one byte that crosses out
+// of an argv element.
+//
+// "Commands are argument vectors, never a shell string" stopped being true at
+// the last byte of an element: tmux's own cmd_parse_from_arguments takes a
+// trailing ';' off one and ends the command there. RenameWindow("a;") named
+// the window "a", and an element of exactly ";" vanished, which made
+// SetOption(status, ";") a set-option with no value at all — tmux reads that
+// as setting a flag option on, so a caller asking for ";" got the opposite of
+// "off" with a nil error.
+//
+// Only a byte-final ';' does it, and inserting one backslash is the exact
+// escape for every string including one already ending in backslashes: tmux
+// strips the final ';' and then rewrites a backslash that has become last as a
+// literal one. What tmux stores for each of these is
+// TestIntegrationTrailingSemicolonSurvives, since only tmux can answer that.
+func TestTrailingSemicolonIsEscapedOnTheArgv(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tt := range []struct{ name, want string }{
+		{"a;", `a\;`},
+		{`a\;`, `a\\;`},
+		{`a\\;`, `a\\\;`},
+		{"a;;", `a;\;`},
+		{";", `\;`},
+		// Not final, so not touched: tmux keeps these as they stand.
+		{"a;b", "a;b"},
+		{"a; ", "a; "},
+		{`a\`, `a\`},
+		{"plain", "plain"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{})
+			if err := f.client().RenameWindow(ctx, "@1", tt.name); err != nil {
+				t.Fatalf("RenameWindow(%q): %v", tt.name, err)
+			}
+			f.wantArgv(0, "rename-window", "-t", "@1", "--", tt.want)
+		})
+	}
+
+	// Every element, not only the last: an option name, an option value and a
+	// hook body are all arguments to the same parser.
+	f := newFake(t, faketmux.Script{})
+	if err := f.client().SetOption(ctx, SessionID("$0"), "@semi", "a;"); err != nil {
+		t.Fatalf("SetOption: %v", err)
+	}
+	f.wantArgv(0, "set-option", "-t", "$0", "--", "@semi", `a\;`)
+
+	// And not the socket flags, which getopt reads before the command parser
+	// ever runs. Escaping one would name a different socket.
+	g := newFake(t, faketmux.Script{})
+	if err := g.client(WithSocketName("sock;")).RenameWindow(ctx, "@1", "plain"); err != nil {
+		t.Fatalf("RenameWindow: %v", err)
+	}
+	g.wantArgv(0, "-L", "sock;", "rename-window", "-t", "@1", "--", "plain")
+}
+
 // TestShowHooksStripsTheArrayIndex pins the key of the map ShowHooks returns.
 //
 // tmux 3.2a prints an index on every hook, not only on one set at an index, so
@@ -1113,22 +1226,96 @@ func TestExitErrorRendersAProcessThatNeverStarted(t *testing.T) {
 	}
 }
 
-// TestExitErrorDoesNotRepeatTheExitStatus is the other side of it. A tmux that
-// ran and exited non-zero leaves an *exec.ExitError here whose whole message
-// is "exit status 1", which the line already carries.
-func TestExitErrorDoesNotRepeatTheExitStatus(t *testing.T) {
-	f := newFake(t, faketmux.Script{
-		Responses: map[string]faketmux.Response{
-			"rename-session": {Stderr: "duplicate session: build\n", Exit: 1},
-		},
+// TestExitErrorDoesNotRestateStderr is the other side of it. The sentinels
+// this package puts in Err are read *out of* Stderr, so rendering one appends
+// this package's words for what tmux has just said in its own — on the two
+// most common failures a caller sees.
+//
+// The guard this replaces asked whether Err held an *exec.ExitError, which
+// nothing could put there, and the test that covered it scripted a stderr this
+// package does not classify: Err was nil and the clause was skipped before the
+// guard was consulted. Each case below therefore checks that Err is what the
+// case is about, so that the assertion cannot pass for the wrong reason again.
+func TestExitErrorDoesNotRestateStderr(t *testing.T) {
+	for _, tt := range []struct {
+		label, stderr string
+		sentinel      error
+	}{
+		{"a missing session", "can't find session: $9\n", ErrNoSession},
+		{"no server", "error connecting to /tmp/sock (No such file or directory)\n", ErrNoServer},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			f := newFake(t, faketmux.Script{
+				Responses: map[string]faketmux.Response{
+					"rename-session": {Stderr: tt.stderr, Exit: 1},
+				},
+			})
+			err := f.client().RenameSession(context.Background(), "$0", "build")
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			var xerr *ExitError
+			if !errors.As(err, &xerr) {
+				t.Fatalf("got %T, want *ExitError", err)
+			}
+			if !errors.Is(xerr.Err, tt.sentinel) {
+				t.Fatalf("Err = %v, want %v: this case is not exercising the guard", xerr.Err, tt.sentinel)
+			}
+			if strings.Contains(err.Error(), tt.sentinel.Error()) {
+				t.Errorf("Error() = %q, which restates in this package's words what tmux said", err)
+			}
+			if !strings.Contains(err.Error(), strings.TrimSpace(tt.stderr)) {
+				t.Errorf("Error() = %q, which has lost what tmux said", err)
+			}
+			// Suppressing it in the message costs a caller nothing: the
+			// sentinel is reached through Unwrap, which is how it is meant to
+			// be asked for.
+			if !errors.Is(err, tt.sentinel) {
+				t.Errorf("errors.Is(%v, %v) is false", err, tt.sentinel)
+			}
+		})
+	}
+
+	// A stderr this package does not classify leaves Err nil, so there is
+	// nothing to suppress and the exit status is still mentioned once.
+	t.Run("unclassified", func(t *testing.T) {
+		f := newFake(t, faketmux.Script{
+			Responses: map[string]faketmux.Response{
+				"rename-session": {Stderr: "duplicate session: build\n", Exit: 1},
+			},
+		})
+		err := f.client().RenameSession(context.Background(), "$0", "build")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		var xerr *ExitError
+		if !errors.As(err, &xerr) || xerr.Err != nil {
+			t.Fatalf("Err = %v, want nil for a stderr this package does not classify", xerr.Err)
+		}
+		if got := strings.Count(err.Error(), "exit status"); got != 1 {
+			t.Errorf("Error() says %q, with %d mentions of the exit status, want 1", err, got)
+		}
+		if !strings.Contains(err.Error(), "duplicate session: build") {
+			t.Errorf("Error() = %q, which has lost what tmux said", err)
+		}
 	})
-	err := f.client().RenameSession(context.Background(), "$0", "build")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if got := strings.Count(err.Error(), "exit status"); got != 1 {
-		t.Errorf("Error() says %q, with %d mentions of the exit status, want 1", err, got)
-	}
+
+	// A context error is neither, and still renders: it is the reason the
+	// process has no useful exit status of its own.
+	t.Run("a cancelled context", func(t *testing.T) {
+		f := newFake(t, faketmux.Script{})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := f.client().RenameSession(ctx, "$0", "build")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), context.Canceled.Error()) {
+			t.Errorf("Error() = %q, which does not say the context was cancelled", err)
+		}
+	})
 }
 
 func TestContextCancellation(t *testing.T) {

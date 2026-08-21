@@ -81,12 +81,30 @@
 // expanded too and is escaped for the same reason: an unescaped "#H" in a path
 // put the pane in the home directory, silently and with a nil error.
 //
+// One alteration is not an encoding and so cannot be undone by reading: tmux
+// rewrites a ':' or a '.' in a *session* name to '_' before storing it,
+// because both are its own target separators. It exits 0 and says nothing, so
+// "web.example.com" would be a session called "web_example_com".
+// [Client.RenameSession] and [Client.NewSession] refuse those two bytes rather
+// than report a name nobody asked for; window names take both, since tmux does
+// this to sessions alone.
+//
 // The cost is that a caller who wants tmux to expand a format into a name
 // cannot get one through these calls — a '#' is a '#' — and should send
 // rename-window itself. The other edge is a window named by another program
 // through "new-window -n", which is the one path tmux stores unescaped: a
 // plain name is unaffected, but a backslash or a tab in one is not. It applies
 // to the events as well as to the rows, since both read what tmux stored.
+//
+// # Arguments
+//
+// Commands are argument vectors and never shell strings, so a space, a quote
+// or a metacharacter in a caller's value is inert. One byte is not: tmux's own
+// argv parser takes a trailing ';' off an element and ends the command there,
+// so "a;" arrived as "a" and an argument of exactly ";" vanished, changing
+// what the command meant. [Client] escapes that one byte on the way out and
+// tmux stores the semicolon, so the vector really is a boundary. A control
+// connection quotes its arguments instead and never needed it.
 //
 // [Row] is the raw view and decodes nothing: it is what tmux wrote.
 //

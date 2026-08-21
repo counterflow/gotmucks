@@ -18,6 +18,12 @@ type Session struct {
 	// with vis(3) and "#{session_name}" expands to the escaped form, so it is
 	// decoded here for the reason [Window.Name] gives; unlike a window name
 	// there is no path that skips the escaping, so this one is always exact.
+	//
+	// It can still differ from a name this package did not set, because tmux
+	// rewrites a ':' or a '.' in a session name to '_' before storing it and
+	// no decoding undoes that. The calls here refuse those two bytes rather
+	// than hand back a name nobody asked for — see [checkSessionName] — but a
+	// session another program named is reported as tmux holds it.
 	Name string
 	// Windows is the number of windows in the session.
 	Windows int
@@ -83,6 +89,11 @@ type NewSessionOptions struct {
 	// tmux expands it as a format before storing it, so a '#' in it is
 	// doubled to keep it a '#' — see [escapeFormat]. [Session.Name] reads
 	// back what was given here.
+	//
+	// A ':' or a '.' is refused: tmux rewrites either to '_' in a session
+	// name and reports nothing, so there is no name to read back. See
+	// [checkSessionName]. [NewSessionOptions.WindowName] takes both, since
+	// tmux only does this to sessions.
 	Name string
 
 	// StartDir is the working directory for the session's first window.
@@ -183,6 +194,9 @@ func sortedKeys(m map[string]string) []string {
 // tmux starts a server if one is not already running, so this is the one read
 // path that legitimately fails when there is no server: it is a write.
 func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Session, error) {
+	if err := checkSessionName(opts.Name); err != nil {
+		return nil, err
+	}
 	if err := validateEnv(opts.Env); err != nil {
 		return nil, err
 	}
@@ -213,6 +227,55 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 		return nil, err
 	}
 	return s, nil
+}
+
+// checkSessionName refuses a name tmux would store as a different one.
+//
+// tmux's session_check_name replaces ':' and '.' with '_' before the name is
+// stored, because both are its own target separators — "-t sess:win.pane". It
+// exits 0 with an empty stderr, so "web.example.com" becomes
+// "web_example_com" with a nil error, and unlike every other alteration in
+// this file the rewrite is not an encoding: nothing read back can undo it.
+// It is a property of sessions alone — a window keeps both bytes, measured on
+// the same server at the same moment, which is why the window half of the
+// round-trip test would pass whatever the session half did.
+//
+// Refusing rather than reporting the rewritten name is the shape this package
+// already uses three times for a value tmux would silently mangle
+// ([validateEnv], [validateCommand], [checkSubscribeName]), and two
+// consequences of the rewrite are invisible from the rename itself. A rename
+// that collapses onto the name already stored emits no notification at all,
+// since tmux compares the two and returns early — so a caller following
+// [SessionRenamed] sees one rename where it made two, and its model of the
+// server is right only by accident. And a collision is reported against a name
+// the caller never used: creating "dup_x" and then "dup:x" fails with
+// "duplicate session: dup_x".
+//
+// A host name, a version, a host and port, a time — "web.example.com",
+// "v1.2", "db:5432", "12:30" — are all ordinary things to name a session
+// after, which is what makes this reachable by data rather than only by a
+// caller writing a separator on purpose.
+func checkSessionName(name string) error {
+	i := strings.IndexAny(name, ":.")
+	if i < 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"gotmucks: session name %q has %q at byte %d: tmux replaces a colon and a dot in a "+
+			"session name with an underscore, since both are its own target separators, so "+
+			"the session would be called %q; pass that if it is what you meant",
+		name, string(name[i]), i, sessionNameAsStored(name))
+}
+
+// sessionNameAsStored is what tmux would have called the session, for the sake
+// of an error a caller can act on.
+func sessionNameAsStored(name string) string {
+	return strings.Map(func(r rune) rune {
+		if r == ':' || r == '.' {
+			return '_'
+		}
+		return r
+	}, name)
 }
 
 // validateEnv rejects environment keys tmux cannot express. tmux splits -e on
@@ -367,8 +430,15 @@ func (c *Client) KillSession(ctx context.Context, id SessionID) error {
 // positional, so without the separator a name beginning with a dash is read as
 // a flag and the session keeps its old name. A '#' in it is doubled for the
 // other reason that call gives: tmux expands the name as a format first.
+//
+// A ':' or a '.' is refused rather than sent, because tmux rewrites either to
+// '_' and says nothing — see [checkSessionName]. A window name may contain
+// both.
 func (c *Client) RenameSession(ctx context.Context, id SessionID, name string) error {
 	if err := id.check(); err != nil {
+		return err
+	}
+	if err := checkSessionName(name); err != nil {
 		return err
 	}
 	return c.runOK(ctx, "rename-session", "-t", string(id), "--", escapeFormat(name))

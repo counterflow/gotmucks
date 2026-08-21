@@ -282,12 +282,62 @@ func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (
 // Which quote tmux reaches for depends on what is inside, so both are
 // accepted: a value containing a double quote is wrapped in single quotes and
 // a value containing a space in double ones.
+//
+// The quoting and the vis pass are not the whole of it, and the third part is
+// positional — see [unprefixOptionValue].
 func unquoteOptionValue(v string) string {
 	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
 		v = v[1 : len(v)-1]
 	}
-	return visDecode(v)
+	return visDecode(unprefixOptionValue(v))
 }
+
+// unprefixOptionValue takes off the bare backslash tmux puts in front of a
+// value that its own lexer would otherwise read as something else.
+//
+// This is not vis(3) and [visDecode] must not learn it. tmux's args_escape
+// quotes, prefixes and *then* calls the same vis a name goes through, so the
+// prefix is a property of an option value alone; widening the decoder would
+// change what a name decodes to, and a name never carries one.
+//
+// Two shapes, measured on 3.2a — the two the byte sweep in
+// scripts/probe-roundtrip.sh could not express until this round, because it
+// set every byte as "a<byte>b" and tmux's answer depends on where in the value
+// the byte sits:
+//
+//   - a value beginning with '~', whatever its length. "~/bin" prints as
+//     "\~/bin", and "~ x" as "\~ x" inside the quotes it also needs. A leading
+//     tilde is a home directory to tmux's lexer, so it is disarmed rather than
+//     escaped, and "~/..." is what a path-valued option normally looks like.
+//   - a value that is a single character needing quotes. Each byte of
+//     argsEscapeQuoted prints as a backslash and the byte: "#" comes back as
+//     "\#" and "{" as "\{".
+//
+// Neither is ambiguous, because the vis pass doubles a backslash that is
+// really in the value: a stored "~x" prints as "\~x" and a stored "\~x" as
+// "\\~x". [visDecode] keeps both bytes of an escape it does not know, which is
+// the right conservative choice and is what made this wrong rather than lossy
+// — every such value came back with a backslash on the front, and a caller
+// that read one, edited it and wrote it back stored the backslash for good.
+func unprefixOptionValue(v string) string {
+	if len(v) < 2 || v[0] != '\\' {
+		return v
+	}
+	if v[1] == '~' || (len(v) == 2 && strings.IndexByte(argsEscapeQuoted, v[1]) >= 0) {
+		return v[1:]
+	}
+	return v
+}
+
+// argsEscapeQuoted is every byte that makes tmux quote an option value, and so
+// every byte its single-character form puts a backslash in front of instead.
+//
+// A space is in tmux's own set and deliberately not in this one: the
+// single-character form excludes a value that is one space, which is quoted
+// like any other. A backslash is absent because it is not in that set either —
+// a value of one backslash prints as "\\", which is the vis escape and
+// [visDecode]'s to undo.
+const argsEscapeQuoted = "#';${}%\""
 
 // SetRemainOnExit controls whether a pane stays after its process exits.
 //

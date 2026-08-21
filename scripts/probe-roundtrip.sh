@@ -3,10 +3,15 @@
 #
 # Every question here is the same question: send a value in through a tmux
 # command, ask tmux for it again, and see whether the two are the same string.
-# On 3.2a they are not, in five separate ways, none of them documented:
+# On 3.2a they are not, in six separate ways, none of them documented:
 #
 #   1. show-options escapes a value with vis(3), and "$" is in the set — so a
-#      value read, edited and written back gains a backslash every cycle.
+#      value read, edited and written back gains a backslash every cycle. It
+#      also puts a bare backslash in front of a value beginning with "~" and of
+#      a value that is one punctuation character, which is not vis at all and
+#      is why every sweep here asks each byte in four positions rather than
+#      one: the middle-byte shape this script used to test alone cannot see a
+#      prefix.
 #   2. rename-window, rename-session and new-session -s escape the name the
 #      same way, and it is the escaped form that "#{window_name}" expands to.
 #      new-session -n is the one that does not, so the package escapes that one
@@ -19,13 +24,24 @@
 #      new-session -n is expanded as a format before it is stored — and so is
 #      new-session -c, which is a path rather than a name and fails as a wrong
 #      directory instead of a wrong name.
+#   6. a ':' or a '.' in a *session* name is rewritten to '_' before the name
+#      is stored, because both are tmux's own target separators. It is not an
+#      encoding: nothing read back undoes it, which is why the package refuses
+#      the two bytes rather than reporting a name nobody asked for. Windows are
+#      untouched.
 #
-# Five things below are assertions rather than reports, and the script exits
+# And one thing that is not about a value at all but about the argument
+# carrying it: tmux's own argv parser takes a trailing ';' off an element and
+# ends the command there, so an argument vector is a boundary everywhere except
+# at the last byte of an element.
+#
+# Seven things below are assertions rather than reports, and the script exits
 # non-zero if any of them stops holding, because each one is a way this package
 # would hand back a value that is not the one that went in:
 #
-#   A1  every byte show-options alters is one the decoder undoes; a new escape
-#       is a value returned wrong.
+#   A1  every value show-options alters comes back in a shape the package
+#       undoes — a vis escape the decoder knows, or the one-backslash prefix
+#       unquoteOptionValue takes off. Anything else is a value returned wrong.
 #   A2  the five expanded arguments really are format-expanded, and "##"
 #       really does stop it — if a tmux stopped expanding, doubling would
 #       corrupt every name containing a '#' instead of protecting it. The
@@ -37,6 +53,12 @@
 #   A5  a substitution takes a raw newline out of a value, which is the only
 #       thing standing between one pane in an oddly named directory and a
 #       failed listing of every pane on the server.
+#   A6  a session name really does lose a ':' and a '.', and a window name
+#       really does not. A tmux that stopped would leave the package refusing
+#       a name it could perfectly well have set.
+#   A7  "\;" is the exact escape for a trailing ';', for every value including
+#       one that already ends in backslashes. The package applies it to every
+#       argument of every one-shot command.
 #
 #   ./scripts/probe-roundtrip.sh [tmux-binary]
 
@@ -68,6 +90,28 @@ fail() {
 # A named format read back off one object.
 fmt() { "${T[@]}" display-message -p -t "$1" "$2" 2>&1; }
 
+# The escape the package applies to every argument of every one-shot command,
+# reproduced here so that the sweeps below can send the values tmux would
+# otherwise eat. See section 8, which is what says this is the right rule.
+argesc() { case "$1" in *\;) printf '%s\\;' "${1%;}" ;; *) printf '%s' "$1" ;; esac; }
+
+# Strip the quotes tmux adds when a value needs them. Which quote it picks
+# depends on what is inside, so both are accepted.
+unquote() {
+	local v="$1"
+	case "$v" in
+	\"*\" | \'*\') printf '%s' "${v:1:${#v}-2}" ;;
+	*) printf '%s' "$v" ;;
+	esac
+}
+
+# The value show-options prints for @probe, with the name and the quoting off.
+optraw() {
+	local v
+	v=$("${T[@]}" show-options -t "$SESS" -- @probe)
+	unquote "${v#@probe }"
+}
+
 echo "=== $("$TMUX_BIN" -V) ==="
 
 "${T[@]}" kill-server 2>/dev/null
@@ -77,29 +121,54 @@ WIN=$("${T[@]}" list-windows -t "$SESS" -F '#{window_id}' | head -1)
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 1. which bytes show-options alters on the way out (A1) ---"
-echo "  every printable byte, set as a<byte>b, read back by name and by -v"
+echo "--- 1. which values show-options alters on the way out, and where (A1) ---"
+echo "  every printable byte in four positions — a<b>b, <b>ab, ab<b>, and the"
+echo "  byte alone — read back by name and by -v. The middle shape is the one"
+echo "  this sweep used to test on its own, and five values are wrong in the"
+echo "  other three: tmux prefixes a leading '~' whatever the length, and a"
+echo "  value that is a single character needing quotes."
 
 ALTERED=()
+PREFIXED=()
+UNKNOWN=()
 for code in $(seq 32 126); do
 	byte=$(printf "\\$(printf '%03o' "$code")")
-	want="a${byte}b"
-	"${T[@]}" set-option -t "$SESS" -- @probe "$want" || continue
-	named=$("${T[@]}" show-options -t "$SESS" -- @probe)
-	named=${named#@probe }
-	# Strip the quotes tmux adds when a value needs them. Which quote it picks
-	# depends on what is inside, so both are accepted.
-	case "$named" in
-	\"*\" | \'*\') named=${named:1:${#named}-2} ;;
-	esac
-	vflag=$("${T[@]}" show-options -t "$SESS" -v -- @probe)
-	if [ "$named" != "$want" ] || [ "$vflag" != "$want" ]; then
-		printf '  byte %3d %-4s named=[%s] -v=[%s]\n' \
-			"$code" "$(vis "$byte")" "$(vis "$named")" "$(vis "$vflag")"
-		[ "$named" != "$want" ] && ALTERED+=("$byte")
-	fi
+	for want in "a${byte}b" "${byte}ab" "ab${byte}" "${byte}"; do
+		if ! "${T[@]}" set-option -t "$SESS" -- @probe "$(argesc "$want")" 2>/dev/null; then
+			fail A1 "set-option refused [$(vis "$want")], which the package can send"
+			continue
+		fi
+		named=$(optraw)
+		vflag=$("${T[@]}" show-options -t "$SESS" -v -- @probe)
+		# -v prints the value unescaped, so it says what tmux is holding. If
+		# that is already wrong the argument never arrived intact and the
+		# escaping is not what is being measured.
+		if [ "$vflag" != "$want" ]; then
+			fail A1 "tmux holds [$(vis "$vflag")] for [$(vis "$want")]; the value did not arrive"
+			continue
+		fi
+		[ "$named" = "$want" ] && continue
+
+		printf '  byte %3d %-6s want [%s] named [%s]\n' \
+			"$code" "$(vis "$byte")" "$(vis "$want")" "$(vis "$named")"
+		case "$byte" in
+		'\' | '"' | "'" | '$')
+			# The vis pass, which visDecode undoes. Recorded per byte, since
+			# it does not depend on where the byte sits.
+			ALTERED+=("$byte")
+			continue
+			;;
+		esac
+		if [ "$named" = "\\$want" ]; then
+			# args_escape's bare prefix, which unquoteOptionValue takes off.
+			PREFIXED+=("$want")
+			continue
+		fi
+		UNKNOWN+=("$want -> $named")
+	done
 done
-printf '  altered in the named form: [%s]\n' "$(vis "${ALTERED[*]-}")"
+printf '  altered by the vis pass: [%s]\n' "$(vis "${ALTERED[*]-}")"
+printf '  given the bare prefix:   [%s]\n' "$(vis "${PREFIXED[*]-}")"
 
 echo
 echo "  and the bytes below space, which cannot be compared as text:"
@@ -114,15 +183,22 @@ done
 printf '  byte  10  named=[%s]\n' \
 	"$(vis "$(v=$("${T[@]}" show-options -t "$SESS" -- @probe) && printf '%s' "${v#@probe }")")"
 
-# visDecode in vis.go knows these. Anything else this tmux writes is a byte the
-# package hands back wrong.
+# visDecode in vis.go undoes the first list and unquoteOptionValue the second.
+# Anything else this tmux writes is a value the package hands back wrong.
 echo
-echo "  altered bytes the package's decoder does not undo (must be empty):"
-for byte in "${ALTERED[@]-}"; do
-	case "$byte" in
-	'' | '\' | '"' | "'" | '$') ;;
-	*) fail A1 "show-options escapes [$(vis "$byte")], which visDecode has no case for" ;;
-	esac
+echo "  alterations the package undoes neither way (must be empty):"
+for u in "${UNKNOWN[@]-}"; do
+	[ -n "$u" ] || continue
+	fail A1 "show-options turned [$(vis "$u")], which is neither a vis escape visDecode knows nor the prefix unquoteOptionValue takes off"
+done
+
+echo
+echo "  and the prefix in the shapes that carry it, spelled out — a leading"
+echo "  tilde at any length, and a single character needing quotes:"
+for want in '~/bin' '~' '~ x' 'a~b' '#' '{' '}' ';' '$HOME/bin'; do
+	"${T[@]}" set-option -t "$SESS" -- @probe "$(argesc "$want")" 2>/dev/null
+	printf '    set [%-9s] named [%-9s] -v [%s]\n' "$(vis "$want")" \
+		"$(vis "$(optraw)")" "$(vis "$("${T[@]}" show-options -t "$SESS" -v -- @probe)")"
 done
 
 # ---------------------------------------------------------------------------
@@ -360,6 +436,122 @@ printf '     the -- vector     -> [%s]\n' "$(vis "$(cat "$WORK/argv" 2>/dev/null
 [ "$(cat "$WORK/argv" 2>/dev/null)" = 'v#{host}' ] ||
 	fail A2 "new-session's command vector is expanded on this tmux; it was not on 3.2a"
 "${T[@]}" kill-session -t "$NS"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 7. what a session name loses that a window name does not (A6) ---"
+echo "  tmux's session_check_name replaces ':' and '.' before the name is"
+echo "  stored, because both are its own target separators. It is a rewrite"
+echo "  rather than an encoding, so no decoding undoes it and the package"
+echo "  refuses the two bytes instead."
+printf '  %-18s %-20s %s\n' "sent" "#{session_name}" "#{window_name}"
+for n in 'a:b' 'a.b' ':ab' 'ab.' ':' '.' 'web.example.com' 'db:5432' 'a_b'; do
+	"${T[@]}" rename-session -t "$SESS" -- "$n" 2>/dev/null
+	"${T[@]}" rename-window -t "$WIN" -- "$n" 2>/dev/null
+	sname=$(fmt "$SESS" '#{session_name}')
+	wname=$(fmt "$WIN" '#{window_name}')
+	mark='  '
+	[ "$sname" = "$n" ] || mark='**'
+	printf '  %s %-16s %-20s %s\n' "$mark" "$(vis "$n")" "$(vis "$sname")" "$(vis "$wname")"
+	want=$(printf '%s' "$n" | tr ':.' '__')
+	[ "$sname" = "$want" ] ||
+		fail A6 "rename-session '$n' stored '$sname', want '$want'"
+	[ "$wname" = "$n" ] ||
+		fail A6 "rename-window '$n' stored '$wname'; a window name is not a session name"
+done
+"${T[@]}" rename-session -t "$SESS" -- keeper
+"${T[@]}" rename-window -t "$WIN" -- keeper
+
+echo
+echo "  new-session -s is the same, and -n is not:"
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' -s 'n:s' -n 'w:n' -x 80 -y 24 -- sleep 600)
+sleep 0.2
+printf '    -s "n:s" -> [%s]   -n "w:n" -> [%s]\n' \
+	"$(vis "$(fmt "$NS" '#{session_name}')")" "$(vis "$(fmt "$NS" '#{window_name}')")"
+[ "$(fmt "$NS" '#{session_name}')" = 'n_s' ] || fail A6 "new-session -s no longer rewrites a colon"
+[ "$(fmt "$NS" '#{window_name}')" = 'w:n' ] || fail A6 "new-session -n now rewrites a colon"
+"${T[@]}" kill-session -t "$NS"
+
+echo
+echo "  two consequences that are invisible from the rename itself. A name"
+echo "  that collapses onto one already taken fails against a name the caller"
+echo "  never used:"
+D1=$("${T[@]}" new-session -d -P -F '#{session_id}' -s 'dup_x' -x 80 -y 24 -- sleep 600)
+printf '    first  "dup_x" -> [%s]\n' "$D1"
+printf '    second "dup:x" -> [%s]\n' \
+	"$("${T[@]}" new-session -d -P -F '#{session_id}' -s 'dup:x' -x 80 -y 24 -- sleep 600 2>&1)"
+"${T[@]}" kill-session -t "$D1"
+
+echo "  and a rename that collapses onto the name already stored emits no"
+echo "  notification at all, since tmux compares the two and returns early —"
+echo "  so a caller following the events sees one rename where it made two:"
+{
+	sleep 0.6
+	printf "rename-session -t %s -- 'c:d'\n" "$SESS"
+	sleep 0.5
+	printf "rename-session -t %s -- 'c.d'\n" "$SESS"
+	sleep 0.5
+	printf "rename-session -t %s -- 'c-e'\n" "$SESS"
+	sleep 0.8
+} | "${T[@]}" -C attach-session -t "$SESS" >"$WORK/ren.out" 2>&1
+grep -c '^%session-renamed' "$WORK/ren.out" |
+	sed 's/^/    %session-renamed lines for three renames: /'
+sed -n 's/^%session-renamed/    | %session-renamed/p' "$WORK/ren.out"
+"${T[@]}" rename-session -t "$SESS" -- keeper
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 8. the one byte that crosses an argv element (A7) ---"
+echo "  cmd_parse_from_arguments takes a trailing ';' off an element and ends"
+echo "  the command there, so an element that is exactly ';' vanishes and"
+echo "  everything after it becomes a second command. Unescaped, through"
+echo "  rename-window:"
+for n in 'a;' 'a\;' 'a;b' 'a; ' 'a;;'; do
+	"${T[@]}" rename-window -t "$WIN" -- "$n" 2>/dev/null
+	got=$(fmt "$WIN" '#{window_name}')
+	printf '    sent [%-6s] stored [%s]\n' "$(vis "$n")" "$(vis "$got")"
+done
+"${T[@]}" set-option -t "$SESS" -- status off
+"${T[@]}" set-option -t "$SESS" -- status ';' 2>/dev/null
+printf '    set-option status ";" left status [%s] — the element vanished and\n' \
+	"$("${T[@]}" show-options -t "$SESS" -v -- status)"
+printf '    tmux read a set-option with no value as setting the flag on\n'
+[ "$("${T[@]}" show-options -t "$SESS" -v -- status)" = 'on' ] ||
+	echo "    (this tmux no longer does that, which would make the lone-';' case merely a truncation)"
+"${T[@]}" set-option -t "$SESS" -u -- status
+
+echo
+echo "  escaped as the package sends it. The rule reads as though a run of"
+echo "  backslashes would need doubling, and it does not: tmux strips the"
+echo "  final ';' and then rewrites whichever backslash has become last."
+for want in 'a;' 'a\;' 'a\\;' 'a;;' ';' ';;' 'a\' 'a;b' 'a; ' 'plain'; do
+	sent=$(argesc "$want")
+	"${T[@]}" set-option -t "$SESS" -- @semi "$sent" 2>/dev/null
+	got=$("${T[@]}" show-options -t "$SESS" -v -- @semi)
+	if [ "$got" = "$want" ]; then
+		printf '    ok  want [%-6s] sent [%-8s] stored [%s]\n' \
+			"$(vis "$want")" "$(vis "$sent")" "$(vis "$got")"
+	else
+		printf '    **  want [%-6s] sent [%-8s] stored [%s]\n' \
+			"$(vis "$want")" "$(vis "$sent")" "$(vis "$got")"
+		fail A7 "'\\;' is not the escape for a trailing ';' on this tmux: [$want] stored as [$got]"
+	fi
+done
+"${T[@]}" set-option -t "$SESS" -u -- @semi
+
+echo
+echo "  and the control path, which must NOT have the escape: quoteArg quotes"
+echo "  a ';' and tmux's control-mode lexer takes it as data."
+{
+	sleep 0.6
+	printf "set-option -t %s -- @ctl 'a;'\n" "$SESS"
+	sleep 0.8
+} | "${T[@]}" -C attach-session -t "$SESS" >"$WORK/ctl-semi.out" 2>&1
+printf '    DoArgs-style quoting -> [%s]\n' \
+	"$(vis "$("${T[@]}" show-options -t "$SESS" -v -- @ctl)")"
+[ "$("${T[@]}" show-options -t "$SESS" -v -- @ctl)" = 'a;' ] ||
+	fail A7 "a quoted ';' no longer survives the control-mode lexer; DoArgs would need the escape too"
+"${T[@]}" set-option -t "$SESS" -u -- @ctl
 
 echo
 if [ "$FAIL" -ne 0 ]; then

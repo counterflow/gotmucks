@@ -172,6 +172,11 @@ func WithoutParentEnv() Option {
 // would be guesswork; but the addressing scheme is not enforced through it.
 // Prefer [WithAttach], or build the -t from an identifier.
 //
+// "As written" includes the trailing ';' that tmux's argv parser reads as a
+// command terminator, which [Client] escapes on the one-shot path and this
+// does not: an element ending in one ends the command there, and an element
+// that is exactly ";" separates two. Write "\;" to mean the byte.
+//
 // Control-mode only.
 func WithControlArgs(args ...string) Option {
 	return func(c *config) { c.controlArgs = append([]string(nil), args...) }

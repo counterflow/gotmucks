@@ -3,7 +3,6 @@ package gotmucks
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
@@ -78,7 +77,16 @@ type ExitError struct {
 // status nor a stderr to explain itself: a missing binary, a permissions
 // failure, or an argument Go will not put in an argv — a NUL in a name is the
 // reachable one — all report "exit status -1" with an empty Stderr, and
-// without this the only route to the reason was errors.Unwrap.
+// without this the only route to the reason was errors.Unwrap. A cancelled or
+// expired context arrives the same way and renders for the same reason.
+//
+// It is left out when it would only restate the line, which is what
+// [ExitError.restatesStderr] decides. [ErrNoServer] and the missing-target
+// sentinels are classified *from* Stderr, so rendering one appends this
+// package's words for what tmux has just said in its own — on the two most
+// common failures a caller will ever see. Nothing is lost by leaving it out:
+// errors.Is reaches the sentinel through Unwrap either way, which is how a
+// caller is meant to ask.
 func (e *ExitError) Error() string {
 	var b strings.Builder
 	b.WriteString("gotmucks: tmux ")
@@ -88,21 +96,25 @@ func (e *ExitError) Error() string {
 		b.WriteString(": ")
 		b.WriteString(e.Stderr)
 	}
-	// Only when it adds something. A tmux that ran and exited non-zero has an
-	// *exec.ExitError here saying "exit status 1" again, which the line
-	// already carries.
-	if e.Err != nil && !isPlainExitStatus(e.Err) {
+	if e.Err != nil && !e.restatesStderr() {
 		b.WriteString(": ")
 		b.WriteString(e.Err.Error())
 	}
 	return b.String()
 }
 
-// isPlainExitStatus reports whether err is the os/exec error that says nothing
-// the exit status did not.
-func isPlainExitStatus(err error) bool {
-	var ee *exec.ExitError
-	return errors.As(err, &ee)
+// restatesStderr reports whether Err is a sentinel this package read out of
+// Stderr, and so says nothing the rendered line does not already carry.
+//
+// The guard this replaces asked instead whether Err was an *exec.ExitError,
+// and nothing could reach it: [Client.run] builds the only two ExitErrors in
+// the package, and by the time it sets Err an errors.As has already proved
+// that runErr is not one. The test that covered it scripted a stderr this
+// package does not classify, which leaves Err nil and skips the clause before
+// the guard is ever consulted — so it held in the one case that could not
+// exercise it.
+func (e *ExitError) restatesStderr() bool {
+	return e.Stderr != "" && (errors.Is(e.Err, ErrNoServer) || isMissingTarget(e.Err))
 }
 
 // Unwrap exposes the os/exec error, if the failure came from process

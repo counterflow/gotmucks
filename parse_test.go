@@ -300,6 +300,38 @@ func TestUnquoteOptionValue(t *testing.T) {
 		// unambiguous, because tmux escapes the backslash too.
 		{`"a\\\$b"`, `a\$b`},
 		{`"a\\\\\$b"`, `a\\$b`},
+		// tmux's args_escape quotes, prefixes and then runs the same vis, so
+		// the prefix is positional and the sweep that found the '$' could not
+		// see it: it set every byte as "a<byte>b", and the prefix only
+		// happens at the front. A leading tilde gets one whatever the length,
+		// quoted or not, since a tilde is a home directory to tmux's own
+		// lexer. All of these are 3.2a's own output.
+		{`\~/bin`, `~/bin`},
+		{`\~`, `~`},
+		{`"\~ x"`, `~ x`},
+		{`a~b`, `a~b`},
+		{`ab~`, `ab~`},
+		// And a value that is a single character needing quotes.
+		{`\#`, `#`},
+		{`\{`, `{`},
+		{`\}`, `}`},
+		{`\;`, `;`},
+		{`\%`, `%`},
+		{`\'`, `'`},
+		{`\"`, `"`},
+		{`\$`, `$`},
+		// Not the prefix: two bytes that are a vis escape, and a value that
+		// really begins with a backslash — which is unambiguous because the
+		// vis pass doubles that one. A stored "~x" prints as "\~x" and a
+		// stored "\~x" as "\\~x".
+		{`\t`, "\t"},
+		{`\\`, `\`},
+		{`\\~x`, `\~x`},
+		{`\\~`, `\~`},
+		// Longer than the single-character form, so the backslash is the vis
+		// escape rather than the prefix.
+		{`\#a`, `\#a`},
+		{`"#a"`, `#a`},
 	}
 
 	for _, tt := range tests {
