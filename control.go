@@ -545,10 +545,28 @@ func (cc *ControlClient) Untap(pane PaneID) {
 // which of the two a brace-quoted token will be, so both are refused;
 // single-quote the argument instead, or let [ControlClient.DoArgs] quote it.
 //
+// It must also be at least one command, which is the same requirement counted
+// the other way and the more dangerous half. A line whose first non-blank byte
+// is a '#' is a comment: it parses to an empty command list and tmux answers
+// it with nothing at all, so this command would be handed the *next* one's
+// reply — with a nil error — and every command after that would wait for a
+// block that is never coming. Measured on 3.2a, all ninety-five printable
+// bytes swept as the first of the line, '#' is the only one that does it; see
+// scripts/probe-blocks.sh. A '#' anywhere else is harmless, either data
+// ("a#b") or a truncation of a command that still earns its block
+// ("list-sessions #tail"), and a quoted one is a command name tmux does not
+// know, which is what [ControlClient.DoArgs] relies on.
+//
 // What cannot be detected is the same hazard written as an ordinary string.
 // Verified on 3.2a: "if-shell 'true' 'list-sessions'" also produces two
 // blocks, and the inner command is indistinguishable from any other argument.
-// Do not send a command that makes tmux run further commands on this client.
+// source-file is the one a caller actually reaches for, and it belongs in that
+// list beside if-shell and bind-key: measured on 3.2a, a file of two commands
+// earns three blocks, one for source-file and one for each command in it. It
+// needs a file on the server's own filesystem, so replaying a configuration
+// line by line is the obvious alternative — and that is the same trap from the
+// other side, since a configuration is full of the comment lines above. Do not
+// send a command that makes tmux run further commands on this client.
 //
 // It is safe to call Do concurrently: several commands may be outstanding at
 // once, and each reply is bound to the command that earned it by the order the
@@ -595,6 +613,12 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 		return Reply{}, fmt.Errorf(
 			"gotmucks: control command contains %q at byte %d and cannot be sent as written",
 			cmd[i:i+1], i)
+	}
+	// Asked before commandBreak, because a comment swallows the rest of the
+	// line and so swallows any ';' or '{' in it: "#c ; list-sessions" earns no
+	// block at all on 3.2a, and blaming the ';' would name the wrong byte.
+	if i := commentStart(cmd); i >= 0 {
+		return Reply{}, commentErr(i)
 	}
 	if b, i := commandBreak(cmd); i >= 0 {
 		return Reply{}, commandBreakErr(b, i)
@@ -654,6 +678,67 @@ func (cc *ControlClient) Do(ctx context.Context, cmd string) (Reply, error) {
 		}
 	}
 	return reply, nil
+}
+
+// commentStart reports the offset of a '#' that tmux would read as commenting
+// out this whole line, or -1 if the line makes a command at all.
+//
+// It is [commandBreak]'s mirror and the half nothing used to ask. Every guard
+// on [ControlClient.Do] counted upwards — an extra command earns an extra
+// reply block — and a line that earns *no* block is worse: the reader binds
+// replies by queue order, so the next command's block is handed to this one
+// with a nil error and the queue stays one place out of step for the life of
+// the connection. Nothing in the package notices. [ControlClient.Err],
+// [ControlClient.Done] and [ControlClient.Stderr] all report a healthy
+// connection while every command on it times out.
+//
+// The first non-blank byte decides the whole line, which is what makes the
+// check this short. Measured on 3.2a against a raw pipe, counting only the
+// blocks tmux attributed to the client:
+//
+//	#comment                         0 blocks
+//	#                                0
+//	  #x                             0
+//	#{session_id}                    0   (an unquoted format is a comment too)
+//	#c ; list-sessions               0   (the comment eats the separator)
+//	'#comment'                       1   %error unknown command: #comment
+//	list-sessions #tail              1   truncated, and still answered
+//	a#b                              1   %error unknown command: a#b
+//	nosuchcommand                    1   %error unknown command
+//	}                                1   %error syntax error
+//
+// Refusing the shape is exact rather than conservative: no tmux command is
+// named with a leading '#', and every one of the ninety-four other printable
+// bytes was swept as the first byte of a line and earned exactly one block —
+// scripts/probe-blocks.sh, which asserts it. A quoted '#' still reaches tmux
+// and still earns its error block, which is what lets [ControlClient.DoArgs]
+// pass one through: '#' is not in [safeByte], so the first argument is quoted
+// and tmux reads it as a command name.
+func commentStart(cmd string) int {
+	for i := 0; i < len(cmd); i++ {
+		switch cmd[i] {
+		case ' ', '\t':
+		case '#':
+			return i
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+// commentErr explains what a line that is not a command would have done. The
+// advice is the case it comes from: a caller replaying a tmux configuration
+// down this connection, which is what a caller does when source-file cannot
+// reach the file.
+func commentErr(i int) error {
+	return fmt.Errorf(
+		"gotmucks: control command has a '#' at byte %d with nothing but blanks before it, "+
+			"where tmux reads it as opening a comment; the line then parses to no command, "+
+			"tmux answers it with no reply block at all, and this command would be given the "+
+			"next one's reply while every command after it waited for ever. Skip the comment "+
+			"lines of a configuration rather than sending them",
+		i)
 }
 
 // commandBreak reports the first byte tmux would read as ending this command

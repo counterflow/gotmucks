@@ -1046,6 +1046,152 @@ func TestIntegrationShowOption(t *testing.T) {
 	}
 }
 
+// TestIntegrationOptionTableFollowsTheName is the option half of what
+// TestIntegrationShowHooksReadsEveryOptionTable pins for hooks, and it went
+// unasked a round longer because nobody asked whether plain options do the
+// same thing. They do: tmux files a name it knows in that name's own table
+// whatever scope flag it is given, and only the listing form and a user option
+// obey the flag. So SetOption and ShowOptions are not inverses, silently.
+//
+// Every option the suite used to set through these calls was either status — a
+// session option — or a '@'-prefixed user option at ScopeSession, and for both
+// of those the table the scope names and the table the option lives in are the
+// same one. That is the same blindness round eleven had with alert-bell.
+func TestIntegrationOptionTableFollowsTheName(t *testing.T) {
+	c, _ := testClient(t)
+	ctx := testCtx(t)
+
+	s, err := c.NewSession(ctx, NewSessionOptions{
+		Name: "opttables", Width: 80, Height: 24, Command: []string{"cat"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// remain-on-exit is a window option, set with no window flag anywhere.
+	if err := c.SetOption(ctx, s.ID, "remain-on-exit", "on"); err != nil {
+		t.Fatalf("SetOption(remain-on-exit): %v", err)
+	}
+
+	// The named reader follows the name, so the scope barely matters to it.
+	// ScopePane is the exception and is not an accident: tmux files
+	// remain-on-exit under window and pane both, and '-p' is the one flag that
+	// picks between them.
+	for _, scope := range []OptionScope{ScopeSession, ScopeWindow, ScopeServer} {
+		v, ok, err := c.ShowOption(ctx, s.ID, scope, "remain-on-exit")
+		if err != nil {
+			t.Fatalf("ShowOption(%v): %v", scope, err)
+		}
+		if !ok || v != "on" {
+			t.Errorf("ShowOption(%v, remain-on-exit) = (%q, %v), want (\"on\", true)", scope, v, ok)
+		}
+	}
+	if v, ok, err := c.ShowOption(ctx, s.ID, ScopePane, "remain-on-exit"); err != nil {
+		t.Fatalf("ShowOption(pane): %v", err)
+	} else if ok || v != "" {
+		t.Errorf("ShowOption(pane, remain-on-exit) = (%q, %v); '-p' should read the pane table, "+
+			"which nothing here wrote to", v, ok)
+	}
+
+	// The listing reader does not, and this is the disagreement the docs now
+	// have to state: set at ScopeSession, absent from the ScopeSession listing.
+	sessionOpts, err := c.ShowOptions(ctx, s.ID, ScopeSession)
+	if err != nil {
+		t.Fatalf("ShowOptions(session): %v", err)
+	}
+	if _, listed := sessionOpts["remain-on-exit"]; listed {
+		t.Error("ShowOptions at ScopeSession listed a window option; tmux's listing form " +
+			"reads one table and this claim is what the doc rests on")
+	}
+	windowOpts, err := c.ShowOptions(ctx, s.ID, ScopeWindow)
+	if err != nil {
+		t.Fatalf("ShowOptions(window): %v", err)
+	}
+	if windowOpts["remain-on-exit"] != "on" {
+		t.Errorf("ShowOptions at ScopeWindow does not hold the option SetOption set: %v",
+			windowOpts["remain-on-exit"])
+	}
+
+	// set-option -u follows the name to the same place, so the two writers
+	// stay inverses however they are scoped.
+	if err := c.UnsetOption(ctx, s.ID, ScopeSession, "remain-on-exit"); err != nil {
+		t.Fatalf("UnsetOption: %v", err)
+	}
+	if windowOpts, err = c.ShowOptions(ctx, s.ID, ScopeWindow); err != nil {
+		t.Fatalf("ShowOptions(window) after unset: %v", err)
+	}
+	if _, still := windowOpts["remain-on-exit"]; still {
+		t.Error("UnsetOption at ScopeSession did not reach the window table SetOption wrote to")
+	}
+
+	// A server option through the same session-scoped call, to show the name
+	// reaches past two tables rather than one.
+	if err := c.SetOptionScoped(ctx, s.ID, ScopeSession, "escape-time", "25"); err != nil {
+		t.Fatalf("SetOptionScoped(escape-time): %v", err)
+	}
+	if v, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "escape-time"); err != nil {
+		t.Fatalf("ShowOption(escape-time): %v", err)
+	} else if !ok || v != "25" {
+		t.Errorf("ShowOption(session, escape-time) = (%q, %v), want (\"25\", true)", v, ok)
+	}
+	if sessionOpts, err = c.ShowOptions(ctx, s.ID, ScopeSession); err != nil {
+		t.Fatalf("ShowOptions(session): %v", err)
+	}
+	if _, listed := sessionOpts["escape-time"]; listed {
+		t.Error("ShowOptions at ScopeSession listed a server option")
+	}
+	serverOpts, err := c.ShowOptions(ctx, s.ID, ScopeServer)
+	if err != nil {
+		t.Fatalf("ShowOptions(server): %v", err)
+	}
+	if serverOpts["escape-time"] != "25" {
+		t.Errorf("ShowOptions at ScopeServer does not hold escape-time: %q", serverOpts["escape-time"])
+	}
+
+	// The control, and the reason none of this was visible before: a session
+	// option set at session scope agrees with itself in both readers.
+	if err := c.SetOption(ctx, s.ID, "status", "off"); err != nil {
+		t.Fatalf("SetOption(status): %v", err)
+	}
+	if v, ok, err := c.ShowOption(ctx, s.ID, ScopeSession, "status"); err != nil {
+		t.Fatalf("ShowOption(status): %v", err)
+	} else if !ok || v != "off" {
+		t.Errorf("ShowOption(session, status) = (%q, %v), want (\"off\", true)", v, ok)
+	}
+	if sessionOpts, err = c.ShowOptions(ctx, s.ID, ScopeSession); err != nil {
+		t.Fatalf("ShowOptions(session): %v", err)
+	}
+	if sessionOpts["status"] != "off" {
+		t.Errorf("ShowOptions at ScopeSession does not hold status: %q", sessionOpts["status"])
+	}
+
+	// And a user option, which has no table of its own and so is the one kind
+	// of name the scope really does place. Set through the window scope, it is
+	// invisible to every other one.
+	if err := c.SetOptionScoped(ctx, s.ID, ScopeWindow, "@scoped", "window-value"); err != nil {
+		t.Fatalf("SetOptionScoped(@scoped): %v", err)
+	}
+	if v, ok, err := c.ShowOption(ctx, s.ID, ScopeWindow, "@scoped"); err != nil {
+		t.Fatalf("ShowOption(window, @scoped): %v", err)
+	} else if !ok || v != "window-value" {
+		t.Errorf("ShowOption(window, @scoped) = (%q, %v), want (\"window-value\", true)", v, ok)
+	}
+	for _, scope := range []OptionScope{ScopeSession, ScopePane} {
+		if v, ok, err := c.ShowOption(ctx, s.ID, scope, "@scoped"); err != nil {
+			t.Fatalf("ShowOption(%v, @scoped): %v", scope, err)
+		} else if ok || v != "" {
+			t.Errorf("ShowOption(%v, @scoped) = (%q, %v); a user option has no name to follow, "+
+				"so the flag is the whole of where it lives", scope, v, ok)
+		}
+	}
+	if windowOpts, err = c.ShowOptions(ctx, s.ID, ScopeWindow); err != nil {
+		t.Fatalf("ShowOptions(window): %v", err)
+	}
+	if windowOpts["@scoped"] != "window-value" {
+		t.Errorf("ShowOptions at ScopeWindow does not hold @scoped: %q", windowOpts["@scoped"])
+	}
+}
+
 // TestIntegrationShowHooksReportsPerTargetHooks is M4: the comment on
 // ShowHooks used to warn that "show-hooks -t" reports nothing on 3.2a even for
 // a hook that was set successfully. It does report it.
@@ -2289,6 +2435,85 @@ func TestIntegrationControlRefusesCommandBlocks(t *testing.T) {
 	}
 	if reply.String() != "in-step" {
 		t.Errorf("reply = %q, want %q", reply.String(), "in-step")
+	}
+}
+
+// TestIntegrationControlRefusesALineThatMakesNoCommand is the other half of
+// the test above against real tmux, and the half no fixture could produce: the
+// unit reader is driven from tables of lines the test writes and always
+// answers with a block, so "a command that never gets one" is not a state it
+// can reach.
+//
+// Left unrefused, one comment line desynchronises the connection for good.
+// tmux writes nothing for it, the reader binds replies by queue order, so the
+// comment is handed the next command's output with a nil error and every
+// command after that times out — with Err, Done and Stderr all reporting a
+// healthy connection.
+func TestIntegrationControlRefusesALineThatMakesNoCommand(t *testing.T) {
+	cc, _ := testControl(t)
+	ctx := testCtx(t)
+
+	// The deadline is an assertion here, not a safety net: the failure being
+	// guarded against is silence, so a test that only asked for a non-nil
+	// error would be satisfied by the timeout the missing check produces. The
+	// refusal has to come back before the line is written.
+	fast, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for _, cmd := range []string{
+		"#comment",
+		"  #x",
+		"#{session_id}",
+		"#c ; list-sessions",
+	} {
+		switch _, err := cc.Do(fast, cmd); {
+		case err == nil:
+			t.Errorf("Do(%q) was accepted", cmd)
+		case errors.Is(err, context.DeadlineExceeded):
+			t.Errorf("Do(%q) was sent and then waited for a block tmux never writes", cmd)
+		}
+	}
+
+	// Still in step, which is the whole point: no line was written, so no
+	// block is owed to anyone.
+	reply, err := cc.Do(ctx, "display-message -p in-step")
+	if err != nil {
+		t.Fatalf("Do after the refusals: %v (stderr: %s)", err, cc.Stderr())
+	}
+	if reply.String() != "in-step" {
+		t.Errorf("reply = %q, want %q", reply.String(), "in-step")
+	}
+
+	// A '#' anywhere but the front is answered by tmux, so it must not be
+	// refused here. The first is a truncation and the second is data, and both
+	// earn their block.
+	if reply, err = cc.Do(ctx, "display-message -p kept #tail"); err != nil {
+		t.Errorf("Do with a mid-line '#': %v", err)
+	} else if reply.String() != "kept" {
+		t.Errorf("reply = %q, want %q — tmux truncates at the '#' and still answers", reply.String(), "kept")
+	}
+	if reply, err = cc.Do(ctx, "display-message -p a#Hb"); err != nil {
+		t.Errorf("Do with a '#' inside a token: %v", err)
+	} else if reply.String() == "" {
+		t.Error("a '#' inside a token produced an empty reply")
+	}
+
+	// And the reason DoArgs needs no check of its own: the quoting makes a
+	// leading '#' a command name, which tmux answers with an error block
+	// rather than with silence. An error here is the right answer; a timeout
+	// would not be.
+	switch _, err := cc.DoArgs(ctx, "#comment"); {
+	case err == nil:
+		t.Error("DoArgs(\"#comment\") succeeded; tmux knows no such command")
+	case errors.Is(err, context.DeadlineExceeded):
+		t.Error("DoArgs(\"#comment\") timed out; the quoted '#' opened a comment after all")
+	}
+
+	// The connection survived all of it.
+	if reply, err = cc.Do(ctx, "display-message -p still-here"); err != nil {
+		t.Fatalf("Do at the end: %v (stderr: %s)", err, cc.Stderr())
+	}
+	if reply.String() != "still-here" {
+		t.Errorf("reply = %q, want %q", reply.String(), "still-here")
 	}
 }
 

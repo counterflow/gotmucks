@@ -9,26 +9,59 @@ import (
 
 // OptionScope selects which of tmux's option tables a command addresses.
 //
-// tmux keeps separate tables for server, session, window and pane options and
-// picks between them with a flag. Getting this wrong is the usual reason a
-// set-option appears to succeed but changes nothing.
+// It selects less than the name suggests, and the difference is the reason
+// [Client.SetOption] and [Client.ShowOptions] are not inverses. tmux does keep
+// separate tables for server, session, window and pane options — but for a
+// name it knows it picks between them by the *name*, not by the flag, exactly
+// as it does for a hook name. Measured on 3.2a:
+//
+//	set-option    -t <session> -- remain-on-exit on   // a window option
+//	show-options  -t <session> -- remain-on-exit      // remain-on-exit on
+//	show-options  -t <session>                        // does not list it
+//	show-options  -w -t <session>                     // remain-on-exit on
+//
+// Swept rather than sampled: over all eighty-seven names in this binary's two
+// global tables, "show-options -g -- name" and "show-options -g -w -- name"
+// answer identically, and over all seventeen server names so do
+// "show-options -s -- name" and "show-options -- name". The flag is ignored.
+//
+// Three things do obey it, and they are why this type exists:
+//
+//   - A user option, the ones beginning with '@'. It has no entry in tmux's
+//     table, so there is no name to follow and the flag is all there is:
+//     "set-option -w -t <session> @a v" is invisible to
+//     "show-options -t <session> -- @a".
+//   - The listing form with no name, which is what [Client.ShowOptions] uses.
+//     It reads the one table the flag names, whatever is in the others.
+//   - '-p', for the few names tmux files under window *and* pane, of which
+//     remain-on-exit is one — see [Client.SetRemainOnExit]. That is the single
+//     case where the flag alters a known name's table rather than being
+//     ignored by it.
+//
+// '-g' is a fourth thing and a different kind, because it does not choose a
+// table so much as choose the global counterpart of whichever table the name
+// already chose: measured on 3.2a, "set-option -g -- remain-on-exit on" is
+// listed by "show-options -g -w" and not by "show-options -g".
+//
+// So a wrong scope on a built-in name does not, as this comment used to claim,
+// make a set-option succeed and change nothing. It sets the option, in the
+// table tmux chose; what it changes is which listing can find it afterwards.
 type OptionScope int
 
 const (
-	// ScopeSession addresses session options, tmux's default for
-	// set-option and show-options.
+	// ScopeSession passes no scope flag, which is tmux's default for
+	// set-option and show-options and reaches session options.
 	ScopeSession OptionScope = iota
-	// ScopeServer addresses server options, tmux's -s.
+	// ScopeServer is tmux's -s, which reaches server options.
 	ScopeServer
-	// ScopeGlobal addresses the global table for the option's own type,
-	// tmux's -g.
+	// ScopeGlobal is tmux's -g, the global table for the option's own type.
 	ScopeGlobal
-	// ScopeWindow addresses window options, tmux's -w.
+	// ScopeWindow is tmux's -w, which reaches window options.
 	ScopeWindow
-	// ScopePane addresses pane options, tmux's -p.
+	// ScopePane is tmux's -p, which reaches pane options.
 	ScopePane
-	// ScopeGlobalWindow addresses the global window option table, tmux's
-	// -g -w together.
+	// ScopeGlobalWindow is tmux's -g and -w together, the global window
+	// option table.
 	ScopeGlobalWindow
 )
 
@@ -147,15 +180,30 @@ func checkOptionName(name string) error {
 	return nil
 }
 
-// SetOption sets a session option on a target.
+// SetOption sets an option on a target, addressed at tmux's session scope.
 //
-// For options that live in another table — a window option such as
-// remain-on-exit, or a server option — use [Client.SetOptionScoped].
+// The scope is not what decides where the option goes, so this is not limited
+// to session options: tmux files a name it knows in that name's own table
+// whatever flag it is given, and measured on 3.2a this sets remain-on-exit (a
+// window option) and escape-time (a server option) just as successfully as
+// status. See [OptionScope].
+//
+// What the scope decides is a user option, which has no table of its own, and
+// which *listing* the option turns up in afterwards. An option set here that
+// tmux does not file under session is found by [Client.ShowOption] and is not
+// in [Client.ShowOptions] at [ScopeSession]. Use [Client.SetOptionScoped] with
+// the option's own table when the two have to agree.
 func (c *Client) SetOption(ctx context.Context, t Target, name, value string) error {
 	return c.SetOptionScoped(ctx, t, ScopeSession, name, value)
 }
 
 // SetOptionScoped sets an option in a named scope.
+//
+// The scope reaches the write only for a user option and for the '-p' of a
+// window-or-pane name; tmux files every other known name by the name. What it
+// always reaches is the read, since [Client.ShowOptions] lists one table — so
+// this is the call to use when an option has to appear in a listing of the
+// scope it was set through. See [OptionScope].
 //
 // The name is checked by [checkOptionName]: tmux would store one containing a
 // space perfectly well, and neither reader here could tell it from a name and
@@ -176,6 +224,12 @@ func (c *Client) SetOptionScoped(ctx context.Context, t Target, scope OptionScop
 
 // UnsetOption removes an option, restoring the inherited value. This is
 // tmux's set-option -u.
+//
+// set-option -u follows a name to the same table set-option wrote it to, so
+// this and [Client.SetOption] are inverses whatever scope either is given —
+// measured on 3.2a, unsetting remain-on-exit through a session target empties
+// the window table entry a session-scoped set put there. Only the listing in
+// [Client.ShowOptions] is bound by the flag.
 func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, name string) error {
 	if err := checkOptionName(name); err != nil {
 		return err
@@ -190,20 +244,30 @@ func (c *Client) UnsetOption(ctx context.Context, t Target, scope OptionScope, n
 	return c.runOK(ctx, args...)
 }
 
-// ShowOption returns the value of a single option and whether it is set in
-// the requested table.
+// ShowOption returns the value of a single option and whether it is set on
+// the target rather than inherited.
+//
+// That is what the bool means, and it is not "set in the table you asked for".
+// tmux resolves a name it knows to that name's own table and reads it from
+// there, so the scope is honoured only for a user option and for the '-p' of a
+// window-or-pane name — see [OptionScope]. What the bool does distinguish is
+// the distinction this call exists for: measured on 3.2a with status set
+// globally to off and nothing set on the session, ShowOption at [ScopeSession]
+// reports ("", false, nil) rather than the inherited value.
 //
 // A name tmux does not know, a server that is not running and a target that
 // does not exist are all absences rather than failures: the value is empty,
 // the bool is false, and the error is nil.
 //
 // It asks show-options for one name rather than using show-options -v, even
-// though -v would print the value with no quoting to undo. -v cannot answer
-// the question this function exists to answer: an option that is not set in
-// the table produces exit 0 and an empty line, exactly like one that is set
-// to the empty string — verified on 3.2a. The named form prints nothing at
-// all when the option is not set there, which is the distinction the bool
-// reports.
+// though -v would print the value with no quoting to undo. Two reasons, and
+// neither is the one this comment used to give. The named form is what lets
+// this refuse an array rather than answer with its first element, and it
+// shares its quoting and vis decode with [Client.ShowOptions] instead of being
+// a second path to keep right. The reason it used to give — that -v cannot
+// tell an unset option from one set to the empty string — is false on 3.2a,
+// measured with od: unset prints no bytes at all and empty prints one newline,
+// which is exactly the difference [splitLines] already preserves.
 //
 // An array option — status-format, command-alias — has no single value and is
 // an error here rather than a quiet answer of its first element. Read one with
@@ -306,6 +370,17 @@ func isUnknownOptionStderr(stderr string) bool {
 }
 
 // ShowOptions returns every option in a scope.
+//
+// One scope, and this is the one call in the package where the scope is the
+// whole answer: tmux's listing form takes no name to follow, so it reads the
+// table the flag names and nothing else. That makes this and [Client.SetOption]
+// not inverses. An option appears here only if the scope given to this call is
+// the table tmux filed the *name* under, which for a built-in name has nothing
+// to do with the scope it was set with — measured on 3.2a,
+// SetOption(t, "remain-on-exit", "on") succeeds, ShowOption finds it at
+// [ScopeSession], [ScopeWindow] and [ScopeServer] alike, and ShowOptions at
+// [ScopeSession] does not list it. See [OptionScope]. There is no call here
+// for "everything set on this object"; ask each scope in turn.
 //
 // tmux prints one "name value" pair per line, quoting values that need it and
 // escaping the characters that would otherwise break the line; both are undone
@@ -430,6 +505,13 @@ const argsEscapeQuoted = "#';${}%\""
 // vanishing, so it gets a named helper. The scope follows the target: pane
 // options for a [PaneID], window options otherwise, which is where tmux keeps
 // remain-on-exit for each.
+//
+// It is also the one place in the package where the scope is doing real work
+// on a built-in name. tmux files remain-on-exit under window *and* pane, and
+// '-p' is the flag that picks between them — measured on 3.2a, "set-option -p"
+// puts it in the pane table and "set-option" with no flag in the window table,
+// while every other built-in name ignores the flag entirely. See
+// [OptionScope].
 func (c *Client) SetRemainOnExit(ctx context.Context, t Target, on bool) error {
 	scope := ScopeWindow
 	if _, isPane := t.(PaneID); isPane {

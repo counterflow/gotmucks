@@ -132,6 +132,16 @@
 // hook wherever it is addressed. [Client.ShowHooks] reads all three tables for
 // that reason, since [Client.SetHook] has no say in which one is used.
 //
+// A plain option is filed the same way, and the consequence is sharper because
+// there is no merging it away: tmux ignores the scope flag for a name it knows
+// and so does the named form of show-options, while the *listing* form obeys
+// it. So [Client.SetOption] and [Client.ShowOptions] are not inverses — an
+// option set at [ScopeSession] that tmux files under window is found by
+// [Client.ShowOption] and is absent from [Client.ShowOptions] at that scope.
+// Unlike a hook name, an option name legitimately exists in several tables at
+// once with different values, so the tables cannot be merged; [OptionScope]
+// says which of the two readers to believe about what.
+//
 // [Row] is the raw view and decodes nothing: it is what tmux wrote.
 //
 // # No server running

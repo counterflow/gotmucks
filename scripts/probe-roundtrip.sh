@@ -48,7 +48,16 @@
 # in a name rather than decoding them, and A9 is what says the refusal is still
 # the right shape.
 #
-# Nine things below are assertions rather than reports, and the script exits
+# And one thing that is about neither, but about the third argument of the same
+# call: the SCOPE. Which table tmux keeps something in is a claim of its own,
+# and asking it of a hook name is how round eleven found that show-hooks reads
+# one table while set-hook writes by the name. A plain option does exactly the
+# same thing — set-option and the named form of show-options both follow the
+# name, while the listing form and a user option follow the flag — so an option
+# set at one scope is missing from the listing of that scope, silently. That is
+# A10, and it is why the section numbering here goes to ten.
+#
+# Ten things below are assertions rather than reports, and the script exits
 # non-zero if any of them stops holding, because each one is a way this package
 # would hand back a value that is not the one that went in:
 #
@@ -80,6 +89,11 @@
 #       positions, and the only ones that break the "name value" split are the
 #       ones checkOptionName refuses — so a tmux that started escaping a name,
 #       or one that stopped, is caught here rather than in a caller's map.
+#   A10 a known option name ignores the scope flag, in both the write and the
+#       named read, while the listing form and a user option obey it. Swept
+#       over every name in this binary's tables for the read half. A tmux that
+#       started honouring the flag would leave the three doc comments that now
+#       describe this wrong the other way round.
 #
 #   ./scripts/probe-roundtrip.sh [tmux-binary]
 
@@ -709,6 +723,83 @@ echo "  fires — nothing reads it back as a hook:"
 printf '    show-hooks   -> [%s]\n' "$("${T[@]}" show-hooks -t "$SESS" | tr '\n' '|')"
 printf '    show-options -> [%s]\n' "$("${T[@]}" show-options -t "$SESS" -- '@nothook')"
 "${T[@]}" set-option -t "$SESS" -u -- '@nothook' 2>/dev/null
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 10. the table question of section 4, asked of an option (A10) ---"
+echo "  set-hook files a hook by its NAME rather than by the target, and"
+echo "  section 4 is what pins that. Plain options do the same thing and it"
+echo "  went unasked a round longer: set-option ignores the scope flag for a"
+echo "  name tmux knows, and so does the NAMED form of show-options. Only the"
+echo "  listing form and a user option obey it — which is why SetOption and"
+echo "  ShowOptions are not inverses, silently."
+
+echo
+echo "  first the sweep: for a name it knows, does the flag change the answer?"
+echo "  the global tables have every option set, so this asks the whole table"
+echo "  without writing anything."
+sess_names=$("${T[@]}" show-options -g | sed 's/\[[0-9]*\]//; s/ .*//' | sort -u)
+win_names=$("${T[@]}" show-options -g -w | sed 's/\[[0-9]*\]//; s/ .*//' | sort -u)
+srv_names=$("${T[@]}" show-options -s | sed 's/\[[0-9]*\]//; s/ .*//' | sort -u)
+printf '    global session table %s names, global window table %s, server %s\n' \
+	"$(printf '%s\n' "$sess_names" | wc -l)" \
+	"$(printf '%s\n' "$win_names" | wc -l)" \
+	"$(printf '%s\n' "$srv_names" | wc -l)"
+IGNORED=0
+for n in $sess_names $win_names; do
+	[ -n "$n" ] || continue
+	a=$("${T[@]}" show-options -g -- "$n" 2>&1 | head -1)
+	b=$("${T[@]}" show-options -g -w -- "$n" 2>&1 | head -1)
+	if [ "$a" = "$b" ]; then
+		IGNORED=$((IGNORED + 1))
+		continue
+	fi
+	fail A10 "named show-options for [$n] depends on the flag: -g [$a] -g -w [$b]"
+done
+for n in $srv_names; do
+	[ -n "$n" ] || continue
+	a=$("${T[@]}" show-options -s -- "$n" 2>&1 | head -1)
+	b=$("${T[@]}" show-options -- "$n" 2>&1 | head -1)
+	if [ "$a" = "$b" ]; then
+		IGNORED=$((IGNORED + 1))
+		continue
+	fi
+	fail A10 "named show-options for server option [$n] depends on the flag: -s [$a] plain [$b]"
+done
+printf '    %d names answer the same whatever flag they are asked with\n' "$IGNORED"
+
+echo
+echo "  then the write, which is the half a caller sees: a window option set"
+echo "  through a session target, with no window flag anywhere."
+"${T[@]}" set-option -t "$SESS" -- remain-on-exit on || fail A10 "set-option refused a window option at session scope"
+printf '    show-options    -t -- remain-on-exit : [%s]\n' "$("${T[@]}" show-options -t "$SESS" -- remain-on-exit)"
+printf '    show-options    -t   (listing)       : [%s]\n' "$("${T[@]}" show-options -t "$SESS" | grep '^remain-on-exit' || echo '<absent>')"
+printf '    show-options -w -t   (listing)       : [%s]\n' "$("${T[@]}" show-options -w -t "$SESS" | grep '^remain-on-exit' || echo '<absent>')"
+[ -n "$("${T[@]}" show-options -t "$SESS" -- remain-on-exit)" ] ||
+	fail A10 "the named form cannot see an option set at session scope; ShowOption would report it unset"
+[ -z "$("${T[@]}" show-options -t "$SESS" | grep '^remain-on-exit')" ] ||
+	fail A10 "the session listing now holds a window option; ShowOptions' doc says it cannot"
+[ -n "$("${T[@]}" show-options -w -t "$SESS" | grep '^remain-on-exit')" ] ||
+	fail A10 "the window listing does not hold it either; the option is somewhere neither reader looks"
+
+echo "  and set-option -u follows the name to the same table, so the two"
+echo "  writers stay inverses however they are scoped:"
+"${T[@]}" set-option -u -t "$SESS" -- remain-on-exit
+printf '    show-options -w -t after -u          : [%s]\n' "$("${T[@]}" show-options -w -t "$SESS" | grep '^remain-on-exit' || echo '<absent>')"
+[ -z "$("${T[@]}" show-options -w -t "$SESS" | grep '^remain-on-exit')" ] ||
+	fail A10 "set-option -u at session scope did not reach the window table set-option wrote to"
+
+echo
+echo "  a USER option is the other way round: no name for tmux to follow, so"
+echo "  the flag is the whole of where it lives."
+"${T[@]}" set-option -w -t "$SESS" -- @scoped window-value
+printf '    show-options    -t -- @scoped        : [%s]\n' "$("${T[@]}" show-options -t "$SESS" -- @scoped)"
+printf '    show-options -w -t -- @scoped        : [%s]\n' "$("${T[@]}" show-options -w -t "$SESS" -- @scoped)"
+[ -z "$("${T[@]}" show-options -t "$SESS" -- @scoped)" ] ||
+	fail A10 "a user option set with -w is visible without it; the scope no longer places one"
+[ -n "$("${T[@]}" show-options -w -t "$SESS" -- @scoped)" ] ||
+	fail A10 "a user option set with -w is invisible with it"
+"${T[@]}" set-option -u -w -t "$SESS" -- @scoped 2>/dev/null
 
 echo
 if [ "$FAIL" -ne 0 ]; then

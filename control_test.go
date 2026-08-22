@@ -1160,15 +1160,30 @@ func TestDoRejectsUnsendableCommands(t *testing.T) {
 	// answers each with its own block, so the second reply lands on whichever
 	// command comes next. A brace block is that same defect in tmux's other
 	// quoting form — see scripts/probe-blocks.sh.
+	//
+	// The comment lines are the same defect counted downwards, and are the
+	// worse half: no block at all, so this command takes the next one's reply
+	// with a nil error — see TestDoRefusesALineThatMakesNoCommand.
 	cmds := []string{
 		"", "   ", "a\nb", "a\x00b",
 		"list-sessions ; list-sessions",
 		`if-shell "true" { list-sessions }`,
 		`if-shell "true" {list-sessions}`,
+		"#comment", "  #x", "#{session_id}",
 	}
+	// Bounded, and the deadline is part of the assertion. The fixture answers
+	// only what a test tells it to, so any line that got past the check would
+	// wait on a reply nobody is going to write — which under an unbounded
+	// context is a ten-minute hang and under a merely non-nil error check
+	// would read as a pass.
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
 	for _, cmd := range cmds {
-		if _, err := c.cc.Do(context.Background(), cmd); err == nil {
+		switch _, err := c.cc.Do(ctx, cmd); {
+		case err == nil:
 			t.Errorf("Do(%q) was accepted", cmd)
+		case errors.Is(err, context.DeadlineExceeded):
+			t.Errorf("Do(%q) was written and then waited for a reply", cmd)
 		}
 	}
 
@@ -1179,6 +1194,137 @@ func TestDoRejectsUnsendableCommands(t *testing.T) {
 	case line := <-c.sent.lines:
 		t.Errorf("a rejected command was written anyway: %q", line)
 	default:
+	}
+}
+
+// TestDoRefusesALineThatMakesNoCommand is TestCommandBreak asked in the other
+// direction, which is the direction nothing asked for twelve rounds.
+//
+// Every guard on Do counted upwards: an empty line detaches the client, a
+// newline makes a second command, a ';' or a token-initial '{' earns an extra
+// reply block. A line that earns *no* block was not a state the fixture below
+// can even produce — the ctl harness always answers what it is sent — and it
+// is the worse failure of the two. Measured on 3.2a, "#comment" is parsed to
+// an empty command list and tmux writes nothing at all, after which the
+// reader hands this command the next one's block with a nil error and every
+// command after that waits for ever, while Err, Done and Stderr all report a
+// healthy connection.
+func TestDoRefusesALineThatMakesNoCommand(t *testing.T) {
+	c := newCtl(t)
+
+	// Bounded, and the deadline is an assertion rather than a safety net. The
+	// failure this guards against is silence, so "Do returned an error" is not
+	// enough on its own: without the check the line is written, no block ever
+	// comes back, and Do returns the context's error — which would satisfy a
+	// test that only asked for a non-nil one, slowly. The refusal has to
+	// arrive before anything is sent.
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	for _, cmd := range []string{
+		"#comment", "#", "#x", "  #x", "#\tx", "\t#x",
+		"#{session_id}",      // an unquoted format is a comment, not a format
+		"#c ; list-sessions", // the comment eats the separator, so this is no break
+		"# { list-sessions }",
+	} {
+		switch _, err := c.cc.Do(ctx, cmd); {
+		case err == nil:
+			t.Errorf("Do(%q) was accepted; tmux answers that line with no block at all", cmd)
+		case errors.Is(err, context.DeadlineExceeded):
+			t.Errorf("Do(%q) was sent and then waited for a block tmux never writes", cmd)
+		}
+	}
+	select {
+	case line := <-c.sent.lines:
+		t.Errorf("a refused comment was written anyway: %q", line)
+	default:
+	}
+
+	// A '#' that is not the first non-blank byte is either data or a
+	// truncation, and either way the command still earns its block. Refusing
+	// it would cost a caller a line tmux answers perfectly well.
+	const cmd = "list-sessions #tail"
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), testTimeout)
+	defer sendCancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := c.cc.Do(sendCtx, cmd); err != nil {
+			t.Errorf("Do(%q): %v", cmd, err)
+		}
+	}()
+	if got := c.serveOne(1); got != cmd {
+		t.Errorf("wrote %q, want %q", got, cmd)
+	}
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("the accepted command never completed")
+	}
+}
+
+// TestDoArgsSendsALeadingHashQuoted is why the check above belongs to Do
+// alone. DoArgs is unaffected for a reason rather than by luck: '#' is not in
+// safeByte, so the first argument is quoted and tmux reads it as a command
+// name it does not know — which earns an error block like any other.
+func TestDoArgsSendsALeadingHashQuoted(t *testing.T) {
+	c := newCtl(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := c.cc.DoArgs(ctx, "#comment"); err != nil {
+			t.Errorf("DoArgs with a leading '#': %v", err)
+		}
+	}()
+	if got := c.serveOne(1); got != `'#comment'` {
+		t.Errorf("DoArgs wrote %q, want %q", got, `'#comment'`)
+	}
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("DoArgs never completed")
+	}
+}
+
+func TestCommentStart(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		want int // -1 if the line makes a command
+	}{
+		{`list-sessions`, -1},
+		{`#comment`, 0},
+		{`#`, 0},
+		{`  #x`, 2},
+		{"\t#x", 1},
+		{"#\tx", 0},
+		// An unquoted format is a comment, which is why safeByte excludes '#'
+		// and every format this package sends is quoted.
+		{`#{session_id}`, 0},
+		// The comment runs to the end of the line, so it swallows both of the
+		// bytes commandBreak looks for. Do asks this question first for that
+		// reason: blaming the ';' would name a byte that does nothing here.
+		{`#c ; list-sessions`, 0},
+		{`# { list-sessions }`, 0},
+		// Anywhere but the front is not a comment for this purpose. Mid-token
+		// it is data, mid-line it truncates a command that is still answered,
+		// and quoted or escaped it is a command name.
+		{`list-sessions #tail`, -1},
+		{`a#b`, -1},
+		{`'#comment'`, -1},
+		{`\#comment`, -1},
+		{`   `, -1},
+		{``, -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cmd, func(t *testing.T) {
+			if got := commentStart(tt.cmd); got != tt.want {
+				t.Errorf("commentStart(%q) = %d, want %d", tt.cmd, got, tt.want)
+			}
+		})
 	}
 }
 

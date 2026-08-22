@@ -1206,9 +1206,17 @@ func TestShowOptionUnknownIsAbsent(t *testing.T) {
 	}
 }
 
-// TestShowOptionUnsetIsAbsent is the case show-options -v cannot answer: an
-// option that is not set in the requested table exits 0 and prints nothing,
-// which -v renders as an empty value indistinguishable from one set to "".
+// TestShowOptionUnsetIsAbsent pins the empty reply as an absence: tmux exits 0
+// and prints nothing at all for an option it has, resolved to its own table
+// and found unset there.
+//
+// This comment used to say the named form was chosen because -v cannot tell
+// that from an option set to the empty string. It can — measured on 3.2a with
+// od, -v prints no bytes for an unset option and one newline for an empty one.
+// The reasons that hold are the two [Client.ShowOption] now gives: the named
+// form is what lets it refuse an array, and it shares its decoding with
+// [Client.ShowOptions]. The argv assertion below is still worth having, since
+// switching to -v would change what the bool means.
 func TestShowOptionUnsetIsAbsent(t *testing.T) {
 	f := newFake(t, faketmux.Script{
 		Responses: map[string]faketmux.Response{
@@ -1222,7 +1230,8 @@ func TestShowOptionUnsetIsAbsent(t *testing.T) {
 	if ok || v != "" {
 		t.Errorf("got (%q, %v), want (\"\", false) for an option that is not set", v, ok)
 	}
-	// -v would defeat the whole point of the bool, so its absence is pinned.
+	// The named form, with no -v: an array would come back as element zero and
+	// the value would need a decoder of its own.
 	f.wantArgv(0, "show-options", "-g", "--", "status-left")
 }
 
