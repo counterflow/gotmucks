@@ -281,6 +281,33 @@ func sessionNameAsStored(name string) string {
 // validateEnv rejects environment keys tmux cannot express. tmux splits -e on
 // the first '=', so a key containing '=' would silently become part of the
 // value, and an empty key is meaningless.
+//
+// The set is deliberately narrower than [checkOptionName]'s, and the reason is
+// which byte is the delimiter. An option is printed back as "name value", so
+// the space that separates the two fields cannot appear in a name; an
+// environment pair is printed as "KEY=value", so the delimiter is the '=' and
+// a space in a key is unambiguous — measured on 3.2a, "-e 'A B=v'" is exit 0
+// and show-environment prints "A B=v" on one line. Refusing the space here
+// would refuse something that works.
+//
+// A newline is where the two do converge, and it is left alone for a reason
+// worth stating rather than for none. It splits the show-environment listing
+// exactly as it splits show-options, but the value reaches the pane's process
+// intact — measured, "-e $'VAL=a\nb'" arrives in the process environment as
+// the seven bytes "VAL=a\nb", which is a legitimate thing for a caller to
+// want. The ambiguity is confined to a listing this package never asks for:
+// there is no environment reader here, so nothing misreads it the way
+// [Client.ShowOptions] would. If one is ever added, this is where the check
+// belongs, and the option-name check is the shape to copy.
+//
+// Neither half of an -e pair is format-expanded, which bounds [escapeFormat]
+// to its five arguments and is the one claim here that would be dangerous to
+// get wrong: an expanded key would make an unescaped "#(...)" in one a shell
+// command rather than a wrong name, and on the control path — where the client
+// outlives its own job — it would run. Measured both ways down a control
+// connection, neither the key nor the value runs one. Assertion A2 in
+// scripts/probe-roundtrip.sh sweeps it, so a tmux that started expanding
+// either fails the build rather than a caller.
 func validateEnv(env map[string]string) error {
 	for k := range env {
 		if k == "" {

@@ -535,18 +535,55 @@ printf '     set-hook command  -> [%s]\n' "$("${T[@]}" show-hooks -t "$SESS" | h
 "${T[@]}" set-hook -u -t "$SESS" -- alert-bell
 
 # The other two arguments new-session takes from a caller. Neither is expanded
-# on 3.2a, and the command vector is an assertion because it is the one where
-# expansion would be a shell running a caller's data.
+# on 3.2a, and both are assertions rather than reports, because expansion in
+# either is a shell running a caller's data rather than a wrong name.
+#
+# The -e KEY is the half nothing had asked. Everything above is a value or a
+# name; a key is the third thing new-session takes from a caller, and
+# validateEnv guards it on a claim about tmux splitting at the first '=' that
+# says nothing about expansion. Both halves of the pair are swept.
 rm -f "$WORK/argv"
-NS=$("${T[@]}" new-session -d -P -F '#{session_id}' -e 'PROBE=v#{host}' -x 80 -y 24 -- \
+NS=$("${T[@]}" new-session -d -P -F '#{session_id}' \
+	-e 'PROBE=v#{host}' -e 'K#{host}=keyprobe' -x 80 -y 24 -- \
 	sh -c 'printf "%s" "$1" >"$0"; sleep 600' "$WORK/argv" 'v#{host}')
 sleep 0.6
-printf '     new-session -e    -> [%s]\n' \
-	"$(vis "$("${T[@]}" show-environment -t "$NS" PROBE 2>/dev/null)")"
-printf '     the -- vector     -> [%s]\n' "$(vis "$(cat "$WORK/argv" 2>/dev/null)")"
+envval=$("${T[@]}" show-environment -t "$NS" PROBE 2>/dev/null)
+printf '     new-session -e value -> [%s]\n' "$(vis "$envval")"
+[ "$envval" = 'PROBE=v#{host}' ] ||
+	fail A2 "new-session -e expands its value on this tmux; it did not on 3.2a"
+
+# The key is read back off the full listing, since show-environment takes the
+# name to look up and the name is the thing under test.
+envkey=$("${T[@]}" show-environment -t "$NS" 2>/dev/null | grep 'keyprobe')
+printf '     new-session -e key   -> [%s]\n' "$(vis "$envkey")"
+[ "$envkey" = 'K#{host}=keyprobe' ] ||
+	fail A2 "new-session -e expands its key on this tmux; it did not on 3.2a"
+
+printf '     the -- vector        -> [%s]\n' "$(vis "$(cat "$WORK/argv" 2>/dev/null)")"
 [ "$(cat "$WORK/argv" 2>/dev/null)" = 'v#{host}' ] ||
 	fail A2 "new-session's command vector is expanded on this tmux; it was not on 3.2a"
 "${T[@]}" kill-session -t "$NS"
+
+# And the half that decides whether an unescaped '#' in a key is a wrong name
+# or a shell command: the job form, down a control connection, which is the
+# client that stays alive long enough to run one. Nothing is escaped here on
+# purpose — this is the measurement escapeFormat's bounds rest on.
+rm -f "$WORK/ran-e-key" "$WORK/ran-e-val"
+{
+	sleep 0.6
+	printf "new-session -d -e '#(touch %s/ran-e-key; echo K)=v' -x 80 -y 24 -- sleep 600\n" "$WORK"
+	sleep 1.0
+	printf "new-session -d -e 'K=#(touch %s/ran-e-val; echo V)' -x 80 -y 24 -- sleep 600\n" "$WORK"
+	sleep 2.0
+} | "${T[@]}" -C attach-session -t "$SESS" >"$WORK/ctl-env.out" 2>&1
+ranmark ran-e-key "control new-session -e key"
+ranmark ran-e-val "control new-session -e value"
+if [ -e "$WORK/ran-e-key" ] || [ -e "$WORK/ran-e-val" ]; then
+	fail A2 "new-session -e runs a #() job on this tmux; escapeFormat's five arguments are no longer all of them"
+fi
+for s in $("${T[@]}" list-sessions -F '#{session_id}' 2>/dev/null); do
+	[ "$s" = "$SESS" ] || "${T[@]}" kill-session -t "$s" 2>/dev/null
+done
 
 # ---------------------------------------------------------------------------
 echo

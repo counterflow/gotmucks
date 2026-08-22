@@ -1439,6 +1439,188 @@ func TestCommandBreak(t *testing.T) {
 	}
 }
 
+// FuzzDoArgsProducesASendableLine joins the two halves nothing joined.
+//
+// commandBreak and commentStart are tested against strings the tests write,
+// and scripts/probe-blocks.sh tests tmux against lines the probe writes. The
+// property between them is the one a caller depends on and nothing states:
+// every line [ControlClient.DoArgs] composes is one [ControlClient.Do]
+// accepts. It holds today only because safeByte happens to exclude ';', '{',
+// '#' and '%', so a case added to quoteArg that emitted one of them unquoted
+// would break no test.
+//
+// Every guard on Do is asserted here rather than only the two predicates,
+// because quoting is what has to satisfy all of them:
+//
+//   - no raw newline, which quoteArg splices as tmux's own "\n" escape so that
+//     an argument cannot become a second protocol line
+//   - a NUL in the line exactly when there is one in an argument. This is the
+//     two-sided half and it is deliberate: quoteArg does not escape a NUL, so
+//     Do refuses such a line, and asserting only "Do accepts" would be
+//     satisfied by a quoteArg that had started mangling its input
+//   - never the blank line that detaches the client
+//   - no command break, and no leading comment
+func FuzzDoArgsProducesASendableLine(f *testing.F) {
+	f.Add("display-message", "-p", "#{session_id}")
+	f.Add("#comment", "", "")
+	f.Add(";", "{", "}")
+	f.Add("kill-session", "-t", "a;")
+	f.Add("set-option", "@x", "a\nb")
+	f.Add("rename-window", "-t", "@0")
+	f.Add("refresh-client", "-A", "%0:continue")
+	f.Add(" ", "\t", "\r")
+	f.Add("'", `"`, `\`)
+	f.Add("~", "$HOME", "%if")
+	f.Add("a\x00b", "", "")
+
+	f.Fuzz(func(t *testing.T, a, b, c string) {
+		args := []string{a, b, c}
+		parts := make([]string, len(args))
+		for i, s := range args {
+			parts[i] = quoteArg(s)
+		}
+		line := strings.Join(parts, " ")
+
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			t.Fatalf("DoArgs(%q) composed %q, which holds a raw newline at %d and would be two commands",
+				args, line, i)
+		}
+		wantNUL := strings.ContainsRune(a+b+c, 0)
+		if gotNUL := strings.ContainsRune(line, 0); gotNUL != wantNUL {
+			t.Fatalf("DoArgs(%q) composed %q: NUL present = %v, want %v",
+				args, line, gotNUL, wantNUL)
+		}
+		if strings.TrimSpace(line) == "" {
+			t.Fatalf("DoArgs(%q) composed %q, which is the blank line that detaches the client",
+				args, line)
+		}
+		if br, i := commandBreak(line); i >= 0 {
+			t.Fatalf("DoArgs(%q) composed %q, which tmux reads as breaking at %q, byte %d",
+				args, line, string(br), i)
+		}
+		if i := commentStart(line); i >= 0 {
+			t.Fatalf("DoArgs(%q) composed %q, which tmux reads as a comment from byte %d",
+				args, line, i)
+		}
+	})
+}
+
+// TestAnExtraBlockGoesToTheCommandBehindIt pins the hazard [ControlClient.Do]
+// documents and cannot detect.
+//
+// "if-shell 'true' 'list-sessions'" earns two reply blocks and nothing on the
+// wire distinguishes the inner command's from any other argument, so
+// commandBreak cannot refuse it the way it refuses the brace form. What
+// happens then was documented and never tested: beginBlock binds by queue
+// order, so the extra block is given to whatever was outstanding behind it,
+// with a nil error.
+//
+// The ordering matters and is the reason this is not the same test as
+// TestUnsolicitedBlockIsAbsorbed. An extra block arriving with the queue empty
+// is absorbed harmlessly; it is only a shift when a second command is already
+// waiting, which is what this arranges.
+func TestAnExtraBlockGoesToTheCommandBehindIt(t *testing.T) {
+	c := newCtl(t)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	// Both commands are queued before either is answered. Do appends to the
+	// queue before it writes, so a command whose line has been read here is
+	// one the reader can already bind a block to.
+	first := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(ctx, "if-shell 'true' 'list-sessions'")
+		if err != nil {
+			t.Errorf("first Do: %v", err)
+		}
+		first <- r
+	}()
+	c.nextCommand()
+
+	second := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(ctx, "display-message -p mine")
+		if err != nil {
+			t.Errorf("second Do: %v", err)
+		}
+		second <- r
+	}()
+	c.nextCommand()
+
+	// tmux answers the first command twice: once for if-shell and once for
+	// the command it ran.
+	c.reply(1, "outer")
+	c.reply(2, "inner")
+
+	if got := (<-first).String(); got != "outer" {
+		t.Errorf("the first command got %q, want %q", got, "outer")
+	}
+	// Not what it asked for, and not an error either. This is the shift, and
+	// it is asserted rather than deplored: the package cannot see it coming,
+	// so what it must not do is change silently.
+	if got := (<-second).String(); got != "inner" {
+		t.Errorf("the second command got %q; the extra block is expected to land here", got)
+	}
+}
+
+// TestAMissingBlockLeavesItsCommandOutstanding is the same failure counted the
+// other way, and the one commentStart now prevents for the single shape it can
+// see.
+//
+// A command that earns no block is never answered. The reader has nothing to
+// notice: no line arrives, so nothing is malformed, and the connection stays
+// up and healthy while the caller waits on a reply that is not coming. Every
+// command behind it in the queue then takes the block in front of it.
+func TestAMissingBlockLeavesItsCommandOutstanding(t *testing.T) {
+	c := newCtl(t)
+
+	// Short, because the assertion is that this expires. A generous deadline
+	// would only make the test slow.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	answered := make(chan Reply, 1)
+	go func() {
+		r, err := c.cc.Do(ctx, "display-message -p answered")
+		if err != nil {
+			t.Errorf("the answered command: %v", err)
+		}
+		answered <- r
+	}()
+	c.nextCommand()
+
+	lost := make(chan error, 1)
+	go func() {
+		_, err := c.cc.Do(ctx, "display-message -p lost")
+		lost <- err
+	}()
+	c.nextCommand()
+
+	// One block for two commands.
+	c.reply(1, "answered")
+
+	if got := (<-answered).String(); got != "answered" {
+		t.Errorf("the first command got %q, want %q", got, "answered")
+	}
+	if err := <-lost; !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the unanswered command returned %v, want the caller's own deadline", err)
+	}
+
+	// And the part that makes this worth preventing rather than reporting:
+	// nothing on the connection says anything went wrong.
+	if err := c.cc.Err(); err != nil {
+		t.Errorf("Err() = %v; a missing block is invisible, which is the point", err)
+	}
+	select {
+	case <-c.cc.Done():
+		t.Error("Done() closed; the connection is still up")
+	default:
+	}
+	if s := c.cc.Stderr(); s != "" {
+		t.Errorf("Stderr() = %q, want empty", s)
+	}
+}
+
 // TestEventsDroppedRatherThanBlocking is the load-bearing property of the
 // reader: a consumer that stops reading must not be able to stall the
 // connection, because that would stall command replies and every other pane
@@ -2245,6 +2427,23 @@ func TestControlCommandArgv(t *testing.T) {
 				return cc.Subscribe(context.Background(), "cmd", SubscribePane("%3"), "#{pane_current_command}")
 			},
 			want: `refresh-client -B 'cmd:%3:#{pane_current_command}'`,
+		},
+		{
+			// SubscribeWindow had no caller in the suite at all, which the
+			// coverage profile is what said: an exported selector at 0.0%
+			// beside a SubscribePane that was covered.
+			name: "subscribe to one window",
+			run: func(cc *ControlClient) error {
+				return cc.Subscribe(context.Background(), "wname", SubscribeWindow("@2"), "#{window_name}")
+			},
+			want: `refresh-client -B 'wname:@2:#{window_name}'`,
+		},
+		{
+			name: "subscribe to all windows",
+			run: func(cc *ControlClient) error {
+				return cc.Subscribe(context.Background(), "wall", SubscribeAllWindows, "#{window_name}")
+			},
+			want: `refresh-client -B 'wall:@*:#{window_name}'`,
 		},
 		{
 			name: "unsubscribe",

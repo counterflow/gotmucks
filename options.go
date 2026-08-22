@@ -104,9 +104,21 @@ func (c config) globalArgs() []string {
 }
 
 // environ returns the environment for a tmux subprocess.
+//
+// nil and empty are different answers here, which is the whole difficulty:
+// os/exec reads a nil Env as "inherit this process's environment" and an empty
+// non-nil one as "no environment at all". So the slice returned for
+// [WithoutParentEnv] has to be non-nil even when there is nothing in it —
+// "append([]string(nil), nothing...)" gives back nil, which handed tmux the
+// entire parent environment and made the option a no-op in exactly the case a
+// caller reaches for it most plainly, WithoutParentEnv() with no WithEnv
+// beside it. Both consumers assign the result straight to exec.Cmd.Env
+// ([Client.run] and [Connect]), so there is nowhere else the distinction could
+// be recovered.
 func (c config) environ() []string {
 	if !c.inheritEnv {
-		return append([]string(nil), c.env...)
+		env := make([]string, 0, len(c.env))
+		return append(env, c.env...)
 	}
 	if len(c.env) == 0 {
 		return nil // nil means "inherit", per os/exec.
@@ -149,7 +161,10 @@ func WithEnv(env ...string) Option {
 }
 
 // WithoutParentEnv runs tmux with only the entries given to [WithEnv],
-// rather than inheriting this process's environment.
+// rather than inheriting this process's environment. On its own, with no
+// [WithEnv] beside it, that means an empty environment — see [config.environ],
+// where the difference between an empty environment and an inherited one is
+// the difference between an empty slice and a nil one.
 func WithoutParentEnv() Option {
 	return func(c *config) { c.inheritEnv = false }
 }
