@@ -10,7 +10,7 @@ tmux presents two interfaces, and this library covers both.
 
 | Half | What it does |
 |---|---|
-| **Commands** | One-shot tmux invocations: create, list, kill, send keys, set options, capture panes. Typed arguments, typed results parsed from format strings |
+| **Commands** | One-shot tmux invocations: create, list, kill, send keys, capture panes, set options and hooks. Typed arguments, typed results parsed from format strings |
 | **Control mode** | A persistent `tmux -C` client: send commands on one connection, receive live pane output and asynchronous notifications |
 
 Existing Go tmux packages cover parts of the first half only. The control-mode
@@ -31,6 +31,16 @@ s, err := c.NewSession(ctx, gotmucks.NewSessionOptions{
 
 panes, err := c.ListSessionPanes(ctx, s.ID)
 out, err := c.CapturePane(ctx, panes[0].ID, gotmucks.CaptureOptions{})
+```
+
+Options and hooks are typed the same way, and are read back decoded:
+
+```go
+c.SetOption(ctx, s.ID, "@deploy-target", "staging")
+v, ok, err := c.ShowOption(ctx, s.ID, gotmucks.ScopeSession, "@deploy-target")
+
+c.SetHook(ctx, s.ID, "alert-bell", "display-message rang")
+hooks, err := c.ShowHooks(ctx, s.ID)
 ```
 
 ## Control mode
@@ -61,6 +71,14 @@ order the commands were written in. Not by tmux's command number — those
 neither start at zero nor run contiguously, and tmux opens blocks of its own
 that no command asked for.
 
+Because replies are bound by order, a line must earn exactly one reply block.
+`Do` refuses the ways a line earns more than one — an unquoted `;`, a `{`
+beginning a token — and the way it earns none, a leading `#`, which is a
+comment tmux answers with nothing at all and which would hand this command the
+*next* one's reply. What cannot be detected is a command that makes tmux run
+further commands as an ordinary quoted string: `if-shell`, `bind-key` and
+`source-file` are documented rather than refused. `DoArgs` quotes for you.
+
 ---
 
 ## Design
@@ -86,6 +104,42 @@ metacharacters in it are inert. The one case where tmux will not honour that —
 a single-element vector, which tmux hands to the shell — is rejected rather
 than silently interpreted.
 
+**The vector is the boundary, with one exception.** tmux's own argv parser
+takes a trailing `;` off an element and ends the command there, so
+`RenameWindow("a;")` named the window `a` and an element of exactly `;`
+vanished — turning `SetOption(status, ";")` into a `set-option` with no value,
+which tmux reads as turning the flag *on*, with a nil error. `Client` escapes
+that one byte on the way out. Every other metacharacter survives an element
+intact.
+
+**A name is data, and tmux does not hand it back as given.** It expands a name
+as a format before storing it, so `v#{host}` would name a window after the
+host; and it stores names, and prints option values, escaped with vis(3), so a
+session called `$HOME` reads back as `\$HOME`. The writers escape and the
+readers decode — rows and notifications alike — so what was set is what comes
+back. One rewrite is not an encoding and cannot be undone by reading: tmux
+turns a `:` or a `.` in a *session* name into `_`, exits 0 and says nothing, so
+`web.example.com` would be a session called `web_example_com`. Those two bytes
+are refused rather than reported as a name nobody asked for. Windows keep both.
+
+**A name printed back is a delimiter.** `show-options` and `show-hooks` print
+`name value`, escape the value and print the name exactly as stored — and a
+user option's name is whatever the caller passed, since tmux validates only the
+leading `@`. A name containing a space comes back indistinguishable from a
+shorter name and a longer value; one containing a newline arrives as a second
+line that was never an option. Those bytes are refused in the readers as well
+as the writers.
+
+**Which table a thing is kept in follows its name, not the scope you ask for.**
+tmux files a known option or hook under the table its name belongs to and
+ignores the scope flag. `ShowHooks` therefore reads all three tables and
+merges, which is unambiguous because a hook name belongs to exactly one.
+Options cannot be merged — the same name legitimately exists in several tables
+with different values — so `SetOption` and `ShowOptions` are *not* inverses: an
+option set at `ScopeSession` that tmux files under window is found by
+`ShowOption` and is absent from `ShowOptions` at that scope. `OptionScope` says
+which reader to believe about what.
+
 **"No server running" is not an error.** tmux exits non-zero for it, but for a
 read that is an answer: `ListSessions` returns an empty slice, `HasSession` and
 `ServerRunning` return false, and none of them return an error.
@@ -107,9 +161,11 @@ indefinitely. `Resume` restarts it.
 
 ## Requirements
 
-- **tmux ≥ 3.2**, for `new-session -e`. Checked at connect time and covered in CI.
-- **Go ≥ 1.22.**
-- **No dependencies outside the standard library.**
+- **tmux ≥ 3.2**, for `new-session -e`. Checked at connect time; CI runs the
+  integration suite against 3.2a, 3.4 and 3.5a.
+- **Go ≥ 1.22**, built and tested in CI on 1.22 and stable.
+- **No dependencies outside the standard library.** CI fails if `go.sum` is
+  not empty.
 - Builds with `CGO_ENABLED=0`.
 
 tmux does not run on Windows. The package compiles anywhere but only functions
@@ -140,17 +196,23 @@ The unit suite runs against a stand-in tmux binary that records the argument
 vector it was given and replies byte for byte, so argv assembly and output
 parsing are both pinned without a tmux installation. Control-mode parsing is
 driven over in-memory pipes from tables of raw protocol lines. Output escaping
-is covered by round-trip fuzzing over arbitrary bytes.
+and control-line assembly are covered by fuzzing over arbitrary bytes
+(`FuzzRoundTrip`, `FuzzUnescapeArbitrary`, `FuzzDoArgsProducesASendableLine`).
 
 Integration tests run against real tmux on a private socket per test
 (`-L gotmucks-t<pid>-<n>`) and kill their server on the way out, so they can
 never touch a developer's own sessions.
 
-`scripts/` holds probe scripts that ask a tmux binary how it actually behaves —
-whether a command vector is `execvp`'d, whether control mode works over pipes,
-which format variables are populated. Several of this library's decisions came
-from running them rather than from reading the manual; run them against any
-tmux you add to the support matrix.
+`scripts/` holds probe scripts that ask a tmux binary how it actually behaves
+rather than what the manual says — whether a command vector is `execvp`'d,
+whether control mode works over pipes, which format variables are populated,
+which notification names are really written, how many reply blocks a line
+earns, and what a value looks like after a round trip through tmux. They are
+assertions and not reports: each exits non-zero when a tmux stops behaving the
+way the package depends on. Several of this library's decisions came from
+running them, and a few corrected what had been written from reading. Run them
+against any tmux you add to the support matrix — which table an option or hook
+name belongs to is exactly the kind of claim that moves between releases.
 
 ---
 
