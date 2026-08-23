@@ -1,5 +1,9 @@
 # gotmucks
 
+[![CI](https://github.com/counterflow/gotmucks/actions/workflows/ci.yml/badge.svg)](https://github.com/counterflow/gotmucks/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/counterflow/gotmucks.svg)](https://pkg.go.dev/github.com/counterflow/gotmucks)
+[![Go Report Card](https://goreportcard.com/badge/github.com/counterflow/gotmucks)](https://goreportcard.com/report/github.com/counterflow/gotmucks)
+
 A Go library for driving tmux programmatically.
 
 ```
@@ -177,8 +181,8 @@ where tmux does.
 
 Layout management, copy mode, key tables and plugin systems are out of scope.
 Windows and panes are exposed for reading and for addressing other commands,
-but v1 does not create them or manipulate layouts — adding that later is
-additive, whereas removing it would not be.
+but this library does not create them or manipulate layouts — adding that later
+is additive, whereas removing it would not be.
 
 There is no CLI. This is a library.
 

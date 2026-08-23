@@ -7,7 +7,7 @@ import (
 
 // Window is a tmux window.
 //
-// v1 exposes windows for reading and for addressing other commands. Creating
+// Windows are exposed for reading and for addressing other commands. Creating
 // windows and manipulating layouts are deliberately absent: layout management
 // is out of scope, and adding those calls later is additive whereas removing
 // them would not be.
