@@ -111,6 +111,18 @@ jobs:
           bash ./scripts/probe-blocks.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-tabs.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-interleave.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-size.sh "$HOME/tmux-install/bin/tmux" || true
+
+      - name: Integration tests
+        # Ahead of the two assertions below rather than after them, because
+        # they abort at their first failed claim and a failing step ends the
+        # job: on 3.4 and 3.5a the suite had therefore never run at all, and
+        # what the package does on those releases was unknown rather than
+        # bad. The assertions still fail the job; they just no longer decide
+        # whether anything is learned from the run.
+        run: |
+          GOTMUCKS_TMUX="$HOME/tmux-install/bin/tmux" \
+            go test -tags integration -race -count=1 -timeout 15m ./...
 
       - name: Check the notification table against this tmux
         # This one is an assertion, and is run for its exit status. A
@@ -139,11 +151,6 @@ jobs:
         # name arguments it escapes, or will not substitute a newline out of a
         # value.
         run: bash ./scripts/probe-roundtrip.sh "$HOME/tmux-install/bin/tmux"
-
-      - name: Integration tests
-        run: |
-          GOTMUCKS_TMUX="$HOME/tmux-install/bin/tmux" \
-            go test -tags integration -race -count=1 -timeout 15m ./...
 
   # The escaping of pane output is the single most test-worthy piece of
   # parsing here, so it gets a fuzzing pass of its own on every run.
