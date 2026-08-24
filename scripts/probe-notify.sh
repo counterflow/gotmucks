@@ -198,6 +198,16 @@ grep -E '^%[a-z-]*window[a-z-]*' "$WORK/raw" | sed 's/^/  /'
 #
 # Both lines below are assertions. If a tmux stopped escaping here, the decode
 # would corrupt every name containing a backslash instead of restoring it.
+#
+# The tab is asserted as one spelling because every release writes it that way.
+# The dollar cannot be, and asserting it as backslash-dollar was wrong: 3.2a
+# and 3.4 escape it and 3.5a does not, so the assertion failed on 3.5a for a
+# name the package handles perfectly well. What has to hold is not a spelling
+# but the round trip — that the reader's decode maps what arrived back to what
+# was set — and both spellings satisfy it, because visDecode leaves a bare '$'
+# alone and takes the backslash off an escaped one. So the dollar is asserted
+# as "one of the two forms a release is known to write", and a third form
+# still fails, which is what the assertion is for.
 "${T[@]}" kill-server 2>/dev/null
 sleep 0.3
 SID=$("${T[@]}" new-session -d -P -F "#{session_id}" -s names -x 80 -y 24 -- sleep 300 2>/dev/null)
@@ -225,8 +235,8 @@ name_escaped() {
 # a raw tab and not a bare '$'.
 name_escaped "a tab in a window name arrives as backslash-t" \
 	'^%(unlinked-)?window-renamed @[0-9]+ a\\tb$'
-name_escaped "a dollar in a session name arrives as backslash-dollar" \
-	'^%session-renamed (\$[0-9]+ )?r\\\$HOMEs$'
+name_escaped "a dollar in a session name arrives in a form visDecode undoes" \
+	'^%session-renamed (\$[0-9]+ )?r\\?\$HOMEs$'
 
 # --- 5. a raw newline in the last field of a notification -----------------
 # tmux ends a notification at the newline and delimits nothing, so any value it

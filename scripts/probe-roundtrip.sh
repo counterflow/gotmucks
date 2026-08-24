@@ -122,6 +122,26 @@ fail() {
 	FAIL=1
 }
 
+# tmux 3.4 inserts a backslash before a '$' when it *stores* a value, where
+# 3.2a and 3.5a store the bytes they were given. That is a fault in one release
+# and the package corrects it on the way back out — see
+# Version.EscapesDollarOnWrite and scripts/probe-dollar.sh — so the sweeps below
+# have to know about it. Without this A1 and A9 report every '$' on 3.4 as a
+# value that did not arrive, which is true of tmux and not true of the package,
+# and the assertion then fails for something that is handled.
+DOLLARQUIRK=0
+case "$("$TMUX_BIN" -V)" in
+*' 3.4') DOLLARQUIRK=1 ;;
+esac
+
+# undollar mirrors undoDollarEscape in client.go: drop one backslash that sits
+# immediately before a '$' which has a byte after it. A '$' at the end is not
+# escaped by 3.4, so a backslash before one of those is data.
+undollar() {
+	[ "$DOLLARQUIRK" = 1 ] || { printf '%s' "$1"; return; }
+	printf '%s' "$1" | sed 's/\\\(\$.\)/\1/g'
+}
+
 # A named format read back off one object.
 fmt() { "${T[@]}" display-message -p -t "$1" "$2" 2>&1; }
 
@@ -178,7 +198,7 @@ for code in $(seq 32 126); do
 		# -v prints the value unescaped, so it says what tmux is holding. If
 		# that is already wrong the argument never arrived intact and the
 		# escaping is not what is being measured.
-		if [ "$vflag" != "$want" ]; then
+		if [ "$(undollar "$vflag")" != "$want" ]; then
 			fail A1 "tmux holds [$(vis "$vflag")] for [$(vis "$want")]; the value did not arrive"
 			continue
 		fi
@@ -720,7 +740,7 @@ for code in $(seq 32 126); do
 		"${T[@]}" set-option -t "$SESS" -u -- "$(argesc "$name")" 2>/dev/null
 		# The parse both readers do: everything up to the first space is the
 		# name. Anything else means the caller's name is not the map's key.
-		[ "${line%% *}" = "$name" ] && [ "${line#* }" = "V" ] && continue
+		[ "$(undollar "${line%% *}")" = "$name" ] && [ "${line#* }" = "V" ] && continue
 		printf '  byte %3d %-6s name [%s] printed [%s]\n' \
 			"$code" "$(vis "$byte")" "$(vis "$name")" "$(vis "$line")"
 		NAMEBAD+=("$name")
