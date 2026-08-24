@@ -969,6 +969,28 @@ func (cc *ControlClient) Close() error {
 		cc.userClose = true
 		cc.mu.Unlock()
 
+		// A connection that is already over has nothing to detach from and
+		// nothing to wait for, and asking here rather than falling into the
+		// select below is what makes the answer deterministic. Both cases of
+		// that select are ready at once for such a client: done is closed, and
+		// cfg.closeTimeout is zero on one nobody opened — the zero value never
+		// passes through a config's defaults — so time.After fires
+		// immediately. select chooses uniformly among ready cases, so Close
+		// reported a kill timeout for a connection that had ended cleanly
+		// about half the time it was asked. It survived locally because the
+		// timer has usually not fired yet at the moment select evaluates; a
+		// loaded CI runner under -race is where it does.
+		select {
+		case <-cc.done:
+			// Still close the pipe. detach does it on the way out, and this
+			// path is the one that skips detach; leaving it to reap would
+			// make it depend on cmd.Wait having created the pipe itself.
+			cc.closeStdin()
+			err = cc.reap()
+			return
+		default:
+		}
+
 		// The detach write is unbounded: a tmux that has stopped draining its
 		// input blocks it for as long as it likes, and it would then consume
 		// the close timeout rather than being covered by it. Running it on its
