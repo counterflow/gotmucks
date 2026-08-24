@@ -201,13 +201,21 @@ func TestIntegrationSessionLifecycle(t *testing.T) {
 	}
 
 	// Size lives on the window, not the session: tmux's session_width and
-	// session_height are deprecated and expand to nothing.
+	// session_height are deprecated and expand to nothing. The size is read
+	// here rather than asserted against the 100x30 that was asked for, because
+	// -x/-y sets the session size and the window is sized by the window-size
+	// option — default "latest", the size of the most recently attached client
+	// — so honouring the request is the environment's decision. It is honoured
+	// here and is not on a GitHub runner. That the request reaches tmux at all
+	// is pinned hermetically in the unit suite, against the recorded argument
+	// vector, which is where a claim about this call belongs.
 	windows, err := c.ListSessionWindows(ctx, s.ID)
 	if err != nil || len(windows) != 1 {
 		t.Fatalf("ListSessionWindows = (%v, %v)", windows, err)
 	}
-	if windows[0].Width != 100 || windows[0].Height != 30 {
-		t.Errorf("window size = %dx%d, want 100x30", windows[0].Width, windows[0].Height)
+	if windows[0].Width <= 0 || windows[0].Height <= 0 {
+		t.Errorf("window size = %dx%d, want both positive",
+			windows[0].Width, windows[0].Height)
 	}
 
 	running, err := c.ServerRunning(ctx)
@@ -397,8 +405,24 @@ func TestIntegrationWindowsAndPanes(t *testing.T) {
 	if p.PID <= 0 {
 		t.Errorf("pane pid = %d", p.PID)
 	}
-	if p.Width != 90 || p.Height != 25 {
-		t.Errorf("pane size = %dx%d, want 90x25", p.Width, p.Height)
+	// Not the size that was asked for. new-session -x/-y sets the session
+	// size, and the window is sized by the window-size option, whose default
+	// "latest" takes the size of the most recently attached client — so
+	// whether the request is honoured is a property of the environment, not of
+	// the call. It is here and is not on a GitHub runner, where tmux behaves as
+	// though a client of 80x24 exists and every window came back 80x23.
+	// scripts/probe-size.sh measures it.
+	//
+	// That the request reaches tmux is asserted hermetically in the unit suite,
+	// where the fake records the argument vector and "-x 132 -y 43" is pinned.
+	// What is worth asserting against a real server is the invariant: the only
+	// pane of a single-pane window is the size of that window.
+	if p.Width != w.Width || p.Height != w.Height {
+		t.Errorf("pane size = %dx%d, want the window's %dx%d",
+			p.Width, p.Height, w.Width, w.Height)
+	}
+	if p.Width <= 0 || p.Height <= 0 {
+		t.Errorf("pane size = %dx%d, want both positive", p.Width, p.Height)
 	}
 	if p.CurrentCommand != "sleep" {
 		t.Errorf("pane current command = %q, want %q", p.CurrentCommand, "sleep")
@@ -935,8 +959,12 @@ func TestIntegrationRawTabsDoNotShiftColumns(t *testing.T) {
 	if p.PID <= 0 {
 		t.Errorf("PID = %d, want the pane's child", p.PID)
 	}
-	if p.Width != 80 || p.Height != 24 {
-		t.Errorf("size = %dx%d, want 80x24", p.Width, p.Height)
+	// Positive rather than exact: what size a window gets when no client ever
+	// attached is the environment's answer, not this call's. See the note in
+	// TestIntegrationWindowsAndPanes. What this test is about is the column
+	// after it, which a raw tab could shift into.
+	if p.Width <= 0 || p.Height <= 0 {
+		t.Errorf("size = %dx%d, want both positive", p.Width, p.Height)
 	}
 	// The one that could, and the two after it.
 	if p.CurrentCommand != "ab cd" {
@@ -965,11 +993,15 @@ func TestIntegrationRawTabsDoNotShiftColumns(t *testing.T) {
 	if !w.Active || w.Panes != 1 || w.Index != 0 {
 		t.Errorf("active=%v panes=%d index=%d, want true/1/0", w.Active, w.Panes, w.Index)
 	}
-	if w.Width != 80 || w.Height != 24 {
-		t.Errorf("window size = %dx%d, want 80x24", w.Width, w.Height)
+	if w.Width <= 0 || w.Height <= 0 {
+		t.Errorf("window size = %dx%d, want both positive", w.Width, w.Height)
 	}
-	if !strings.Contains(w.Layout, "80x24") {
-		t.Errorf("Layout = %q, want tmux's layout string for an 80x24 window", w.Layout)
+	// The layout is the last column and is what a tab in the name would have
+	// pushed off the row, so it has to be the window's real size rather than a
+	// size this test chose: tmux writes "<width>x<height>" into it.
+	if size := fmt.Sprintf("%dx%d", w.Width, w.Height); !strings.Contains(w.Layout, size) {
+		t.Errorf("Layout = %q, want tmux's layout string to carry the window's %s",
+			w.Layout, size)
 	}
 }
 

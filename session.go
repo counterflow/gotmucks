@@ -140,8 +140,25 @@ type NewSessionOptions struct {
 	// call named the window.
 	WindowName string
 
-	// Width and Height set the size of the detached session. tmux defaults to
-	// 80x24 for a session with no attached client.
+	// Width and Height set the size of the detached session, as "new-session
+	// -x" and "-y". tmux defaults to 80x24 for a session with no attached
+	// client.
+	//
+	// They are a request rather than a guarantee, and the difference is worth
+	// knowing before relying on one. They size the *session*; a window is
+	// sized by the "window-size" option, whose default "latest" means the size
+	// of the most recently attached client. Where tmux considers that it has
+	// never seen a client it falls back to the session size and the request is
+	// honoured; where it considers that it has — which includes environments
+	// with no terminal at all, such as a CI runner, where every window comes
+	// back at 80x24 less the status line — the client's size wins and this is
+	// ignored. Nothing is reported when that happens.
+	//
+	// Read the size back from the window if it matters. Forcing it is possible
+	// with "window-size manual" but is not done here: it pins the window for
+	// good, and a control client that attaches later and calls
+	// [ControlClient.SetSize] then cannot resize it, which is a worse trade
+	// than an unhonoured request. scripts/probe-size.sh measures all of this.
 	Width, Height int
 }
 
