@@ -1846,10 +1846,21 @@ func TestIntegrationControlSpecArg(t *testing.T) {
 // sends and reads back, on a reason that was true of the other two bytes and
 // not of this one.
 //
-// What is true of it is narrower and is about the way back: the reader strips
-// one trailing '\r' from every line as CRLF tolerance, so a '\r' that ends a
-// line is lost. Both halves are asserted here, in the four positions round ten
-// established are not interchangeable.
+// What is true of it is narrower, is about the way back, and is the first
+// claim in this file found to differ by release. On 3.2a "show-options -v"
+// prints a control byte as the byte, so the reader's CRLF tolerance takes a
+// trailing '\r' off a reply body and an interior one survives. On 3.4 and 3.5a
+// tmux vis-escapes it instead, and a backslash followed by an 'r' is not a
+// line ending to anything: nothing is stripped, and nothing is lost either.
+// The package does not decode a reply body on any release — a body is whatever
+// the command printed, and deciding it was an option value is what would let a
+// pane forge protocol — so both spellings are legitimate and both are accepted
+// below.
+//
+// What does not vary is the loop that comes first. Reading by name goes
+// through the decoding path, and gives back the bytes that were set on all
+// three releases, in the four positions round ten established are not
+// interchangeable. That is the property the package actually rests on.
 func TestIntegrationControlCarriesACarriageReturn(t *testing.T) {
 	cc, c := testControl(t)
 	ctx := testCtx(t)
@@ -1878,26 +1889,34 @@ func TestIntegrationControlCarriesACarriageReturn(t *testing.T) {
 	}
 
 	// And the cost, stated as an assertion so that a tmux or a reader that
-	// stopped behaving this way is caught rather than assumed: a raw reply
-	// body line loses a trailing '\r' and keeps an interior one.
-	if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", "a\rb"); err != nil {
-		t.Fatalf("DoArgs: %v", err)
-	}
-	reply, err := cc.DoArgs(ctx, "show-options", "-t", string(s), "-v", "--", "@cr")
-	if err != nil {
-		t.Fatalf("DoArgs show-options -v: %v", err)
-	}
-	if len(reply.Output) != 1 || reply.Output[0] != "a\rb" {
-		t.Errorf("an interior carriage return did not survive the reader: %q", reply.Output)
-	}
-	if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", "ab\r"); err != nil {
-		t.Fatalf("DoArgs: %v", err)
-	}
-	if reply, err = cc.DoArgs(ctx, "show-options", "-t", string(s), "-v", "--", "@cr"); err != nil {
-		t.Fatalf("DoArgs show-options -v: %v", err)
-	}
-	if len(reply.Output) != 1 || reply.Output[0] != "ab" {
-		t.Errorf("the reader's CRLF tolerance no longer takes a trailing '\\r' off: %q", reply.Output)
+	// stopped behaving this way is caught rather than assumed. Two spellings
+	// are legitimate, for the reason in the comment above this test, and what
+	// is asserted is that the body is one of them and is one line: a third
+	// answer means either tmux changed again or the reader mangled the body.
+	for _, tc := range []struct {
+		set   string
+		raw   string // 3.2a: the byte itself, so a trailing one is stripped
+		escpd string // 3.4, 3.5a: vis-escaped, so nothing looks like an ending
+	}{
+		{set: "a\rb", raw: "a\rb", escpd: `a\rb`},
+		{set: "ab\r", raw: "ab", escpd: `ab\r`},
+	} {
+		if _, err := cc.DoArgs(ctx, "set-option", "-t", string(s), "--", "@cr", tc.set); err != nil {
+			t.Fatalf("DoArgs set %q: %v", tc.set, err)
+		}
+		reply, err := cc.DoArgs(ctx, "show-options", "-t", string(s), "-v", "--", "@cr")
+		if err != nil {
+			t.Fatalf("DoArgs show-options -v after %q: %v", tc.set, err)
+		}
+		if len(reply.Output) != 1 {
+			t.Errorf("set %q: the reply body is %d lines, want 1: %q",
+				tc.set, len(reply.Output), reply.Output)
+			continue
+		}
+		if got := reply.Output[0]; got != tc.raw && got != tc.escpd {
+			t.Errorf("set %q: the reply body carries %q, want %q (3.2a) or %q (3.4 onwards)",
+				tc.set, got, tc.raw, tc.escpd)
+		}
 	}
 }
 
