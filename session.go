@@ -214,12 +214,6 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 		return nil, fmt.Errorf("gotmucks: new-session returned %q: %w", trimID(out), err)
 	}
 
-	if opts.Width > 0 || opts.Height > 0 {
-		if err := c.pinWindowSize(ctx, id, opts.Width, opts.Height); err != nil {
-			return nil, err
-		}
-	}
-
 	s, err := c.Session(ctx, id)
 	if err != nil {
 		// The session was created — we have its id — but reading it back
@@ -233,46 +227,6 @@ func (c *Client) NewSession(ctx context.Context, opts NewSessionOptions) (*Sessi
 		return nil, err
 	}
 	return s, nil
-}
-
-// pinWindowSize makes the size new-session was asked for the size it keeps.
-//
-// -x and -y set the session size, and the window is sized by the window-size
-// option rather than by that. Its default is "latest" — take the size of the
-// most recently attached client — so whether -x/-y is honoured depends on
-// whether tmux believes it has ever seen a client, which is a property of the
-// environment and not of the call. It holds on a developer's machine and does
-// not on a GitHub runner, where every window came back 80x23 whatever was
-// asked for: 80x24 less a status line, the size of a client that reported
-// none. default-size was ignored there too, which is what rules that out as
-// the explanation. Measured by scripts/probe-size.sh, which also shows the
-// remedy: with window-size "manual" the runner honours the request exactly.
-//
-// So the option is set on the window this call created rather than globally —
-// a library has no business changing how the caller's other windows resize —
-// and the window is then resized, because setting the option does not itself
-// move a window that has already been made at the wrong size.
-func (c *Client) pinWindowSize(ctx context.Context, id SessionID, w, h int) error {
-	if err := id.check(); err != nil {
-		return err
-	}
-
-	// A session one command old has exactly one window, so addressing the
-	// session resolves to it.
-	if _, _, err := c.run(ctx,
-		"set-option", "-w", "-t", string(id), "--", "window-size", "manual"); err != nil {
-		return err
-	}
-
-	args := []string{"resize-window", "-t", string(id)}
-	if w > 0 {
-		args = append(args, "-x", fmt.Sprint(w))
-	}
-	if h > 0 {
-		args = append(args, "-y", fmt.Sprint(h))
-	}
-	_, _, err := c.run(ctx, args...)
-	return err
 }
 
 // checkSessionName refuses a name tmux would store as a different one.

@@ -52,3 +52,12 @@ printf -- '\n--- 4. the exact shape the failing tests use ---\n'
 "$tmux" -L "$sock" set-option -g default-size 80x24
 "$tmux" -L "$sock" new-session -d -s d -x 90 -y 25 -- sleep 60
 report 'asked 90x25' d
+
+printf -- '\n--- 5. resize-window after the fact, window-size left at latest ---\n'
+# This is what NewSession does. Setting window-size to "manual" also makes the
+# request stick and is the wrong remedy: it pins the window for good, so a
+# control client attaching later and calling SetSize never moves it again. A
+# resize has to hold on its own for that to be avoidable, so it is asked here.
+"$tmux" -L "$sock" resize-window -t d -x 90 -y 25
+report 'resized to 90x25' d
+printf '  window-size still = %s\n' "$("$tmux" -L "$sock" show-options -gv window-size)"
