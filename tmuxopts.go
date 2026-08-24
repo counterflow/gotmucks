@@ -314,7 +314,7 @@ func (c *Client) ShowOption(ctx context.Context, t Target, scope OptionScope, na
 	if !ok {
 		return "", true, nil
 	}
-	return unquoteOptionValue(value), true, nil
+	return c.decodeStored(ctx, unquoteOptionValue(value)), true, nil
 }
 
 // isArrayElement reports whether the name tmux printed for a value is an
@@ -422,10 +422,14 @@ func (c *Client) ShowOptions(ctx context.Context, t Target, scope OptionScope) (
 		name, value, ok := strings.Cut(line, " ")
 		if !ok {
 			// A flag option printed alone means it is set with no value.
-			opts[line] = ""
+			opts[c.decodeStored(ctx, line)] = ""
 			continue
 		}
-		opts[name] = unquoteOptionValue(value)
+		// The name gets the same treatment as the value on 3.4, because the
+		// fault is in what set-option stored rather than in what show-options
+		// printed: a user option called "@a$b" is held as "@a\$b" and would
+		// otherwise be keyed here under a name the caller never used.
+		opts[c.decodeStored(ctx, name)] = c.decodeStored(ctx, unquoteOptionValue(value))
 	}
 	return opts, nil
 }

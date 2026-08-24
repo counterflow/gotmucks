@@ -432,6 +432,89 @@ func TestVisRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUndoDollarEscape pins the inverse of what tmux 3.4 does to a value on
+// its way into storage: it inserts one backslash before a '$' that has a byte
+// after it, and touches nothing else.
+//
+// The cases that matter are the ones that made visDecode the wrong tool for
+// this. A backslash that is really in the value must survive, and a "\t" or a
+// "\b" in it is data here rather than an escape — decoding with vis turned a
+// window named "a\b" into one holding a backspace. The pairs below are the
+// stored form on the left and what the caller set on the right, taken from
+// scripts/probe-dollar.sh against a real 3.4.
+func TestUndoDollarEscape(t *testing.T) {
+	tests := []struct {
+		stored, want string
+	}{
+		// What 3.4 escapes.
+		{`a\$b`, `a$b`},
+		{`\$ab`, `$ab`},
+		{`x\$HOMEy`, `x$HOMEy`},
+		{`PATH=\$HOME/bin:\$PATH`, `PATH=$HOME/bin:$PATH`},
+		// A backslash already in the value keeps it: 3.4 inserts exactly one
+		// per escaped '$', so removing exactly one is the inverse.
+		{`a\\$b`, `a\$b`},
+		{`a\\\$b`, `a\\$b`},
+		// A '$' with nothing after it is not escaped by 3.4, so a backslash
+		// before one of those is the caller's and stays.
+		{`ab$`, `ab$`},
+		{`$`, `$`},
+		{`a\$`, `a\$`},
+		// Everything else is untouched — this is the half visDecode got wrong.
+		{`a\b`, `a\b`},
+		{`a\tb`, `a\tb`},
+		{`\ab`, `\ab`},
+		{`a\\b`, `a\\b`},
+		{``, ``},
+		{`plain`, `plain`},
+		{`a#{host}b`, `a#{host}b`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stored, func(t *testing.T) {
+			if got := undoDollarEscape(tt.stored); got != tt.want {
+				t.Errorf("undoDollarEscape(%q) = %q, want %q", tt.stored, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEscapesDollarOnWrite pins the fault to the one release that has it. A
+// range would quietly claim a version nobody has asked.
+func TestEscapesDollarOnWrite(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"tmux 3.4", true},
+		{"3.4", true},
+		{"tmux 3.2a", false},
+		{"tmux 3.3a", false},
+		{"tmux 3.5a", false},
+		{"tmux 3.5", false},
+		{"tmux 3.6", false},
+		{"tmux 4.0", false},
+		// A tree heading towards 3.4 is not 3.4, and a release candidate for
+		// it precedes it; neither has been measured.
+		{"tmux next-3.4", false},
+		{"tmux 3.4-rc1", false},
+		{"tmux master", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			v, err := ParseVersion(tt.in)
+			if err != nil {
+				t.Fatalf("ParseVersion(%q): %v", tt.in, err)
+			}
+			if got := v.EscapesDollarOnWrite(); got != tt.want {
+				t.Errorf("ParseVersion(%q).EscapesDollarOnWrite() = %v, want %v",
+					tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestEscapeFormat pins the escape for the five arguments tmux expands as a
 // format before it uses them: the four names, and new-session's -c.
 func TestEscapeFormat(t *testing.T) {

@@ -122,6 +122,7 @@ func (c *Client) windows(ctx context.Context, args ...string) ([]Window, error) 
 		if err != nil {
 			return nil, err
 		}
+		w.Name = c.decodeStored(ctx, w.Name)
 		windows = append(windows, w)
 	}
 	return windows, nil

@@ -112,6 +112,7 @@ jobs:
           bash ./scripts/probe-tabs.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-interleave.sh "$HOME/tmux-install/bin/tmux" || true
           bash ./scripts/probe-size.sh "$HOME/tmux-install/bin/tmux" || true
+          bash ./scripts/probe-dollar.sh "$HOME/tmux-install/bin/tmux" || true
 
       - name: Integration tests
         # Ahead of the two assertions below rather than after them, because

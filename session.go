@@ -380,6 +380,7 @@ func (c *Client) ListSessions(ctx context.Context) ([]Session, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.Name = c.decodeStored(ctx, s.Name)
 		sessions = append(sessions, s)
 	}
 	return sessions, nil

@@ -109,6 +109,35 @@ func isPreRelease(suffix string) bool { return strings.HasPrefix(suffix, "-") }
 // AtLeast reports whether v is w or newer.
 func (v Version) AtLeast(w Version) bool { return v.Compare(w) >= 0 }
 
+// EscapesDollarOnWrite reports a tmux that adds a backslash before a '$' when
+// it stores a value, rather than only when it prints one.
+//
+// This is a bug in 3.4 alone: 3.2a and 3.5a both store the bytes they were
+// given. On 3.4 "set-option @x 'a$b'" is held as "a\$b", and the two readers
+// that escape least agree it is in storage rather than in the printing —
+// "show-options -v" and a "#{@x}" expansion both return the backslash, where
+// on the other two releases both return the value. A '$' at the very end is
+// untouched, since nothing could follow it to be read as a variable, and a
+// backslash already present is doubled: "a\$b" is held as "a\\$b".
+//
+// That doubling is what makes it correctable rather than fatal. The mapping is
+// exactly one vis(3) pass, so it is injective and [visDecode] inverts it, and
+// the readers therefore decode one extra time when talking to 3.4. Without
+// that a caller reading a value, editing it and writing it back gains a
+// backslash every cycle, and a name is worse: tmux expands the "$HOME" that
+// the lost backslash was protecting.
+//
+// Measured rather than read: scripts/probe-dollar.sh asks a binary the same
+// question in the four positions round ten established are not
+// interchangeable, and [TestUndoDollarEscape] pins the inverse against what it
+// recorded from a real 3.4.
+func (v Version) EscapesDollarOnWrite() bool {
+	// Not AtLeast/Compare against a range: the fault is one release wide, and
+	// a range would silently claim a 3.6 that has not been asked.
+	return !v.Unknown && !v.Next && v.Major == 3 && v.Minor == 4 &&
+		!isPreRelease(v.Suffix)
+}
+
 func sign(n int) int {
 	switch {
 	case n < 0:

@@ -290,11 +290,20 @@ func (c *Client) hooks(ctx context.Context, cmds [][]string) (map[string]string,
 
 	hooks := make(map[string]string, len(parsed))
 	for _, h := range parsed {
+		// A hook command is a command line and is handed back as tmux printed
+		// it, never decoded as an option value would be — that is what keeps
+		// it settable again. The one exception is the backslash 3.4 inserts
+		// before a '$', which is not part of the command line tmux
+		// re-serialised but a fault applied to what it stored: left in, the
+		// body is set again with a doubled backslash, and tmux's lexer then
+		// expands the "$HOME" the original one was protecting. See
+		// [Version.EscapesDollarOnWrite].
+		command := c.decodeStored(ctx, h.command)
 		if elements[h.base] > 1 {
-			hooks[h.printed] = h.command
+			hooks[c.decodeStored(ctx, h.printed)] = command
 			continue
 		}
-		hooks[h.base] = h.command
+		hooks[c.decodeStored(ctx, h.base)] = command
 	}
 	return hooks, nil
 }

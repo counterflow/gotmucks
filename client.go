@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // Client issues one-shot tmux commands. Each call starts a tmux process,
@@ -13,10 +14,86 @@ import (
 // live pane output and asynchronous notifications use [Connect] and
 // [ControlClient].
 //
-// A Client holds no state beyond its configuration and is safe for concurrent
-// use.
+// A Client holds no state beyond its configuration and one cached answer to
+// "tmux -V", and is safe for concurrent use. The version is remembered because
+// the readers consult it per value to undo a fault in one tmux release, and
+// the binary a client runs is fixed when it is made.
 type Client struct {
 	cfg config
+
+	// versionOnce caches "tmux -V" for the whole life of the client. The
+	// readers ask it on every call to know whether this tmux is the one that
+	// escapes a '$' into storage, and a subprocess per row would be absurd.
+	// The binary cannot change under a client: cfg is fixed at New.
+	versionOnce sync.Once
+	version     Version
+	versionErr  error
+}
+
+// tmuxVersion reports the version of the binary this client runs, asking it
+// once and remembering the answer.
+//
+// A failure is remembered too, and is not returned to the caller of a read:
+// the version is wanted here only to decide whether to undo a known 3.4 fault,
+// and a client that cannot say what it is gets the behaviour of a tmux without
+// the fault. Callers that want the version itself, and any error getting it,
+// use [Client.Version].
+func (c *Client) tmuxVersion(ctx context.Context) Version {
+	c.versionOnce.Do(func() {
+		out, _, err := c.run(ctx, "-V")
+		if err != nil {
+			c.versionErr = err
+			return
+		}
+		c.version, c.versionErr = ParseVersion(string(out))
+	})
+	return c.version
+}
+
+// decodeStored undoes what tmux did to a value between being given it and
+// handing it back.
+//
+// Every reader already undoes the escaping tmux applies on the way out. This
+// is the second pass that 3.4 alone needs, because it escapes on the way in as
+// well; see [Version.EscapesDollarOnWrite]. It is a no-op on every other
+// release, so the readers can call it unconditionally.
+func (c *Client) decodeStored(ctx context.Context, v string) string {
+	if !c.tmuxVersion(ctx).EscapesDollarOnWrite() {
+		return v
+	}
+	return undoDollarEscape(v)
+}
+
+// undoDollarEscape removes the backslash tmux 3.4 inserts before a '$'.
+//
+// [visDecode] must not be used for this and was, for one round. What 3.4 does
+// is not a vis(3) pass: it inserts a backslash before a '$' and touches
+// nothing else, so decoding with vis also consumed escapes that were really in
+// the value — a window named "a\b" came back holding a backspace, and one
+// named "a\tb" came back holding a tab. The undo has to be as narrow as the
+// fault.
+//
+// A '$' at the end of a value is left alone by 3.4, since nothing follows it
+// to be read as a variable name, so a backslash before one of those is the
+// caller's own and stays. That is also what makes this unambiguous where a
+// value already contained a backslash: 3.4 inserts exactly one per escaped
+// '$', so removing exactly one is its inverse — "a\$b" is stored as "a\\$b"
+// and comes back "a\$b", not "a$b".
+func undoDollarEscape(v string) string {
+	if !strings.Contains(v, `\$`) {
+		return v
+	}
+	var b strings.Builder
+	b.Grow(len(v))
+	for i := 0; i < len(v); i++ {
+		// i+2 < len(v) is the "something follows the '$'" test: without a
+		// following byte tmux did not escape it, so the backslash is data.
+		if v[i] == '\\' && i+2 < len(v) && v[i+1] == '$' {
+			continue
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
 }
 
 // New returns a Client configured by opts.
