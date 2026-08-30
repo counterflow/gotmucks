@@ -1,0 +1,61 @@
+# Linters this package answers to.
+#
+# Deliberately not the default set. The stylistic linters in it argue with
+# conventions this tree has chosen on purpose — comments that explain which
+# tmux behaviour forced a decision are long, and several exported names are
+# spelled to match tmux's own vocabulary rather than Go's house style. A linter
+# that has to be silenced everywhere teaches nothing.
+#
+# What is enabled finds defects rather than opinions:
+#
+#   errcheck      an error that is never looked at. This package starts
+#                 subprocesses and writes to pipes, so a dropped error is a
+#                 tmux that failed silently.
+#   govet         the standard analyser, already run separately in CI; here so
+#                 a local run matches what CI enforces.
+#   ineffassign   a value assigned and never read, which in a parser is
+#                 usually a branch that forgot to use what it computed.
+#   staticcheck   the checks go vet does not do: impossible type assertions,
+#                 misuse of time, nil paths, unused writes.
+#   unused        dead code, which in a package this size is a leftover rather
+#                 than a spare part.
+#
+# gofmt is not here because CI enforces it directly with "gofmt -l", which
+# fails on any file rather than on the ones a linter happens to visit.
+version: "2"
+
+run:
+  # The integration tests are behind a build tag, so without this the largest
+  # test file in the tree is never looked at.
+  build-tags:
+    - integration
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+  exclusions:
+    rules:
+      # errcheck off in tests and in the stand-in tmux, and nowhere else.
+      #
+      # The library itself passes errcheck with nothing excluded, which is the
+      # result worth keeping: every error a caller could act on is looked at.
+      # A test is different. An example ends with "defer cc.Close()" because
+      # that is what a caller writes and the example is documentation; wrapping
+      # it in a check would teach the wrong shape. internal/faketmux writes its
+      # scripted replies to stdout with fmt.Fprintln, and a test binary that
+      # cannot write to its own pipe has already failed in a way no returned
+      # error improves.
+      #
+      # Narrow on purpose: excluding one linter for one set of paths, rather
+      # than the blanket "tests are exempt" rule, so staticcheck and the rest
+      # still run over the test files — which is where three of this week's
+      # defects were.
+      - path: (_test\.go$|internal/faketmux/)
+        linters:
+          - errcheck

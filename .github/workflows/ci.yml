@@ -168,3 +168,28 @@ jobs:
         run: |
           go test ./internal/escape/ -run xxx -fuzz FuzzRoundTrip -fuzztime 60s
           go test ./internal/escape/ -run xxx -fuzz FuzzUnescapeArbitrary -fuzztime 60s
+
+  # Static analysis beyond go vet: staticcheck, errcheck, ineffassign, unused.
+  # Which linters and why is in .golangci.yml.
+  #
+  # Its own job rather than a step in check, which runs twice across the Go
+  # matrix and would install the tool twice for no extra signal — the linters
+  # ask about the code, not about the toolchain building it.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install golangci-lint
+        # From source at a pinned version rather than through the marketplace
+        # action, so the version CI runs is the one .golangci.yml was written
+        # against — its config format changed between v1 and v2 — and moves
+        # when this line moves rather than on someone else's release cadence.
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+
+      - name: Lint
+        run: golangci-lint run ./...

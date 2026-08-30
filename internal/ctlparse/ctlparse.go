@@ -193,10 +193,12 @@ func Classify(line string) Line {
 
 	switch name {
 	case "begin", "end", "error":
-		l.Kind = KindBegin
-		if name == "end" {
+		switch name {
+		case "begin":
+			l.Kind = KindBegin
+		case "end":
 			l.Kind = KindEnd
-		} else if name == "error" {
+		case "error":
 			l.Kind = KindError
 		}
 		if !parseBlockArgs(&l, args) {
@@ -405,7 +407,13 @@ func ParseLayoutChange(args string) (Layout, bool) {
 // %window-renamed and %session-changed. The name is everything after the
 // first space and may itself contain spaces.
 func ParseIDAndName(args string) (id, name string, ok bool) {
-	id, name, ok = strings.Cut(args, " ")
+	// Cut's own ok is deliberately discarded rather than returned. It reports
+	// whether the separator was there, and its absence is not a parse failure
+	// here: a line carrying an id and nothing else is well formed, and Cut
+	// then hands back the whole argument as the id with an empty name, which
+	// is the right reading of it. What decides the line is having an id at
+	// all. Assigning it and never looking at it said the opposite.
+	id, name, _ = strings.Cut(args, " ")
 	if id == "" {
 		return "", "", false
 	}
