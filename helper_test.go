@@ -43,6 +43,26 @@ type fake struct {
 func newFake(t *testing.T, script faketmux.Script) *fake {
 	t.Helper()
 
+	// -short skips every test that needs the stand-in, and is what makes a
+	// race build affordable. Each use here re-executes the test binary, and
+	// under -race that binary is instrumented, so every launch pays
+	// instrumented startup: the 1.9s suite becomes 123s, on every push.
+	//
+	// Nothing is lost by skipping them there. What -race is for is the
+	// control-mode half — a reader goroutine, per-pane taps, the event
+	// stream, Close — and not one of those tests comes through here: they are
+	// driven over in-memory pipes and start no process at all. What does come
+	// through here is argv assembly and output parsing, which is a single
+	// goroutine calling a subprocess and has no race to find.
+	//
+	// So CI runs the suite twice: once in full without -race, and once with
+	// -race -short. Both together are faster than the raced sweep was, and
+	// the second one actually looks at the concurrent code rather than
+	// spending its time launching processes.
+	if testing.Short() {
+		t.Skip("skipping: re-executes the test binary, which -race makes expensive")
+	}
+
 	dir := t.TempDir()
 	f := &fake{
 		t:          t,

@@ -192,7 +192,7 @@ There is no CLI. This is a library.
 ```
 go test ./...                        # hermetic; no tmux needed
 go test -tags integration ./...      # against the real tmux on PATH
-go test -race ./...
+go test -race -short ./...           # the concurrent half, under the detector
 ```
 
 The unit suite runs against a stand-in tmux binary that records the argument

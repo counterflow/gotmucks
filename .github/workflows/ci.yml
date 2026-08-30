@@ -51,7 +51,20 @@ jobs:
           fi
 
       - name: Test
-        run: go test -race -count=1 ./...
+        run: go test -count=1 ./...
+
+      - name: Test under the race detector
+        # -short, and the two steps rather than one raced sweep, because the
+        # command tests re-execute this binary as a stand-in tmux and under
+        # -race every launch pays instrumented startup: the sweep took 150s
+        # where these two take about 19s together. The split loses no
+        # coverage. What -race is for is the control-mode half — a reader
+        # goroutine, per-pane taps, the event stream, Close — and every one of
+        # those tests runs over in-memory pipes and starts no process, so
+        # -short keeps all of them. What it skips is argv assembly and output
+        # parsing: one goroutine calling a subprocess, with no race to find,
+        # and already run in full by the step above.
+        run: go test -race -short -count=1 ./...
 
   # Integration tests against real tmux. 3.2 is the floor, for new-session -e.
   integration:
