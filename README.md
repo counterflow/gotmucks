@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/counterflow/gotmucks/actions/workflows/ci.yml/badge.svg)](https://github.com/counterflow/gotmucks/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/counterflow/gotmucks.svg)](https://pkg.go.dev/github.com/counterflow/gotmucks)
-[![Go Report Card](https://goreportcard.com/badge/github.com/counterflow/gotmucks)](https://goreportcard.com/report/github.com/counterflow/gotmucks)
 
 A Go library for driving tmux programmatically.
 
